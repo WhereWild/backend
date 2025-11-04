@@ -9,6 +9,7 @@ processed/
 __pycache__/
 *.pyc
 .venv/
+venv/
 
 # OS/editor artifacts
 .DS_Store
