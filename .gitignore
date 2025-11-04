@@ -1,0 +1,15 @@
+# Raw and processed raster outputs (large binaries stay out of git)
+raw/
+processed/
+*.tif
+*.tif.part
+*.aux.xml
+
+# Python cruft
+__pycache__/
+*.pyc
+.venv/
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
