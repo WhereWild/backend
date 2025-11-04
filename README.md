@@ -1,29 +1,21 @@
 # WhereWild
 
-## Overview
-WhereWild is a geospatial data platform that fuses biodiversity observations (e.g., iNaturalist) with large-scale environmental layers—elevation, climate, land cover, soil, and more—to model and visualize species presence and habitat characteristics. The system supports both a React Native front end for exploration and a Python/FastAPI back end for analytics and machine-learning experiments.
+## What Is WhereWild?
+WhereWild is a capstone project that combines wildlife sightings (for example, iNaturalist observations) with environmental context (elevation, climate, vegetation, human presence, etc.). Our goal is to give researchers and nature lovers a single place to explore why species show up where they do and how habitats change over time.
 
-## Architecture Snapshot
-- **Frontend:** React Native web/mobile for map visualization and user interaction.
-- **Backend:** FastAPI with Python analytics stack (NumPy, Pandas, PyTorch).
-- **Object Storage:** Rasterized environmental layers aligned to a canonical grid.
-- **Database:** Lightweight metadata and user preferences; bulk spatial data lives in object storage.
+## How the System Fits Together
+- **React Native app** (web/mobile) lets people browse the map, filter by species, and explore different layers.
+- **FastAPI backend** handles requests, runs analyses, and talks to the Python data science stack (NumPy, Pandas, PyTorch).
+- **Object storage** (cloud buckets or local storage) keeps the heavy-duty raster layers. Everything follows one shared grid so the datasets line up perfectly.
+- **Lightweight database** stores references, metadata, and user settings. The big geospatial files stay out of SQL.
 
-## Data Strategy
-- Normalize all Tier 1 environmental datasets (elevation, slope, aspect, roughness, land cover, NDVI, precipitation, temperature, distance-to-water, human footprint) onto a shared 100 m grid.
-- Target region: continental United States.
-- Canonical projection: EPSG:5070 (US Albers Equal Area).
-- Storage format: Cloud-Optimized GeoTIFF (COG) or GeoParquet for efficient spatial querying.
-- Quantization guidance: elevation as float32/uint16; slope/aspect/roughness as uint8; categorical layers as uint8.
+## Why the Grid Matters
+- We picked a 100 m x 100 m grid that covers the continental U.S. (defined in `grid.json`). Every dataset we add later snaps to that grid so layers overlay cleanly.
+- Elevation is the foundation: once the DEM is aligned, we can derive slope/aspect/roughness and warp other layers (precipitation, NDVI, land cover, etc.).
+- We store aligned rasters as Cloud Optimized GeoTIFFs (COGs) because they’re fast to read, even over the network.
+- Each dataset carries provenance in `manifest.csv` so we know the source URL, license, and when we downloaded it.
 
-## Current Focus
-Establish the master 100 m DEM that defines pixel alignment, grid origin, and CRS for every other dataset.
-1. Download USGS 3DEP 1″ (~30 m) elevation tiles covering CONUS.
-2. Reproject/mosaic the tiles to the canonical grid defined in `grid.json`.
-3. Produce a compressed COG and record provenance in `manifest.csv`.
-4. Use this aligned DEM as the baseline for derived products (slope, aspect, roughness) and future Tier 1 layers.
-
-## Repository Layout
+## What’s in This Repo?
 ```
 WhereWild/
 ├── grid.json                # Canonical grid specification (CRS, bounds, pixel size)
@@ -38,9 +30,9 @@ WhereWild/
 ```
 
 ## Setup
-1. Prefer Linux or WSL
-2. Ensure GNU Make and Python 3.10+ are available.
-3. Install Python dependencies (virtual environment recommended):
+1. **Use a Linux-style shell.** Native Linux/macOS works out of the box. On Windows, install **WSL2** and run everything inside the WSL terminal.
+2. **Install Make and Python 3.10+.** Most distros already have Python; add GNU Make if needed (`sudo apt-get install make` on Ubuntu/WSL).
+3. **Install Python packages** (ideally in a virtualenv):
    ```bash
    pip install -r requirements.txt
    ```
@@ -49,7 +41,7 @@ WhereWild/
    sudo apt-get install make python3-pyproj python3-rasterio
    pip install rio-cogeo  # optional, for COG output
    ```
-4. Confirm GDAL/Rasterio can open GeoTIFFs (`rio --version` or `python -c "import rasterio"`).
+4. **Verify Rasterio works** (`rio --version` or `python -c "import rasterio"`). If this fails, double-check GDAL is installed and visible in your PATH.
 
 ## Usage
 ### 1. Download Raw Elevation Tiles
@@ -76,14 +68,15 @@ make validate-dem
 Hook for grid-alignment, statistics, and QA visualizations (to be implemented).
 
 ## Future Work
-- Derive slope, aspect, and roughness from the aligned DEM.
-- Warp additional Tier 1 layers (precipitation, temperature, NDVI, land cover, distance-to-water, human footprint) to the canonical grid.
-- Store curated outputs in object storage and maintain a comprehensive dataset manifest.
-- Build automated validation checks (affine alignment, histograms, hillshades) for every dataset.
+- Generate slope, aspect, and terrain roughness from the aligned DEM.
+- Add more environmental layers (precipitation, temperature, NDVI, land cover, distance-to-water, human footprint) using the same download + warp workflow.
+- Stand up validation scripts that check alignment, nodata coverage, and generate quick-look plots for QA.
+- Store the processed rasters in shared object storage so the app/backend can stream them without redownloading.
 
 ## Licensing & Attribution
-- USGS 3DEP tiles are public domain; retain attribution when publishing derivatives.
-- iNaturalist and other community datasets may carry Creative Commons licenses (often non-commercial). Track license terms in `manifest.csv`, surface attributions in the UI, and ensure compliance before open-sourcing or distributing data.
+- USGS 3DEP elevation tiles are public domain; we still keep attribution info in the manifest.
+- Community datasets (e.g., iNaturalist) often use Creative Commons licenses—some allow non-commercial use only. Log license terms in `manifest.csv`, display attributions to users, and confirm permissions before sharing anything publicly.
+- The project will remain non-commercial unless all sources permit it.
 
 ## Additional Resources
-- Automation/AI agent instructions are maintained in `docs/agent_context.md`.
+- Automation/AI agent instructions live in `docs/agent_context.md` (optional reading).
