@@ -143,8 +143,9 @@ def mosaic_tiles(
                         dst_crs=crs,
                         dst_nodata=nodata,
                         resampling=Resampling.bilinear,
-                        num_threads=4,
-                        warp_mem_limit=512,
+                        num_threads=12,
+                        warp_mem_limit=4096,
+                        init_dest_nodata=False,
                     )
 
     final_path = convert_to_cog(tmp_tif, output_path, nodata)
@@ -156,7 +157,11 @@ def convert_to_cog(tmp_tif: Path, output_path: Path, nodata: float) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         from rio_cogeo.cogeo import cog_translate
-        from rio_cogeo.profiles import get_profile
+        try:
+            from rio_cogeo.profiles import get_profile
+        except ImportError:  # rio-cogeo >=5 removed get_profile helper
+            get_profile = None
+            from rio_cogeo.profiles import cog_profiles
     except ModuleNotFoundError:
         print(
             "rio-cogeo not installed; leaving output as standard GeoTIFF.",
@@ -166,7 +171,14 @@ def convert_to_cog(tmp_tif: Path, output_path: Path, nodata: float) -> Path:
         return output_path
 
     print(f"Converting to Cloud Optimized GeoTIFF: {output_path}")
-    profile = get_profile("deflate")
+    if get_profile is not None:
+        profile = get_profile("deflate")
+    else:
+        profile_obj = cog_profiles.get("deflate")
+        if profile_obj is None:
+            profile = {}
+        else:
+            profile = dict(profile_obj)
     profile.update({"nodata": nodata})
     cog_translate(
         str(tmp_tif),

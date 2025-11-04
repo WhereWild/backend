@@ -8,9 +8,12 @@ processed/
 # Python cruft
 __pycache__/
 *.pyc
-.venv/
 venv/
 
 # OS/editor artifacts
 .DS_Store
 Thumbs.db
+
+# Other non needed stuff
+figures/
+logs/

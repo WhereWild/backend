@@ -1,0 +1,239 @@
+{
+  "base": {
+    "name": "conus",
+    "quicklook": true,
+    "description": "Canonical 100 m CONUS DEM"
+  },
+  "cutouts": [
+    {
+      "name": "salt_lake",
+      "center": {
+        "lat": 40.560530,
+        "lon": -111.842617
+      },
+      "width_km": 80,
+      "quicklook": true,
+      "description": "Salt Lake Valley and surrounding Wasatch Front. Verify stuff makes sense, since we're located here."
+    },
+    {
+      "name": "hounds_tooth",
+      "center": {
+        "lat": 40.603193,
+        "lon": -111.76760
+      },
+      "width_km": 3,
+      "quicklook": true,
+      "description": "Hounds Tooth rock formation. Verify rocky outcrops have high ruggedness, probably unique soil data."
+    },
+    {
+      "name": "dimple_dell",
+      "center": {
+        "lat": 40.560142,
+        "lon": -111.838213
+      },
+      "width_km": 6,
+      "quicklook": true,
+      "description": "Dimple Dell park has a natural gulley formation"
+    },
+    {
+      "name": "devils_slide",
+      "center": {
+        "lat": 41.062544,
+        "lon": -111.548456
+      },
+      "width_km": 3,
+      "quicklook": true,
+      "description": "Devils Slide sandstone fin in Morgan County"
+    },
+    {
+      "name": "san_rafael_swell",
+      "center": {
+        "lat": 38.801,
+        "lon": -110.712
+      },
+      "width_km": 40,
+      "quicklook": true,
+      "description": "San Rafael Swell uplift with hogbacks and slot canyons"
+    },
+    {
+      "name": "bonneville_flats",
+      "center": {
+        "lat": 40.739252,
+        "lon": -113.535475
+      },
+      "width_km": 100,
+      "quicklook": true,
+      "description": "Bonneville Salt Flats – extremely low relief salt pan"
+    },
+    {
+      "name": "deep_creek_mountains",
+      "center": {
+        "lat": 39.882092,
+        "lon": -113.908748
+      },
+      "width_km": 50,
+      "quicklook": true,
+      "description": "Deep Creek Mountains (Ibapah Peak) – rugged range at the UT/NV border"
+    },
+    {
+      "name": "arches",
+      "center": {
+        "lat": 38.79062,
+        "lon": -109.59265
+      },
+      "width_km": 18,
+      "quicklook": true,
+      "description": "Arches National Park fins and sandstone arches"
+    },
+    {
+      "name": "devils_castle",
+      "center": {
+        "lat": 40.57391,
+        "lon": -111.64887
+      },
+      "width_km": 8,
+      "quicklook": true,
+      "description": "High alpine ridgeline near Devils Castle in Little Cottonwood Canyon"
+    },
+    {
+      "name": "point_of_the_mountain",
+      "center": {
+        "lat": 40.46942,
+        "lon": -111.89461
+      },
+      "width_km": 10,
+      "quicklook": true,
+      "description": "Point of the Mountain sand dunes and wind-sculpted ridges"
+    },
+    {
+      "name": "factory_butte",
+      "center": {
+        "lat": 38.48252,
+        "lon": -110.90158
+      },
+      "width_km": 20,
+      "quicklook": true,
+      "description": "Factory Butte badlands and eroded benches"
+    },
+    {
+      "name": "lake_powell",
+      "center": {
+        "lat": 37.10153,
+        "lon": -111.23769
+      },
+      "width_km": 30,
+      "quicklook": true,
+      "description": "Lake Powell shoreline canyons"
+    },
+    {
+      "name": "escalante_canyon",
+      "center": {
+        "lat": 37.76365,
+        "lon": -111.59905
+      },
+      "width_km": 25,
+      "quicklook": true,
+      "description": "Escalante River canyons and slickrock"
+    },
+    {
+      "name": "zion_canyon",
+      "center": {
+        "lat": 37.29839,
+        "lon": -113.0263
+      },
+      "width_km": 25,
+      "quicklook": true,
+      "description": "Zion Canyon sandstone walls and slot canyons"
+    },
+    {
+      "name": "mt_rainier",
+      "center": {
+        "lat": 46.8523,
+        "lon": -121.7603
+      },
+      "width_km": 45,
+      "quicklook": true,
+      "description": "Mount Rainier volcanic cone and glaciers"
+    },
+    {
+      "name": "glacier_np",
+      "center": {
+        "lat": 48.6968,
+        "lon": -113.7183
+      },
+      "width_km": 50,
+      "quicklook": true,
+      "description": "Glacier National Park hanging valleys and cirques"
+    },
+    {
+      "name": "grand_canyon",
+      "center": {
+        "lat": 36.0544,
+        "lon": -112.1228
+      },
+      "width_km": 70,
+      "quicklook": true,
+      "description": "Grand Canyon stratified gorge"
+    },
+    {
+      "name": "badlands_sd",
+      "center": {
+        "lat": 43.8554,
+        "lon": -102.3397
+      },
+      "width_km": 35,
+      "quicklook": true,
+      "description": "South Dakota Badlands eroded formations"
+    },
+    {
+      "name": "appalachian_ridge",
+      "center": {
+        "lat": 37.4223,
+        "lon": -79.6110
+      },
+      "width_km": 45,
+      "quicklook": true,
+      "description": "Appalachian Ridge-and-Valley folding near Roanoke"
+    },
+    {
+      "name": "everglades",
+      "center": {
+        "lat": 25.7443,
+        "lon": -80.8860
+      },
+      "width_km": 60,
+      "quicklook": true,
+      "description": "Everglades wetlands – extremely low relief marsh"
+    },
+    {
+      "name": "white_sands",
+      "center": {
+        "lat": 32.787,
+        "lon": -106.3257
+      },
+      "width_km": 25,
+      "quicklook": true,
+      "description": "White Sands dune field"
+    },
+    {
+      "name": "niagara",
+      "center": {
+        "lat": 43.0896,
+        "lon": -79.0719
+      },
+      "width_km": 18,
+      "quicklook": true,
+      "description": "Niagara River escarpment and falls"
+    },
+    {
+      "name": "cape_cod",
+      "center": {
+        "lat": 41.9230,
+        "lon": -70.0280
+      },
+      "width_km": 45,
+      "quicklook": true,
+      "description": "Cape Cod coastline and tidal flats"
+    }
+  ]
+}

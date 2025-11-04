@@ -11,7 +11,7 @@ WhereWild is a capstone project that combines wildlife sightings (for example, i
 
 ## Why the Grid Matters
 - We picked a 100 m x 100 m grid that covers the continental U.S. (defined in `grid.json`). Every dataset we add later snaps to that grid so layers overlay cleanly.
-- Elevation is the foundation: once the DEM is aligned, we can derive slope/aspect/roughness and warp other layers (precipitation, NDVI, land cover, etc.).
+- Elevation is the foundation: once the DEM is aligned, we derive slope/aspect/roughness (stacked into a single terrain raster) and warp other layers (precipitation, NDVI, land cover, etc.).
 - We store aligned rasters as Cloud Optimized GeoTIFFs (COGs) because they’re fast to read, even over the network.
 - Each dataset carries provenance in `manifest.csv` so we know the source URL, license, and when we downloaded it.
 
@@ -19,12 +19,17 @@ WhereWild is a capstone project that combines wildlife sightings (for example, i
 ```
 WhereWild/
 ├── grid.json                # Canonical grid specification (CRS, bounds, pixel size)
+├── regions.json             # Predefined cutouts (Salt Lake, Hounds Tooth, etc.)
 ├── Makefile                 # Automation entry points (download, warp, validate)
 ├── manifest.csv             # Provenance log (populated as datasets are ingested)
 ├── requirements.txt         # Python dependencies for data processing
 ├── scripts/
 │   ├── download_dem.py      # Fetch USGS 3DEP tiles (parallel-aware)
-│   └── process_elevation.py # Mosaic + warp DEM tiles into the 100 m grid
+│   ├── process_elevation.py # Mosaic + warp DEM tiles into the 100 m grid
+│   ├── derive_terrain.py    # Build slope/aspect/roughness stack from the DEM
+│   ├── extract_cutout.py    # Helper to clip rasters around a lat/lon center
+│   ├── plot_quicklooks.py   # Render PNG previews for rasters (per band)
+│   └── build_regions.py     # Generate configured cutouts (Salt Lake, etc.)
 ├── raw/                     # Cached source data (ignored by git)
 └── processed/               # Aligned outputs (ignored by git)
 ```
@@ -61,7 +66,39 @@ make dem
 - Mosaics all cached tiles, reprojects to EPSG:5070 with 100 m pixels, and writes `processed/dem_100m_cog.tif` (COG when `rio-cogeo` is installed; otherwise a compressed GeoTIFF).
 - The derived product is logged to `manifest.csv` for provenance.
 
-### 3. Validate (Placeholder)
+### 2b. Fetch Sample Species Observations (Optional)
+```
+OBS_SPECIES=escobaria_vivipara OBS_SPECIES_ID=148405 make download-observations
+```
+- Caches the raw iNaturalist responses under `raw/observations/<species>/<run_timestamp>/`.
+- Projects each observation into the canonical grid and writes a presence table to `processed/observations/<species>/`.
+- Customize filters with environment variables (e.g. `OBS_MAX_RECORDS=500`, `OBS_QUALITY_GRADE=needs_id`, `OBS_BBOX=49,-66,24,-125`).
+
+### 3. Derive Terrain Layers
+```
+make terrain
+```
+- Generates a multi-band terrain stack (`processed/terrain/terrain_stack.tif`): band 1 slope (degrees), band 2 aspect (degrees, 0° = north, clockwise), band 3 3×3 roughness.
+- Outputs share the 100 m grid specification so downstream features align without resampling.
+
+### 4. Generate Standard Cutouts (Optional)
+```
+make regions
+```
+- Clips the multi-band terrain stack into named regions defined in `regions.json` (e.g., Salt Lake Valley, Hounds Tooth) and writes them under `processed/cutouts/<region>/`.
+- Extend `regions.json` with additional snapshots as needed.
+
+### 5. Quick Visualization (Optional)
+```
+venv/bin/python scripts/plot_quicklooks.py
+```
+- Builds PNG heatmaps for the global DEM, the terrain stack (per band), and every configured cutout (auto-downsampled for convenience).
+- Outputs live under `figures/quicklooks/<region>/` with filenames derived from the dataset and band names (no more `band3`).
+- Skips files that already exist; pass `--overwrite` to regenerate, or `--discover`/`--rasters` for custom inputs.
+- Multi-band rasters emit one PNG per band (e.g., slope, aspect, roughness).
+- Tune preview resolution with `--max-size`.
+
+### 6. Validate (Placeholder)
 ```
 make validate-dem
 ```
@@ -72,6 +109,7 @@ Hook for grid-alignment, statistics, and QA visualizations (to be implemented).
 - Add more environmental layers (precipitation, temperature, NDVI, land cover, distance-to-water, human footprint) using the same download + warp workflow.
 - Stand up validation scripts that check alignment, nodata coverage, and generate quick-look plots for QA.
 - Store the processed rasters in shared object storage so the app/backend can stream them without redownloading.
+- Enrich iNaturalist presence tables with weather, vegetation, and human footprint features so we can prototype habitat models quickly.
 
 ## Licensing & Attribution
 - USGS 3DEP elevation tiles are public domain; we still keep attribution info in the manifest.

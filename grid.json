@@ -1,7 +1,7 @@
 {
   "crs": "EPSG:5070",
   "pixel_size": 100,
-  "bounds": [-2500000, 150000, 2500000, 3300000],
+  "bounds": [-3100000, 200000, 2900000, 3700000],
   "nodata": -9999,
   "dtype": "float32",
   "align": "target_aligned_pixels"
