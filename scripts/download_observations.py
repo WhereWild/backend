@@ -34,11 +34,13 @@ MAX_PER_PAGE = 200
 
 
 def load_grid(path: Path) -> Dict[str, Any]:
+    """Load the grid definition so we can project lon/lat into grid cells."""
     with path.open() as fp:
         return json.load(fp)
 
 
 def compute_dimensions(bounds: Sequence[float], pixel_size: float) -> Tuple[int, int]:
+    """Reuse the width/height math so the grid projector knows the valid index range."""
     xmin, ymin, xmax, ymax = bounds
     width = int(round((xmax - xmin) / pixel_size))
     height = int(round((ymax - ymin) / pixel_size))
@@ -53,6 +55,7 @@ class GridIndex:
     row: int
 
     def cell_id(self) -> str:
+        """Combine column/row into a stable string for downstream joins."""
         return f"{self.column}_{self.row}"
 
 
@@ -69,6 +72,7 @@ class GridProjector:
         self._transformer = Transformer.from_crs(4326, crs, always_xy=True)
 
     def project(self, longitude: float, latitude: float) -> Optional[Tuple[float, float, GridIndex]]:
+        """Return projected x/y plus grid indices, or None when the point lives outside the grid."""
         x, y = self._transformer.transform(longitude, latitude)
         if not (self._xmin <= x <= self._xmax and self._ymin <= y <= self._ymax):
             return None
@@ -86,6 +90,7 @@ def chunked_observations(
     max_records: Optional[int],
     sleep_seconds: float,
 ) -> Iterator[Dict[str, Any]]:
+    """Paginate through the iNat API, yielding raw observation dicts."""
     total_fetched = 0
     page = 1
     while True:
@@ -104,15 +109,18 @@ def chunked_observations(
         page += 1
         if max_records is not None and total_fetched >= max_records:
             break
+        # Short pause between pages keeps us friendly with the API rate limits.
         time.sleep(sleep_seconds)
 
 
 def ensure_output_paths(raw_dir: Path, processed_dir: Path) -> None:
+    """Make sure the nested raw/processed folders exist before we start writing."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
 
 def append_manifest(manifest_path: Path, rows: Sequence[Dict[str, str]]) -> None:
+    """Upsert observation metadata into the shared manifest."""
     if manifest_path is None:
         return
     fieldnames = ["dataset", "source_url", "license", "created_at", "notes"]
@@ -130,6 +138,7 @@ def append_manifest(manifest_path: Path, rows: Sequence[Dict[str, str]]) -> None
         for row in rows:
             if row["source_url"] in existing_urls:
                 continue
+            # Rows are tiny; writing one at a time keeps the code straightforward.
             writer.writerow(row)
 
 
@@ -137,6 +146,7 @@ def extract_presence_row(
     obs: Dict[str, Any],
     projector: GridProjector,
 ) -> Optional[Dict[str, Any]]:
+    """Convert an iNaturalist observation into one grid-aligned presence row."""
     geojson = obs.get("geojson") or {}
     coords = geojson.get("coordinates")
     if not coords or len(coords) != 2:
@@ -201,6 +211,7 @@ def build_query_params(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+    """Validate bbox CLI input so we can forward four floats to the API."""
     if raw is None:
         return None
     parts = raw.split(",")
@@ -210,6 +221,7 @@ def parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]
 
 
 def write_jsonl_gz(path: Path, records: Iterable[Dict[str, Any]]) -> None:
+    """Dump newline-delimited JSON (gzipped) so raw API responses are easy to replay."""
     with gzip.open(path, "wt", encoding="utf-8") as fp:
         for record in records:
             fp.write(json.dumps(record))
@@ -217,6 +229,7 @@ def write_jsonl_gz(path: Path, records: Iterable[Dict[str, Any]]) -> None:
 
 
 def write_presence_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    """Persist the grid-aligned table as gzipped CSV with consistent headers."""
     fieldnames = [
         "observation_id",
         "species_id",
@@ -245,6 +258,7 @@ def create_output_paths(
     raw_root: Path,
     processed_root: Path,
 ) -> Tuple[Path, Path, str]:
+    """Build timestamped file paths so multiple runs stay organized."""
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     raw_dir = raw_root / "observations" / species_slug / timestamp
     processed_dir = processed_root / "observations" / species_slug
@@ -255,6 +269,7 @@ def create_output_paths(
 
 
 def download_and_process(args: argparse.Namespace) -> None:
+    """Main CLI flow: fetch observations, write artifacts, update manifest."""
     grid = load_grid(args.grid)
     projector = GridProjector(grid)
     session = requests.Session()
@@ -292,6 +307,7 @@ def download_and_process(args: argparse.Namespace) -> None:
         row = extract_presence_row(record, projector)
         if row is not None:
             presence_rows.append(row)
+    # Presence table only includes points landing inside the grid and with usable coords.
 
     processed_output: Optional[Path] = None
     if presence_rows:
@@ -322,6 +338,7 @@ def download_and_process(args: argparse.Namespace) -> None:
                 "notes": "Presence table aligned to 100 m grid.",
             }
         )
+    # Manifest rows document both the raw API query and the processed presence output.
     append_manifest(args.manifest, append_manifest_rows)
     print(f"Raw observations written to {raw_path}", flush=True)
     if processed_output:

@@ -98,6 +98,7 @@ def ensure_rasters(
     discover: bool,
     processed_root: Path,
 ) -> List[Path]:
+    """Return a deduplicated list of rasters from explicit paths, discovery, or both."""
     discovered: List[Path] = []
     if discover:
         if not processed_root.exists():
@@ -120,6 +121,7 @@ def ensure_rasters(
             continue
         seen.add(path)
         rasters.append(path)
+    # Ordering is deterministic: discovered files first, then explicitly provided ones.
     return rasters
 
 
@@ -128,6 +130,7 @@ def downsample_raster(
     max_size: int,
     band: int = 1,
 ) -> np.ma.MaskedArray:
+    """Read a raster band at reduced resolution to keep quicklooks speedy."""
     if max_size <= 0:
         data = src.read(band, masked=True)
         return data
@@ -149,12 +152,14 @@ def downsample_raster(
 
 
 def slugify(value: str, fallback: str) -> str:
+    """Make filesystem-friendly slugs while keeping a human-readable fallback."""
     cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
     cleaned = "_".join(filter(None, cleaned.split("_")))
     return cleaned or fallback
 
 
 def load_config(path: Path) -> Dict[str, object]:
+    """Load regions.json when present; fallback to an empty dict otherwise."""
     if path.exists():
         with path.open() as fp:
             return json.load(fp)
@@ -162,6 +167,7 @@ def load_config(path: Path) -> Dict[str, object]:
 
 
 def gather_default_targets(config_path: Path, processed_root: Path) -> List[Dict[str, object]]:
+    """Build a list of quicklook jobs from the config file and known datasets."""
     config = load_config(config_path)
     targets: List[Dict[str, object]] = []
 
@@ -219,6 +225,7 @@ def gather_default_targets(config_path: Path, processed_root: Path) -> List[Dict
 
 
 def targets_from_paths(rasters: Sequence[Path], processed_root: Path) -> List[Dict[str, object]]:
+    """Infer region labels/slugs from file paths when users pass --rasters."""
     targets: List[Dict[str, object]] = []
     for path in rasters:
         path = Path(path)
@@ -274,8 +281,10 @@ def compute_display_range(
     explicit: Optional[Tuple[float, Optional[float]]],
     pct: float,
 ) -> Tuple[float, float]:
+    """Turn masked raster values into display-friendly min/max bounds."""
     clipped = data.compressed()
     if clipped.size == 0:
+        # No valid pixels—fallback to a harmless default range.
         return (0.0, 1.0)
 
     lower_bound: float
@@ -307,6 +316,7 @@ def render_quicklook(
     band: int,
     band_display: str,
 ) -> Path:
+    """Render a single band quicklook PNG and return the output path."""
     with rasterio.open(path) as src:
         data = downsample_raster(src, max_size, band=band)
 
@@ -336,6 +346,7 @@ def main(argv: Sequence[str]) -> int:
 
     try:
         if not args.rasters and not args.discover:
+            # Default path: rely on regions.json + known datasets to decide what to plot.
             targets = gather_default_targets(args.config, processed_root)
         else:
             rasters = ensure_rasters(args.rasters, args.discover, processed_root)

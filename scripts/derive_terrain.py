@@ -28,6 +28,7 @@ DEFAULT_MANIFEST = Path("manifest.csv")
 
 
 def load_grid(path: Path) -> Dict[str, float]:
+    """Grab grid metadata so we know pixel size for slope calculations."""
     with path.open() as fp:
         import json
 
@@ -41,6 +42,7 @@ def create_output_profile(
     nodata: float = -9999.0,
     count: int = 1,
 ) -> Dict[str, object]:
+    """Clone the DEM profile but swap in our own datatype and band count."""
     profile = base_profile.copy()
     profile.update(
         {
@@ -138,6 +140,7 @@ def compute_metrics(block: np.ndarray, cellsize: float) -> Tuple[np.ndarray, np.
 
 
 def expand_window(window: Window, padding: int = 1) -> Window:
+    """Grow a Rasterio window by `padding` cells on all sides."""
     return Window(
         col_off=window.col_off - padding,
         row_off=window.row_off - padding,
@@ -153,6 +156,7 @@ def write_block(
     window: Window,
     nodata: float,
 ) -> None:
+    """Write a single block to disk, swapping NaNs for the nodata sentinel."""
     filled = np.where(np.isnan(data), nodata, data).astype(np.float32, copy=False)
     dataset.write(filled, band_index, window=window)
 
@@ -163,6 +167,7 @@ def derive_terrain(
     output_dir: Path,
     manifest_path: Optional[Path] = None,
 ) -> Dict[str, Path]:
+    """Main driver: loop over DEM blocks, compute metrics, write outputs, log manifest."""
     grid = load_grid(grid_path)
     cellsize = float(grid["pixel_size"])
 
@@ -185,6 +190,7 @@ def derive_terrain(
                 total_blocks = sum(1 for _ in src.block_windows(1))
                 for idx, (block_index, window) in enumerate(src.block_windows(1), start=1):
                     print(f"[{idx}/{total_blocks}] Processing block {block_index}", flush=True)
+                    # Pull a padded block so Horn's kernel has neighbors along the edges.
                     padded_window = expand_window(window, padding=1)
                     block = src.read(
                         1,
@@ -193,10 +199,12 @@ def derive_terrain(
                         fill_value=nodata,
                     ).astype(np.float32, copy=False)
 
+                    # Raster math is easier when nodata becomes NaN.
                     block[block == nodata] = np.nan
 
                     slope_block, aspect_block, roughness_block = compute_metrics(block, cellsize)
 
+                    # Write the original DEM values alongside the derived metrics.
                     dem_block = src.read(1, window=window).astype(np.float32, copy=False)
                     dem_block = np.where(dem_block == dem_nodata, np.nan, dem_block)
 
@@ -217,6 +225,9 @@ def derive_terrain(
             legacy.unlink()
         except FileNotFoundError:
             pass
+        # If removal succeeds we stay quiet—these files were transitional outputs.
+        else:
+            print(f"Removed outdated single-band file: {legacy}")
 
     artifact_paths = {
         "stack": stack_path,
@@ -226,6 +237,7 @@ def derive_terrain(
 
 
 def append_manifest(manifest_path: Optional[Path], artifacts: Dict[str, Path]) -> None:
+    """Record the terrain stack in the project manifest (unless we're told not to)."""
     if manifest_path is None:
         return
 

@@ -42,6 +42,7 @@ TNM_S3_BASE = (
 
 
 def load_grid(grid_path: Path) -> Dict[str, float]:
+    """Pull grid metadata so we know the area to cover with downloads."""
     with grid_path.open() as fp:
         grid = json.load(fp)
     for key in ("bounds", "crs"):
@@ -51,6 +52,7 @@ def load_grid(grid_path: Path) -> Dict[str, float]:
 
 
 def bounds_to_latlon(bounds: List[float], crs: str) -> Tuple[float, float, float, float]:
+    """Reproject the grid bounds into lat/lon so they line up with USGS tiles."""
     transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
     xmin, ymin, xmax, ymax = bounds
     lon_min, lat_min = transformer.transform(xmin, ymin)
@@ -63,6 +65,7 @@ def bounds_to_latlon(bounds: List[float], crs: str) -> Tuple[float, float, float
 def degree_tile_names(
     lon_left: float, lat_bottom: float, lon_right: float, lat_top: float
 ) -> Iterable[str]:
+    """Yield the standard 1x1 degree tile names (e.g., n40w111) covering our extent."""
     lon_start = math.floor(lon_left)
     lon_stop = math.ceil(lon_right)
     lat_start = math.floor(lat_bottom)
@@ -82,6 +85,7 @@ def tile_url(tile_name: str) -> str:
 
 
 def download_file(url: str, destination: Path) -> bool:
+    """Stream a GeoTIFF to disk, writing through *.part so partial files are obvious."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         return False
@@ -92,6 +96,7 @@ def download_file(url: str, destination: Path) -> bool:
             chunk = response.read(1024 * 1024)
             while chunk:
                 out_fp.write(chunk)
+                # Stream in 1 MB chunks to keep memory usage tiny.
                 chunk = response.read(1024 * 1024)
     except HTTPError as err:
         if err.code == 404:
@@ -106,6 +111,7 @@ def download_file(url: str, destination: Path) -> bool:
 
 
 def read_manifest(manifest_path: Path) -> List[Dict[str, str]]:
+    """Read existing manifest rows so we can skip duplicates."""
     if not manifest_path.exists():
         return []
     with manifest_path.open(newline="") as fp:
@@ -117,6 +123,7 @@ def append_manifest(
     manifest_path: Path,
     entries: Iterable[Dict[str, str]],
 ) -> None:
+    """Append new download records to the manifest without duplicating URLs."""
     existing = read_manifest(manifest_path)
     existing_urls = {row["source_url"] for row in existing}
 
@@ -140,6 +147,7 @@ def run(
     dry_run: bool,
     workers: int,
 ) -> None:
+    """End-to-end downloader: find tiles, fetch missing ones, and log them."""
     grid = load_grid(grid_path)
     lon_left, lat_bottom, lon_right, lat_top = bounds_to_latlon(
         grid["bounds"], grid["crs"]
@@ -170,6 +178,7 @@ def run(
         if destination.exists():
             continue
         tiles_to_fetch.append((tile, url, destination))
+    # tiles_to_fetch tracks only the missing rasters so parallel downloads stay focused.
 
     total = len(tiles_to_fetch)
     workers = max(1, workers)
@@ -185,6 +194,7 @@ def run(
         print(f"Using {workers} parallel workers.")
 
     def worker(task: Tuple[str, str, Path]) -> Tuple[str, bool, str]:
+        """Download a single tile; returned tuple mirrors the manifest fields we need."""
         tile, url, destination = task
         print(f"Downloading {tile} ...")
         fetched = download_file(url, destination)

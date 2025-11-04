@@ -57,6 +57,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def load_config(path: Path) -> Dict:
+    """Load the regions.json file that lists every named cutout."""
     if not path.exists():
         raise FileNotFoundError(f"Region configuration not found: {path}")
     with path.open() as fp:
@@ -64,6 +65,7 @@ def load_config(path: Path) -> Dict:
 
 
 def ensure_datasets(keys: Iterable[str], dataset_map: Dict[str, Path]) -> Dict[str, Path]:
+    """Validate dataset choices and make sure the corresponding rasters exist."""
     paths: Dict[str, Path] = {}
     for key in keys:
         if key not in dataset_map:
@@ -83,6 +85,7 @@ def build_cutouts(
     output_root: Path,
     overwrite: bool,
 ) -> None:
+    """Loop through regions and write one cutout per dataset."""
     cutouts = config.get("cutouts", [])
     if not cutouts:
         print("No cutouts defined in configuration.")
@@ -126,6 +129,7 @@ def build_cutouts(
         for orphan in region_dir.glob("*.tif"):
             if orphan.resolve() not in tracked:
                 orphan.unlink()
+                print(f"  removed leftover cutout {orphan}")
 
 
 def main(argv: Sequence[str]) -> int:

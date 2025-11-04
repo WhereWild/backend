@@ -92,6 +92,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def parse_center(raw: str, center_format: str | None) -> Tuple[float, float]:
+    """Turn a CLI comma pair into (lat, lon), inferring order when needed."""
     parts = raw.split(",")
     if len(parts) != 2:
         raise ValueError("Center must be 'lat,lon' or 'lon,lat'.")
@@ -110,6 +111,7 @@ def parse_center(raw: str, center_format: str | None) -> Tuple[float, float]:
 
 
 def load_regions_config(path: Path) -> Dict[str, Any]:
+    """Load the JSON config that lists reusable cutout regions."""
     if not path.exists():
         raise FileNotFoundError(f"Region configuration not found: {path}")
     with path.open() as fp:
@@ -117,6 +119,7 @@ def load_regions_config(path: Path) -> Dict[str, Any]:
 
 
 def slugify_name(value: str) -> str:
+    """Lowercase and sanitize region names so we can safely use them in filenames."""
     cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in value)
     cleaned = "_".join(filter(None, cleaned.split("_")))
     return cleaned or "cutout"
@@ -129,6 +132,7 @@ def extract_cutout(
     size_km: float,
     output: Path,
 ) -> Dict[str, Any]:
+    """Clip a square raster window around the requested center and write it to disk."""
     half_size_m = size_km * 1000
     if half_size_m <= 0:
         raise ValueError("size_km must be positive.")
@@ -140,6 +144,7 @@ def extract_cutout(
 
         row, col = src.index(x, y)
         half_pixels = int(round(half_size_m / src.res[0]))
+        # Rasterio windows operate on pixel indices; we build a square around the center.
         window = windows.Window(
             col_off=col - half_pixels,
             row_off=row - half_pixels,
@@ -194,6 +199,7 @@ def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
 
     if not argv and not args.center and not args.name:
+        # Calling the script with zero arguments defaults to generating all configured cutouts.
         args.all = True
 
     if args.center:
