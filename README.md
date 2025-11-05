@@ -32,6 +32,8 @@ WhereWild/
 │   ├── extract_cutout.py    # Helper to clip rasters around a lat/lon center
 │   ├── plot_quicklooks.py   # Render PNG previews for rasters (per band)
 │   ├── build_feature_table.py # Export tidy Parquet feature tables per region
+│   ├── sample_species_features.py # Join observations with raster-derived features
+│   ├── model_species_presence.py  # Train a baseline presence/absence classifier
 │   └── build_regions.py     # Generate configured cutouts (Salt Lake, etc.)
 ├── raw/                     # Cached source data (ignored by git)
 └── processed/               # Aligned outputs (ignored by git)
@@ -73,8 +75,8 @@ make dem
 ```
 OBS_SPECIES=escobaria_vivipara OBS_SPECIES_ID=148405 make download-observations
 ```
-- Caches the raw iNaturalist responses under `raw/observations/<species>/<run_timestamp>/`.
-- Projects each observation into the canonical grid and writes a presence table to `processed/observations/<species>/`.
+- Caches the raw iNaturalist responses under `raw/observations/<species>/` (overwrites on refresh).
+- Projects each observation into the canonical grid and writes `processed/observations/<species>/<species>_presence.csv.gz`.
 - Customize filters with environment variables (e.g. `OBS_MAX_RECORDS=500`, `OBS_QUALITY_GRADE=needs_id`, `OBS_BBOX=49,-66,24,-125`).
 
 ### 3. Derive Terrain Layers
@@ -117,7 +119,34 @@ make features
 - Exports tidy Parquet tables under `processed/features/<region>.parquet` for every configured cutout (coordinates + terrain + land cover columns).
 - Great for modeling workflows that prefer tabular features over rasters. Enable `--include-conus` in the script if you really need the full domain (beware: huge).
 
-### 8. Validate (Placeholder)
+### 8. Sample Species Features (Optional)
+```
+venv/bin/python scripts/sample_species_features.py \
+  --observations processed/observations/escobaria_vivipara/escobaria_vivipara_presence_<timestamp>.csv.gz
+```
+- Enriches the presence table with elevation, slope, aspect, roughness, and land-cover values sampled from the processed rasters.
+- Presence rows now also carry basic phenology flags (budding/flowering/fruiting) derived from iNaturalist annotations when available.
+- Writes an augmented table (`*_features.*`) plus a JSON summary (basic stats, land-cover counts) for quick QA.
+
+### 9. Train a Baseline Presence Model (Optional)
+```
+venv/bin/python scripts/model_species_presence.py \
+  --features processed/observations/escobaria_vivipara/escobaria_vivipara_features.csv.gz \
+  --background processed/features/conus.parquet \
+  --prefix escobaria_vivipara
+```
+- Combines the species features with a random background sample, fits a simple classifier (logistic by default), and writes metrics/predictions under `models/`.
+- Requires `pandas`, `pyarrow`, and `scikit-learn` (install via `pip install -r requirements.txt`).
+### 9b. End-to-End Species Pipeline (Optional)
+```
+make species slug=escobaria_vivipara
+```
+- Reads settings from `species.json`, runs the downloader, feature sampler, and plots in sequence.
+- Drop the `slug=…` parameter to process every species listed in the config.
+- Each entry in `species.json` can declare a `group` (e.g. `plant`, `fungus`). Plants automatically get phenology plots; disable them with `EXTRA="--no-phenology" make species slug=...`.
+- KDE overlays are on by default; disable with `EXTRA="--no-kde" ...`. Force a refresh run via `EXTRA="--force-download" ...` when you need new observations.
+
+### 10. Validate (Placeholder)
 ```
 make validate-dem
 ```

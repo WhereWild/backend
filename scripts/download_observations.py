@@ -32,15 +32,77 @@ from pyproj import CRS, Transformer
 INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 MAX_PER_PAGE = 200
 
+_PLANT_PHENOLOGY_CACHE: Optional[Dict[int, str]] = None
+
+# Hard-coded fallback for the common Plant Phenology controlled values. iNat mostly
+# serves this list via /controlled_terms, but we keep a local copy so the pipeline
+# still enriches observations when the network is locked down.
+DEFAULT_PLANT_PHENOLOGY_VALUES: Dict[int, str] = {
+    12: "Flower buds",
+    13: "Flowers",
+    14: "Fruits or seeds",
+    15: "Flower buds",
+    21: "No evidence of flowering",
+}
+
+PHENOLOGY_BUD_IDS = {12, 15}
+PHENOLOGY_FLOWER_IDS = {13}
+PHENOLOGY_FRUIT_IDS = {14}
+PHENOLOGY_NO_FLOWER_IDS = {21}
+
+
+def _get_plant_phenology_map() -> Dict[int, str]:
+    """
+    Load controlled terms and extract the mapping of value_id -> label for phenology.
+
+    The iNaturalist API sometimes names the phenology term "Plant Phenology"
+    and sometimes "Flowers and Fruits". Both share attribute ID 12, so we match by ID.
+    """
+    global _PLANT_PHENOLOGY_CACHE
+    if _PLANT_PHENOLOGY_CACHE is not None:
+        return _PLANT_PHENOLOGY_CACHE
+
+    url = "https://api.inaturalist.org/v1/controlled_terms"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:  # pragma: no cover
+        print(
+            f"Warning: failed to load controlled terms ({exc}); falling back to bundled phenology labels.",
+            file=sys.stderr,
+        )
+        _PLANT_PHENOLOGY_CACHE = DEFAULT_PLANT_PHENOLOGY_VALUES.copy()
+        return _PLANT_PHENOLOGY_CACHE
+
+    mapping: Dict[int, str] = {}
+    for term in payload.get("results", []):
+        # Most reliable: match by ID == 12
+        if term.get("id") == 12:
+            for value in term.get("values", []):
+                value_id = value.get("id")
+                label = value.get("label")
+                if value_id is not None and label:
+                    mapping[value_id] = label
+            break
+
+    if not mapping:
+        print(
+            "Warning: controlled terms response did not include phenology values; using fallback labels.",
+            file=sys.stderr,
+        )
+        mapping = DEFAULT_PLANT_PHENOLOGY_VALUES.copy()
+
+    _PLANT_PHENOLOGY_CACHE = mapping
+    return _PLANT_PHENOLOGY_CACHE
+
 
 def load_grid(path: Path) -> Dict[str, Any]:
-    """Load the grid definition so we can project lon/lat into grid cells."""
     with path.open() as fp:
         return json.load(fp)
 
 
 def compute_dimensions(bounds: Sequence[float], pixel_size: float) -> Tuple[int, int]:
-    """Reuse the width/height math so the grid projector knows the valid index range."""
     xmin, ymin, xmax, ymax = bounds
     width = int(round((xmax - xmin) / pixel_size))
     height = int(round((ymax - ymin) / pixel_size))
@@ -55,13 +117,10 @@ class GridIndex:
     row: int
 
     def cell_id(self) -> str:
-        """Combine column/row into a stable string for downstream joins."""
         return f"{self.column}_{self.row}"
 
 
 class GridProjector:
-    """Project WGS84 coordinates into the canonical grid and compute cell indices."""
-
     def __init__(self, grid: Dict[str, Any]) -> None:
         bounds = grid["bounds"]
         pixel_size = float(grid["pixel_size"])
@@ -72,7 +131,6 @@ class GridProjector:
         self._transformer = Transformer.from_crs(4326, crs, always_xy=True)
 
     def project(self, longitude: float, latitude: float) -> Optional[Tuple[float, float, GridIndex]]:
-        """Return projected x/y plus grid indices, or None when the point lives outside the grid."""
         x, y = self._transformer.transform(longitude, latitude)
         if not (self._xmin <= x <= self._xmax and self._ymin <= y <= self._ymax):
             return None
@@ -90,7 +148,6 @@ def chunked_observations(
     max_records: Optional[int],
     sleep_seconds: float,
 ) -> Iterator[Dict[str, Any]]:
-    """Paginate through the iNat API, yielding raw observation dicts."""
     total_fetched = 0
     page = 1
     while True:
@@ -109,18 +166,15 @@ def chunked_observations(
         page += 1
         if max_records is not None and total_fetched >= max_records:
             break
-        # Short pause between pages keeps us friendly with the API rate limits.
         time.sleep(sleep_seconds)
 
 
 def ensure_output_paths(raw_dir: Path, processed_dir: Path) -> None:
-    """Make sure the nested raw/processed folders exist before we start writing."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
 
 def append_manifest(manifest_path: Path, rows: Sequence[Dict[str, str]]) -> None:
-    """Upsert observation metadata into the shared manifest."""
     if manifest_path is None:
         return
     fieldnames = ["dataset", "source_url", "license", "created_at", "notes"]
@@ -138,7 +192,6 @@ def append_manifest(manifest_path: Path, rows: Sequence[Dict[str, str]]) -> None
         for row in rows:
             if row["source_url"] in existing_urls:
                 continue
-            # Rows are tiny; writing one at a time keeps the code straightforward.
             writer.writerow(row)
 
 
@@ -146,12 +199,16 @@ def extract_presence_row(
     obs: Dict[str, Any],
     projector: GridProjector,
 ) -> Optional[Dict[str, Any]]:
-    """Convert an iNaturalist observation into one grid-aligned presence row."""
     geojson = obs.get("geojson") or {}
     coords = geojson.get("coordinates")
-    if not coords or len(coords) != 2:
-        return None
-    longitude, latitude = coords
+    if coords and len(coords) == 2:
+        longitude, latitude = coords
+    else:
+        latitude = obs.get("latitude")
+        longitude = obs.get("longitude")
+        if latitude is None or longitude is None:
+            return None
+
     projected = projector.project(longitude, latitude)
     if projected is None:
         return None
@@ -163,6 +220,50 @@ def extract_presence_row(
         or obs.get("time_observed_at")
         or obs.get("observed_on")
     )
+
+    annotations = obs.get("annotations") or []
+    phenology = {
+        "phenology_budding": None,
+        "phenology_flowering": None,
+        "phenology_fruiting": None,
+        "phenology_stage": None,
+    }
+    phenology_map = _get_plant_phenology_map()
+
+    for annotation in annotations:
+        attr_id = annotation.get("controlled_attribute_id")
+        value_id = annotation.get("controlled_value_id")
+        if attr_id == 12 and value_id is not None:
+            label = phenology_map.get(value_id)
+            if not label:
+                continue
+
+            stage_label = label.strip().lower()
+            phenology["phenology_stage"] = stage_label
+
+            if value_id in PHENOLOGY_NO_FLOWER_IDS or (
+                stage_label.startswith("no ")
+                and ("flower" in stage_label or "fruit" in stage_label)
+            ):
+                phenology["phenology_budding"] = 0
+                phenology["phenology_flowering"] = 0
+                phenology["phenology_fruiting"] = 0
+                continue
+
+            if value_id in PHENOLOGY_BUD_IDS or "bud" in stage_label:
+                phenology["phenology_budding"] = 1
+            if value_id in PHENOLOGY_FLOWER_IDS or (
+                "flower" in stage_label and "bud" not in stage_label and "no" not in stage_label
+            ):
+                phenology["phenology_flowering"] = 1
+            if value_id in PHENOLOGY_FRUIT_IDS or "fruit" in stage_label or "seed" in stage_label:
+                phenology["phenology_fruiting"] = 1
+
+    if phenology["phenology_stage"] is None:
+        phenology["phenology_stage"] = "no evidence of flowering"
+    for key in ("phenology_budding", "phenology_flowering", "phenology_fruiting"):
+        if phenology[key] is None:
+            phenology[key] = 0
 
     return {
         "observation_id": obs["id"],
@@ -180,6 +281,7 @@ def extract_presence_row(
         "projected_x": x,
         "projected_y": y,
         "presence": 1,
+        **phenology,
     }
 
 
@@ -188,6 +290,7 @@ def build_query_params(args: argparse.Namespace) -> Dict[str, Any]:
         "taxon_id": args.species_id,
         "order": "desc",
         "order_by": "created_at",
+        "annotations": "true",
     }
     if args.quality_grade:
         params["quality_grade"] = args.quality_grade
@@ -211,7 +314,6 @@ def build_query_params(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
-    """Validate bbox CLI input so we can forward four floats to the API."""
     if raw is None:
         return None
     parts = raw.split(",")
@@ -221,7 +323,6 @@ def parse_bbox(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]
 
 
 def write_jsonl_gz(path: Path, records: Iterable[Dict[str, Any]]) -> None:
-    """Dump newline-delimited JSON (gzipped) so raw API responses are easy to replay."""
     with gzip.open(path, "wt", encoding="utf-8") as fp:
         for record in records:
             fp.write(json.dumps(record))
@@ -229,7 +330,6 @@ def write_jsonl_gz(path: Path, records: Iterable[Dict[str, Any]]) -> None:
 
 
 def write_presence_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
-    """Persist the grid-aligned table as gzipped CSV with consistent headers."""
     fieldnames = [
         "observation_id",
         "species_id",
@@ -246,6 +346,10 @@ def write_presence_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
         "projected_x",
         "projected_y",
         "presence",
+        "phenology_budding",
+        "phenology_flowering",
+        "phenology_fruiting",
+        "phenology_stage",
     ]
     with gzip.open(path, "wt", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -258,18 +362,16 @@ def create_output_paths(
     raw_root: Path,
     processed_root: Path,
 ) -> Tuple[Path, Path, str]:
-    """Build timestamped file paths so multiple runs stay organized."""
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    raw_dir = raw_root / "observations" / species_slug / timestamp
+    raw_dir = raw_root / "observations" / species_slug
     processed_dir = processed_root / "observations" / species_slug
     ensure_output_paths(raw_dir, processed_dir)
     raw_path = raw_dir / f"{species_slug}_observations.jsonl.gz"
-    processed_path = processed_dir / f"{species_slug}_presence_{timestamp}.csv.gz"
+    processed_path = processed_dir / f"{species_slug}_presence.csv.gz"
     return raw_path, processed_path, timestamp
 
 
 def download_and_process(args: argparse.Namespace) -> None:
-    """Main CLI flow: fetch observations, write artifacts, update manifest."""
     grid = load_grid(args.grid)
     projector = GridProjector(grid)
     session = requests.Session()
@@ -278,18 +380,15 @@ def download_and_process(args: argparse.Namespace) -> None:
 
     print(f"Fetching observations for species_id={args.species_id}", flush=True)
     all_records: List[Dict[str, Any]] = []
-    try:
-        for record in chunked_observations(
-            session=session,
-            params=params,
-            per_page=per_page,
-            max_records=args.max_records,
-            sleep_seconds=args.sleep,
-        ):
-            all_records.append(record)
-    except requests.HTTPError as exc:
-        print(f"HTTP error while fetching observations: {exc}", file=sys.stderr)
-        raise
+
+    for record in chunked_observations(
+        session=session,
+        params=params,
+        per_page=per_page,
+        max_records=args.max_records,
+        sleep_seconds=args.sleep,
+    ):
+        all_records.append(record)
 
     print(f"Fetched {len(all_records)} observations", flush=True)
     if args.dry_run or not all_records:
@@ -307,7 +406,6 @@ def download_and_process(args: argparse.Namespace) -> None:
         row = extract_presence_row(record, projector)
         if row is not None:
             presence_rows.append(row)
-    # Presence table only includes points landing inside the grid and with usable coords.
 
     processed_output: Optional[Path] = None
     if presence_rows:
@@ -338,7 +436,7 @@ def download_and_process(args: argparse.Namespace) -> None:
                 "notes": "Presence table aligned to 100 m grid.",
             }
         )
-    # Manifest rows document both the raw API query and the processed presence output.
+
     append_manifest(args.manifest, append_manifest_rows)
     print(f"Raw observations written to {raw_path}", flush=True)
     if processed_output:
@@ -463,7 +561,7 @@ def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     try:
         download_and_process(args)
-    except Exception as exc:  # pragma: no cover - command-line guardrail
+    except Exception as exc:  # pragma: no cover
         print(exc, file=sys.stderr)
         return 1
     return 0

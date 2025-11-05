@@ -16,7 +16,7 @@ LANDCOVER_RAW_TIF := $(LANDCOVER_RAW_DIR)/nlcd_2019_land_cover_l48_20210604.tif
 LANDCOVER_OUTPUT := $(PROCESSED_DIR)/landcover/landcover_100m_cog.tif
 FEATURES_DIR := $(PROCESSED_DIR)/features
 
-.PHONY: all download-dem download-observations download-landcover dem terrain landcover regions plots features warp-dem validate-dem metadata clean
+.PHONY: all download-dem download-observations download-landcover dem terrain landcover regions plots features species warp-dem validate-dem metadata clean
 
 all: dem terrain landcover
 
@@ -109,6 +109,15 @@ features: regions landcover
 		--config regions.json \
 		--output-dir $(FEATURES_DIR) \
 		--manifest manifest.csv
+	@$(PYTHON) $(SCRIPTS_DIR)/build_feature_table.py \
+		--processed-root $(PROCESSED_DIR) \
+		--config regions.json \
+		--output-dir $(FEATURES_DIR) \
+		--manifest manifest.csv \
+		--include-conus
+
+species:
+	@$(PYTHON) $(SCRIPTS_DIR)/run_species_pipeline.py $(if $(slug),--slug $(slug),) $(EXTRA)
 
 # Optional validation / QA hooks.
 warp-dem: dem

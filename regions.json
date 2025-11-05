@@ -234,6 +234,22 @@
       "width_km": 45,
       "quicklook": true,
       "description": "Cape Cod coastline and tidal flats"
+    },
+    {
+      "name": "salt_lake_to_elko",
+      "center": {
+        "lat": 40.8200,
+        "lon": -113.8400
+      },
+      "width_km": 320,
+      "quicklook": true,
+      "description": "Broad Wasatch-to-Ruby corridor spanning Salt Lake City to Elko for Great Basin shrubland gradients"
+    },
+    {
+      "name": "four_corners_mega",
+      "center": { "lat": 37.0, "lon": -109.0 },
+      "width_km": 500,
+      "quicklook": true
     }
   ]
 }

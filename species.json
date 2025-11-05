@@ -1,0 +1,130 @@
+{
+  "species": [
+    {
+      "slug": "castilleja_occidentalis",
+      "inat_id": 117497,
+      "region": "four_corners_mega",
+      "max_records": 1000,
+      "group": "plant"
+    },
+    {
+      "slug": "echinocereus_mojavensis",
+      "inat_id": 858352,
+      "region": "four_corners_mega",
+      "max_records": 6000,
+      "group": "plant"
+    },
+    {
+      "slug": "escobaria_vivipara",
+      "inat_id": 148405,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },
+    {
+      "slug": "fomitopsis_schrenkii",
+      "inat_id": 877362,
+      "region": "four_corners_mega",
+      "max_records": 5000,
+      "group": "fungus"
+    },
+    {
+      "slug": "juniperus_osteosperma",
+      "inat_id": 77600,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },
+    {
+      "slug": "linanthus_pungens",
+      "inat_id": 52148,
+      "region": "four_corners_mega",
+      "max_records": 4000,
+      "group": "plant"
+    },
+    {
+      "slug": "linanthus_watsonii",
+      "inat_id": 569448,
+      "region": "salt_lake_to_elko",
+      "max_records": 100,
+      "group": "plant"
+    },
+    {
+      "slug": "opuntia_polyacantha",
+      "inat_id": 78269,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },
+    {
+      "slug": "pediocactus_simpsonii",
+      "inat_id": 119306,
+      "region": "four_corners_mega",
+      "max_records": 6000,
+      "group": "plant"
+    },
+    {
+      "slug": "pinus_edulis",
+      "inat_id": 57902,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },
+    {
+      "slug": "populus_tremuloides",
+      "inat_id": 54840,
+      "region": "four_corners_mega",
+      "max_records": 5000,
+      "group": "plant"
+    },
+    {
+      "slug": "quercus_gambelii",
+      "inat_id": 116377,
+      "region": "four_corners_mega",
+      "max_records": 5000,
+      "group": "plant"
+    },
+    {
+      "slug": "ribes_cereum",
+      "inat_id": 78854,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },
+    {
+      "slug": "sclerocactus_parviflorus",
+      "inat_id": 148445,
+      "region": "four_corners_mega",
+      "max_records": 6000,
+      "group": "plant"
+    },
+    {
+      "slug": "sclerocactus_wrightiae",
+      "inat_id": 148303,
+      "region": "four_corners_mega",
+      "max_records": 500,
+      "group": "plant"
+    },
+    {
+      "slug": "sedum_lanceolatum",
+      "inat_id": 79026,
+      "region": "four_corners_mega",
+      "max_records": 5000,
+      "group": "plant"
+    },
+    {
+      "slug": "sphaeralcea_coccinea",
+      "inat_id": 126671,
+      "region": "four_corners_mega",
+      "max_records": 2000,
+      "group": "plant"
+    },
+    {
+      "slug": "townsendia_incana",
+      "inat_id": 148148,
+      "region": "four_corners_mega",
+      "max_records": 1800,
+      "group": "plant"
+    }
+  ]
+}
