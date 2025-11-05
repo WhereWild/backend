@@ -22,7 +22,9 @@ import matplotlib
 # Headless environment compatibility.
 matplotlib.use("Agg")  # type: ignore[attr-defined]
 
-import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib import pyplot as plt  # noqa: E402
+from matplotlib.colors import BoundaryNorm, ListedColormap  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 import numpy as np  # noqa: E402
 import rasterio  # noqa: E402
 from pyproj import Transformer  # noqa: E402
@@ -34,10 +36,44 @@ DEFAULT_OUTPUT_DIR = Path("figures/quicklooks")
 DEFAULT_PROCESSED_DIR = Path("processed")
 DEFAULT_CONFIG = Path("regions.json")
 
-# Default datasets built from the canonical terrain stack (no standalone DEM quicklook).
+# Default datasets baked into the project.
+# Base datasets (global rasters sitting directly under processed/).
 DEFAULT_BASE_DATASETS: Tuple[Tuple[str, str, Path], ...] = (
     ("Terrain Stack", "terrain_stack", Path("terrain/terrain_stack.tif")),
+    ("Land Cover", "landcover", Path("landcover/landcover_100m_cog.tif")),
 )
+
+# Named cutouts inherit these datasets when present under processed/cutouts/<region>/.
+CUTOUT_DATASETS: Tuple[Tuple[str, str], ...] = (
+    ("Terrain Stack", "terrain_stack"),
+    ("Land Cover", "landcover"),
+)
+
+# Categorical rasters (we stick to nearest-neighbour sampling + discrete palettes).
+CATEGORICAL_DATASETS = {"landcover"}
+
+NLCD_CLASSES = {
+    11: ("Open Water", "#476BA1"),
+    12: ("Perennial Ice/Snow", "#A3CCFF"),
+    21: ("Developed, Open Space", "#DDC9C9"),
+    22: ("Developed, Low Intensity", "#D89382"),
+    23: ("Developed, Medium Intensity", "#ED0000"),
+    24: ("Developed, High Intensity", "#840000"),
+    31: ("Barren Land", "#B2ADA3"),
+    41: ("Deciduous Forest", "#68AB5F"),
+    42: ("Evergreen Forest", "#1C5F2C"),
+    43: ("Mixed Forest", "#B5C58F"),
+    51: ("Dwarf Scrub", "#AF963C"),
+    52: ("Shrub/Scrub", "#D1BB82"),
+    71: ("Grassland/Herbaceous", "#E3E35A"),
+    72: ("Sedge/Herbaceous", "#C3E87F"),
+    73: ("Lichens", "#B5E9BD"),
+    74: ("Moss", "#70A3BA"),
+    81: ("Pasture/Hay", "#DEDFA6"),
+    82: ("Cultivated Crops", "#E29E8C"),
+    90: ("Woody Wetlands", "#C8E6C6"),
+    95: ("Herbaceous Wetlands", "#7DC8C5"),
+}
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -129,6 +165,7 @@ def downsample_raster(
     src: rasterio.io.DatasetReader,
     max_size: int,
     band: int = 1,
+    resampling: Resampling = Resampling.average,
 ) -> np.ma.MaskedArray:
     """Read a raster band at reduced resolution to keep quicklooks speedy."""
     if max_size <= 0:
@@ -145,7 +182,7 @@ def downsample_raster(
     data = src.read(
         band,
         out_shape=(1, out_height, out_width),
-        resampling=Resampling.average,
+        resampling=resampling,
         masked=True,
     )
     return data
@@ -196,15 +233,17 @@ def gather_default_targets(config_path: Path, processed_root: Path) -> List[Dict
             continue
         region_label = region.get("name", "cutout")
         region_slug = slugify(region_label, region_label)
-        stack_path = processed_root / "cutouts" / region_slug / "terrain_stack.tif"
-        if stack_path.exists():
+        for display_name, dataset_slug in CUTOUT_DATASETS:
+            cutout_path = processed_root / "cutouts" / region_slug / f"{dataset_slug}.tif"
+            if not cutout_path.exists():
+                continue
             targets.append(
                 {
                     "region_slug": region_slug,
                     "region_label": region_label,
-                    "dataset_slug": "terrain_stack",
-                    "dataset_label": "Terrain Stack",
-                    "path": stack_path,
+                    "dataset_slug": slugify(dataset_slug, dataset_slug),
+                    "dataset_label": display_name,
+                    "path": cutout_path,
                 }
             )
     if not targets:
@@ -265,6 +304,8 @@ def pick_colormap(dataset_slug: str, band_label: str) -> Tuple[str, Optional[Tup
     lower: Optional[float] = None
     upper: Optional[float] = None
     name = f"{dataset_slug.lower()}_{band_label.lower()}"
+    if "landcover" in dataset_slug.lower():
+        return "tab20", (0.0, 95.0)
     if "aspect" in name:
         return "twilight", (0.0, 360.0)
     if "slope" in name:
@@ -317,11 +358,11 @@ def render_quicklook(
     band_display: str,
 ) -> Path:
     """Render a single band quicklook PNG and return the output path."""
-    with rasterio.open(path) as src:
-        data = downsample_raster(src, max_size, band=band)
+    categorical = any(token in dataset_slug for token in CATEGORICAL_DATASETS)
+    resampling_method = Resampling.nearest if categorical else Resampling.average
 
-    cmap, explicit_range = pick_colormap(dataset_slug, band_display)
-    vmin, vmax = compute_display_range(data, explicit_range, pct)
+    with rasterio.open(path) as src:
+        data = downsample_raster(src, max_size, band=band, resampling=resampling_method)
 
     band_text = band_display.replace("_", " ").title() if band_display else dataset_label
     title = f"{region_label} – {dataset_label}"
@@ -331,8 +372,41 @@ def render_quicklook(
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.set_title(title)
     ax.axis("off")
-    im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=title)
+
+    if categorical:
+        filled = np.ma.filled(data, 0)
+        unique_codes = sorted({int(code) for code in np.unique(filled) if int(code) != 0})
+        if not unique_codes:
+            ax.text(0.5, 0.5, "No land cover classes", transform=ax.transAxes, ha="center", va="center")
+        else:
+            colors: List[str] = []
+            labels: List[str] = []
+            for code in unique_codes:
+                label, color = NLCD_CLASSES.get(code, (f"Class {code}", "#808080"))
+                colors.append(color)
+                labels.append(f"{code}: {label}")
+            cmap = ListedColormap(colors)
+            boundaries = np.array(unique_codes + [unique_codes[-1] + 1])
+            norm = BoundaryNorm(boundaries, cmap.N)
+            masked = np.ma.masked_where(filled == 0, filled)
+            ax.imshow(masked, cmap=cmap, norm=norm, interpolation="nearest")
+            handles = [Patch(facecolor=colors[i], edgecolor="black", label=labels[i]) for i in range(len(labels))]
+            ncol = max(1, min(4, len(handles)))
+            legend = ax.legend(
+                handles=handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, -0.1),
+                frameon=False,
+                ncol=ncol,
+            )
+            if legend:
+                fig.subplots_adjust(bottom=0.15)
+    else:
+        cmap, explicit_range = pick_colormap(dataset_slug, band_display)
+        vmin, vmax = compute_display_range(data, explicit_range, pct)
+        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="none")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=band_text or dataset_label)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")

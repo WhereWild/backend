@@ -23,6 +23,7 @@ from extract_cutout import extract_cutout
 
 DEFAULT_DATASETS = {
     "terrain_stack": Path("processed/terrain/terrain_stack.tif"),
+    "landcover": Path("processed/landcover/landcover_100m_cog.tif"),
 }
 
 

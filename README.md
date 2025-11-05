@@ -25,10 +25,13 @@ WhereWild/
 ├── requirements.txt         # Python dependencies for data processing
 ├── scripts/
 │   ├── download_dem.py      # Fetch USGS 3DEP tiles (parallel-aware)
+│   ├── download_landcover.py# Fetch NLCD 2019 land cover mosaic (streamed ZIP)
 │   ├── process_elevation.py # Mosaic + warp DEM tiles into the 100 m grid
+│   ├── process_landcover.py # Warp NLCD land cover into the 100 m grid (COG)
 │   ├── derive_terrain.py    # Build slope/aspect/roughness stack from the DEM
 │   ├── extract_cutout.py    # Helper to clip rasters around a lat/lon center
 │   ├── plot_quicklooks.py   # Render PNG previews for rasters (per band)
+│   ├── build_feature_table.py # Export tidy Parquet feature tables per region
 │   └── build_regions.py     # Generate configured cutouts (Salt Lake, etc.)
 ├── raw/                     # Cached source data (ignored by git)
 └── processed/               # Aligned outputs (ignored by git)
@@ -81,14 +84,23 @@ make terrain
 - Generates a multi-band terrain stack (`processed/terrain/terrain_stack.tif`): band 1 slope (degrees), band 2 aspect (degrees, 0° = north, clockwise), band 3 3×3 roughness.
 - Outputs share the 100 m grid specification so downstream features align without resampling.
 
-### 4. Generate Standard Cutouts (Optional)
+### 4. Align NLCD Land Cover
+```
+make download-landcover  # downloads + extracts the NLCD mosaic (one-time)
+make landcover           # warps NLCD into processed/landcover/landcover_100m_cog.tif
+```
+- Streams the NLCD 2019 CONUS land cover ZIP from MRLC, caches it in `raw/landcover/`, and extracts the GeoTIFF.
+- Reprojects the categorical land cover codes into EPSG:5070 with nearest-neighbour resampling so class IDs stay intact.
+- Logs both the raw ZIP and the processed COG to `manifest.csv` for provenance.
+
+### 5. Generate Standard Cutouts (Optional)
 ```
 make regions
 ```
 - Clips the multi-band terrain stack into named regions defined in `regions.json` (e.g., Salt Lake Valley, Hounds Tooth) and writes them under `processed/cutouts/<region>/`.
 - Extend `regions.json` with additional snapshots as needed.
 
-### 5. Quick Visualization (Optional)
+### 6. Quick Visualization (Optional)
 ```
 venv/bin/python scripts/plot_quicklooks.py
 ```
@@ -98,15 +110,21 @@ venv/bin/python scripts/plot_quicklooks.py
 - Multi-band rasters emit one PNG per band (e.g., slope, aspect, roughness).
 - Tune preview resolution with `--max-size`.
 
-### 6. Validate (Placeholder)
+### 7. Feature Tables (Optional)
+```
+make features
+```
+- Exports tidy Parquet tables under `processed/features/<region>.parquet` for every configured cutout (coordinates + terrain + land cover columns).
+- Great for modeling workflows that prefer tabular features over rasters. Enable `--include-conus` in the script if you really need the full domain (beware: huge).
+
+### 8. Validate (Placeholder)
 ```
 make validate-dem
 ```
 Hook for grid-alignment, statistics, and QA visualizations (to be implemented).
 
 ## Future Work
-- Generate slope, aspect, and terrain roughness from the aligned DEM.
-- Add more environmental layers (precipitation, temperature, NDVI, land cover, distance-to-water, human footprint) using the same download + warp workflow.
+- Add more environmental layers (precipitation, temperature, NDVI, distance-to-water, human footprint) using the same download + warp workflow.
 - Stand up validation scripts that check alignment, nodata coverage, and generate quick-look plots for QA.
 - Store the processed rasters in shared object storage so the app/backend can stream them without redownloading.
 - Enrich iNaturalist presence tables with weather, vegetation, and human footprint features so we can prototype habitat models quickly.

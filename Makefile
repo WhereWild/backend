@@ -5,28 +5,32 @@ RAW_DIR := raw
 PROCESSED_DIR := processed
 SCRIPTS_DIR := scripts
 
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard venv/bin/python),venv/bin/python,python3)
 
 # Elevation-specific paths
 DEM_RAW_DIR := $(RAW_DIR)/dem
 DEM_OUTPUT := $(PROCESSED_DIR)/dem_100m_cog.tif
 TERRAIN_STACK := $(PROCESSED_DIR)/terrain/terrain_stack.tif
+LANDCOVER_RAW_DIR := $(RAW_DIR)/landcover
+LANDCOVER_RAW_TIF := $(LANDCOVER_RAW_DIR)/nlcd_2019_land_cover_l48_20210604.tif
+LANDCOVER_OUTPUT := $(PROCESSED_DIR)/landcover/landcover_100m_cog.tif
+FEATURES_DIR := $(PROCESSED_DIR)/features
 
-.PHONY: all download-dem download-observations dem terrain regions plots warp-dem validate-dem metadata clean
+.PHONY: all download-dem download-observations download-landcover dem terrain landcover regions plots features warp-dem validate-dem metadata clean
 
-all: dem
+all: dem terrain landcover
 
 # --- Elevation pipeline targets ------------------------------------------------
 
 # Download raw elevation sources to raw/dem/
 download-dem:
 	@mkdir -p $(DEM_RAW_DIR)
-		@$(PYTHON) $(SCRIPTS_DIR)/download_dem.py \
-			--grid $(GRID_SPEC) \
-			--raw-dir $(RAW_DIR) \
-			--manifest manifest.csv \
-			$(if $(DRY_RUN),--dry-run,) \
-			$(if $(WORKERS),--workers $(WORKERS),)
+	@$(PYTHON) $(SCRIPTS_DIR)/download_dem.py \
+		--grid $(GRID_SPEC) \
+		--raw-dir $(RAW_DIR) \
+		--manifest manifest.csv \
+		$(if $(DRY_RUN),--dry-run,) \
+		$(if $(WORKERS),--workers $(WORKERS),)
 
 download-observations:
 	@if [ -z "$(OBS_SPECIES)" ] || [ -z "$(OBS_SPECIES_ID)" ]; then \
@@ -49,6 +53,15 @@ download-observations:
 		$(if $(OBS_SLEEP),--sleep $(OBS_SLEEP),) \
 		$(if $(OBS_DRY_RUN),--dry-run,)
 
+download-landcover:
+	@mkdir -p $(LANDCOVER_RAW_DIR)
+	@$(PYTHON) $(SCRIPTS_DIR)/download_landcover.py \
+		--raw-dir $(RAW_DIR) \
+		--manifest manifest.csv \
+		$(if $(LANDCOVER_URL),--url $(LANDCOVER_URL),) \
+		$(if $(LANDCOVER_OVERWRITE),--overwrite,) \
+		$(if $(DRY_RUN),--dry-run,)
+
 # Generate the aligned 100 m DEM (mosaic + warp + COG conversion).
 dem: $(DEM_OUTPUT)
 
@@ -70,11 +83,32 @@ $(TERRAIN_STACK): $(DEM_OUTPUT) $(SCRIPTS_DIR)/derive_terrain.py
 		--output-dir $(PROCESSED_DIR)/terrain \
 		--manifest manifest.csv
 
+landcover: $(LANDCOVER_OUTPUT)
+
+$(LANDCOVER_RAW_TIF): $(SCRIPTS_DIR)/download_landcover.py
+	@$(MAKE) download-landcover
+
+$(LANDCOVER_OUTPUT): $(GRID_SPEC) $(LANDCOVER_RAW_TIF) $(SCRIPTS_DIR)/process_landcover.py
+	@mkdir -p $(PROCESSED_DIR)/landcover
+	@$(PYTHON) $(SCRIPTS_DIR)/process_landcover.py \
+		--grid $(GRID_SPEC) \
+		--source $(LANDCOVER_RAW_TIF) \
+		--output $@ \
+		--manifest manifest.csv
+
 regions: $(TERRAIN_STACK)
 	@$(PYTHON) $(SCRIPTS_DIR)/build_regions.py --config regions.json
 
 plots: regions
 	@$(PYTHON) $(SCRIPTS_DIR)/plot_quicklooks.py
+
+features: regions landcover
+	@mkdir -p $(FEATURES_DIR)
+	@$(PYTHON) $(SCRIPTS_DIR)/build_feature_table.py \
+		--processed-root $(PROCESSED_DIR) \
+		--config regions.json \
+		--output-dir $(FEATURES_DIR) \
+		--manifest manifest.csv
 
 # Optional validation / QA hooks.
 warp-dem: dem
@@ -87,4 +121,4 @@ metadata: dem
 	@echo "TODO: export GDAL metadata and update manifest.csv"
 
 clean:
-	rm -f $(DEM_OUTPUT)
+	rm -f $(DEM_OUTPUT) $(LANDCOVER_OUTPUT)

@@ -1298,3 +1298,27 @@ usgs_3dep_1arcsec,https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TI
 usgs_3dep_1arcsec,https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/n50w125/USGS_1_n50w125.tif,Public Domain (USGS),2025-11-04,Tile n50w125
 usgs_3dep_1arcsec,https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/n50w126/USGS_1_n50w126.tif,Public Domain (USGS),2025-11-04,Tile n50w126
 terrain_stack_deg,processed/terrain/terrain_stack.tif,Derived from USGS 3DEP 1 arc-second (Public Domain),2025-11-04,"Multi-band stack (slope, aspect, roughness) derived from WhereWild DEM."
+nlcd_2019_land_cover_100m_epsg5070,processed/landcover/landcover_100m_cog.tif,Public Domain (USGS MRLC),2025-11-04,NLCD 2019 land cover resampled to WhereWild 100 m grid (nearest).
+feature_table,processed/features/salt_lake.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'salt_lake'
+feature_table,processed/features/hounds_tooth.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'hounds_tooth'
+feature_table,processed/features/dimple_dell.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'dimple_dell'
+feature_table,processed/features/devils_slide.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'devils_slide'
+feature_table,processed/features/san_rafael_swell.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'san_rafael_swell'
+feature_table,processed/features/bonneville_flats.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'bonneville_flats'
+feature_table,processed/features/deep_creek_mountains.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'deep_creek_mountains'
+feature_table,processed/features/arches.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'arches'
+feature_table,processed/features/devils_castle.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'devils_castle'
+feature_table,processed/features/point_of_the_mountain.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'point_of_the_mountain'
+feature_table,processed/features/factory_butte.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'factory_butte'
+feature_table,processed/features/lake_powell.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'lake_powell'
+feature_table,processed/features/escalante_canyon.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'escalante_canyon'
+feature_table,processed/features/zion_canyon.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'zion_canyon'
+feature_table,processed/features/mt_rainier.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'mt_rainier'
+feature_table,processed/features/glacier_np.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'glacier_np'
+feature_table,processed/features/grand_canyon.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'grand_canyon'
+feature_table,processed/features/badlands_sd.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'badlands_sd'
+feature_table,processed/features/appalachian_ridge.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'appalachian_ridge'
+feature_table,processed/features/everglades.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'everglades'
+feature_table,processed/features/white_sands.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'white_sands'
+feature_table,processed/features/niagara.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'niagara'
+feature_table,processed/features/cape_cod.parquet,Derived from WhereWild processed rasters (see manifest for sources),2025-11-05,Tidy feature table for region 'cape_cod'
