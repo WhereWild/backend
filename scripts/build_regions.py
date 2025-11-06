@@ -25,6 +25,10 @@ DEFAULT_DATASETS = {
     "terrain_stack": Path("processed/terrain/terrain_stack.tif"),
     "landcover": Path("processed/landcover/landcover_100m_cog.tif"),
     "soil_texture": Path("processed/soil_texture/soil_texture_100m_cog.tif"),
+    "soil_cfvo": Path("processed/soil/cfvo_100m.tif"),
+    "soil_phh2o": Path("processed/soil/phh2o_100m.tif"),
+    "soil_nitrogen": Path("processed/soil/nitrogen_100m.tif"),
+    "soil_soc": Path("processed/soil/soc_100m.tif"),
 }
 
 REQUIRED_DATASETS = {"terrain_stack"}

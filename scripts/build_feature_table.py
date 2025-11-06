@@ -34,6 +34,13 @@ import rasterio
 from pyproj import Transformer
 from rasterio.transform import xy
 
+SOIL_PROPERTY_MAP = {
+    "soil_cfvo": ("cfvo", "soil_cfvo_pct", np.float32),
+    "soil_phh2o": ("phh2o", "soil_phh2o", np.float32),
+    "soil_nitrogen": ("nitrogen", "soil_nitrogen_pct", np.float32),
+    "soil_soc": ("soc", "soil_soc_pct", np.float32),
+}
+
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -139,6 +146,7 @@ def build_feature_table(
     terrain_path: Path,
     landcover_path: Optional[Path],
     soil_texture_path: Optional[Path],
+    soil_property_paths: Dict[str, Optional[Path]],
     output_path: Path,
 ) -> None:
     if not terrain_path.exists():
@@ -184,6 +192,20 @@ def build_feature_table(
     else:
         print(f"[{region_slug}] Soil texture not found; columns will be filled with NaN.")
 
+    soil_property_arrays: Dict[str, Optional[np.ma.MaskedArray]] = {}
+    for dataset_key, (_, column_name, _) in SOIL_PROPERTY_MAP.items():
+        prop_path = None
+        if soil_property_paths:
+            prop_path = soil_property_paths.get(dataset_key)
+        if prop_path and prop_path.exists():
+            print(f"[{region_slug}] Loading {column_name}: {prop_path}")
+            with rasterio.open(prop_path) as prop_ds:
+                soil_property_arrays[column_name] = prop_ds.read(1, masked=True)
+        else:
+            soil_property_arrays[column_name] = None
+            if prop_path:
+                print(f"[{region_slug}] {column_name} raster missing ({prop_path}); filling with NaN.")
+
     # Build coordinate grids
     grid_y, grid_x = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
 
@@ -197,6 +219,9 @@ def build_feature_table(
         valid_mask &= ~landcover.mask
     if sand is not None and silt is not None and clay is not None:
         valid_mask &= ~sand.mask & ~silt.mask & ~clay.mask
+    for arr in soil_property_arrays.values():
+        if arr is not None:
+            valid_mask &= ~arr.mask
 
     if not valid_mask.any():
         print(f"[{region_slug}] No valid pixels after masking; skipping.")
@@ -243,6 +268,12 @@ def build_feature_table(
         data["soil_silt_pct"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
         data["soil_clay_pct"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
 
+    for column_name, arr in soil_property_arrays.items():
+        if arr is not None:
+            data[column_name] = arr.data[valid_mask].astype(np.float32)
+        else:
+            data[column_name] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
+
     df = pd.DataFrame(data)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[{region_slug}] Writing {len(df):,} rows -> {output_path}")
@@ -269,6 +300,9 @@ def main(argv: Sequence[str]) -> int:
         terrain_path = processed_root / "cutouts" / slug / "terrain_stack.tif"
         landcover_path = processed_root / "cutouts" / slug / "landcover.tif"
         soil_path = processed_root / "cutouts" / slug / "soil_texture.tif"
+        soil_props: Dict[str, Optional[Path]] = {}
+        for dataset_key, (stem, _, _) in SOIL_PROPERTY_MAP.items():
+            soil_props[dataset_key] = processed_root / "cutouts" / slug / f"{dataset_key}.tif"
         targets.append(
             {
                 "slug": slug,
@@ -276,10 +310,14 @@ def main(argv: Sequence[str]) -> int:
                 "terrain": terrain_path,
                 "landcover": landcover_path,
                 "soil": soil_path,
+                "soil_properties": soil_props,
             }
         )
 
     if args.include_conus:
+        base_props: Dict[str, Optional[Path]] = {}
+        for dataset_key, (stem, _, _) in SOIL_PROPERTY_MAP.items():
+            base_props[dataset_key] = processed_root / "soil" / f"{stem}_100m.tif"
         targets.insert(
             0,
             {
@@ -288,6 +326,7 @@ def main(argv: Sequence[str]) -> int:
                 "terrain": terrain_base,
                 "landcover": landcover_base,
                 "soil": soil_base,
+                "soil_properties": base_props,
             },
         )
 
@@ -304,6 +343,7 @@ def main(argv: Sequence[str]) -> int:
             target["terrain"],
             target["landcover"],
             target["soil"],
+            target["soil_properties"],
             output_path,
         )
         append_manifest(args.manifest, output_path, target["label"])

@@ -42,6 +42,10 @@ DEFAULT_BASE_DATASETS: Tuple[Tuple[str, str, Path], ...] = (
     ("Terrain Stack", "terrain_stack", Path("terrain/terrain_stack.tif")),
     ("Land Cover", "landcover", Path("landcover/landcover_100m_cog.tif")),
     ("Soil Texture", "soil_texture", Path("soil_texture/soil_texture_100m_cog.tif")),
+    ("Soil Coarse Fragments", "soil_cfvo", Path("soil/cfvo_100m.tif")),
+    ("Soil pH (H2O)", "soil_phh2o", Path("soil/phh2o_100m.tif")),
+    ("Soil Nitrogen (%)", "soil_nitrogen", Path("soil/nitrogen_100m.tif")),
+    ("Soil Organic Carbon (%)", "soil_soc", Path("soil/soc_100m.tif")),
 )
 
 # Named cutouts inherit these datasets when present under processed/cutouts/<region>/.
@@ -49,6 +53,10 @@ CUTOUT_DATASETS: Tuple[Tuple[str, str], ...] = (
     ("Terrain Stack", "terrain_stack"),
     ("Land Cover", "landcover"),
     ("Soil Texture", "soil_texture"),
+    ("Soil Coarse Fragments", "soil_cfvo"),
+    ("Soil pH (H2O)", "soil_phh2o"),
+    ("Soil Nitrogen (%)", "soil_nitrogen"),
+    ("Soil Organic Carbon (%)", "soil_soc"),
 )
 
 # Categorical rasters (we stick to nearest-neighbour sampling + discrete palettes).
@@ -61,6 +69,12 @@ SOIL_TEXTURE_BAND_LABELS: Tuple[str, str, str] = (
 )
 SOIL_TEXTURE_SCALE = 0.1
 SOIL_TEXTURE_ALT_BASE = Path("soil_texture/soil_texture_100m.tif")
+SOIL_PROPERTY_RANGES = {
+    "soil_cfvo": (0.0, 60.0),
+    "soil_phh2o": (4.0, 9.0),
+    "soil_nitrogen": (0.0, 2.0),
+    "soil_soc": (0.0, 10.0),
+}
 
 NLCD_CLASSES = {
     11: ("Open Water", "#476BA1"),
@@ -322,6 +336,14 @@ def pick_colormap(dataset_slug: str, band_label: str) -> Tuple[str, Optional[Tup
         return "tab20", (0.0, 95.0)
     if "soil_texture" in dataset_slug.lower():
         return "YlGnBu", (0.0, 60.0)
+    if dataset_slug.lower() in ("soil_cfvo",):
+        return "YlOrBr", SOIL_PROPERTY_RANGES["soil_cfvo"]
+    if dataset_slug.lower() in ("soil_nitrogen",):
+        return "YlGn", SOIL_PROPERTY_RANGES["soil_nitrogen"]
+    if dataset_slug.lower() in ("soil_soc",):
+        return "PuRd", SOIL_PROPERTY_RANGES["soil_soc"]
+    if dataset_slug.lower() in ("soil_phh2o",):
+        return "viridis", SOIL_PROPERTY_RANGES["soil_phh2o"]
     if "aspect" in name:
         return "twilight", (0.0, 360.0)
     if "slope" in name:

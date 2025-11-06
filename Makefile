@@ -19,9 +19,12 @@ SOIL_TEXTURE_SAND := $(SOIL_TEXTURE_RAW_DIR)/sand.tif
 SOIL_TEXTURE_SILT := $(SOIL_TEXTURE_RAW_DIR)/silt.tif
 SOIL_TEXTURE_CLAY := $(SOIL_TEXTURE_RAW_DIR)/clay.tif
 SOIL_TEXTURE_OUTPUT := $(PROCESSED_DIR)/soil_texture/soil_texture_100m_cog.tif
+SOIL_PROPERTY_NAMES := cfvo phh2o nitrogen soc
+SOIL_PROPERTY_OUTPUTS := $(addprefix $(PROCESSED_DIR)/soil/,$(addsuffix _100m.tif,$(SOIL_PROPERTY_NAMES)))
+SOIL_PROPERTY_RAW_FILES := $(addprefix $(SOIL_TEXTURE_RAW_DIR)/,$(addsuffix .tif,$(SOIL_PROPERTY_NAMES)))
 FEATURES_DIR := $(PROCESSED_DIR)/features
 
-.PHONY: all download-dem download-observations download-landcover dem terrain landcover soil-texture regions plots features species predict warp-dem validate-dem metadata clean
+.PHONY: all download-dem download-observations download-landcover dem terrain landcover soil-texture soil-properties regions plots features species predict warp-dem validate-dem metadata clean
 .PHONY: predict-heatmap-region predict-heatmap-conus
 
 all: dem terrain landcover
@@ -114,13 +117,22 @@ $(SOIL_TEXTURE_OUTPUT): $(GRID_SPEC) $(SCRIPTS_DIR)/process_soil_texture.py $(SO
 		--output $@ \
 		--manifest manifest.csv
 
+soil-properties: $(SOIL_PROPERTY_OUTPUTS)
+
+$(PROCESSED_DIR)/soil/%_100m.tif: $(GRID_SPEC) $(SCRIPTS_DIR)/process_soil_properties.py $(SOIL_TEXTURE_RAW_DIR)/%.tif
+	@mkdir -p $(PROCESSED_DIR)/soil
+	@$(PYTHON) $(SCRIPTS_DIR)/process_soil_properties.py \
+		--grid $(GRID_SPEC) \
+		--properties $* \
+		--manifest manifest.csv
+
 regions: $(TERRAIN_STACK)
 	@$(PYTHON) $(SCRIPTS_DIR)/build_regions.py --config regions.json
 
 plots: regions
 	@$(PYTHON) $(SCRIPTS_DIR)/plot_quicklooks.py
 
-features: regions landcover
+features: regions landcover soil-properties
 	@mkdir -p $(FEATURES_DIR)
 	@$(PYTHON) $(SCRIPTS_DIR)/build_feature_table.py \
 		--processed-root $(PROCESSED_DIR) \

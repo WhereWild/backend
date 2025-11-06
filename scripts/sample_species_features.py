@@ -14,7 +14,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 
 try:
     import pandas as pd
@@ -27,6 +27,13 @@ except ModuleNotFoundError:
 import numpy as np
 import rasterio
 from rasterio.transform import xy
+
+SOIL_PROPERTY_FILES = {
+    "soil_cfvo_pct": ("soil", "cfvo_100m.tif"),
+    "soil_phh2o": ("soil", "phh2o_100m.tif"),
+    "soil_nitrogen_pct": ("soil", "nitrogen_100m.tif"),
+    "soil_soc_pct": ("soil", "soc_100m.tif"),
+}
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -115,6 +122,7 @@ def enrich_with_features(
     terrain_path: Path,
     landcover_path: Optional[Path],
     soil_texture_path: Optional[Path],
+    soil_property_paths: Dict[str, Path],
 ) -> pd.DataFrame:
     rows = df["grid_y"].to_numpy()
     cols = df["grid_x"].to_numpy()
@@ -144,6 +152,14 @@ def enrich_with_features(
     else:
         print("Land cover raster not found; filling landcover_class with NaN.")
         df["landcover_class"] = np.nan
+
+    for column, path in soil_property_paths.items():
+        if path.exists():
+            with rasterio.open(path) as prop_ds:
+                prop_samples = sample_raster(prop_ds, xs, ys)
+                df[column] = prop_samples.astype(np.float32)
+        else:
+            df[column] = np.nan
 
     if soil_texture_path is not None and soil_texture_path.exists():
         with rasterio.open(soil_texture_path) as soil_ds:
@@ -193,6 +209,10 @@ def write_outputs(df: pd.DataFrame, output_path: Path, summary_path: Optional[Pa
         "soil_sand_pct",
         "soil_silt_pct",
         "soil_clay_pct",
+        "soil_cfvo_pct",
+        "soil_phh2o",
+        "soil_nitrogen_pct",
+        "soil_soc_pct",
     ]
     numeric_cols = [col for col in numeric_cols if col in df.columns]
     summary = {
@@ -246,6 +266,10 @@ def main(argv: Iterable[str]) -> int:
     terrain_path = args.terrain or processed_root / "terrain" / "terrain_stack.tif"
     landcover_path = args.landcover or processed_root / "landcover" / "landcover_100m_cog.tif"
     soil_texture_path = args.soil_texture or processed_root / "soil_texture" / "soil_texture_100m_cog.tif"
+    soil_property_paths = {
+        column: (processed_root / subdir / filename)
+        for column, (subdir, filename) in SOIL_PROPERTY_FILES.items()
+    }
 
     if not dem_path.exists():
         raise FileNotFoundError(f"DEM raster not found: {dem_path}")
@@ -258,6 +282,7 @@ def main(argv: Iterable[str]) -> int:
         terrain_path,
         landcover_path if landcover_path.exists() else None,
         soil_texture_path if soil_texture_path.exists() else None,
+        soil_property_paths,
     )
 
     default_output = args.observations.with_name(args.observations.stem.replace("_presence", "_features") + ".csv.gz")

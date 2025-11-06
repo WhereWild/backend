@@ -11,10 +11,14 @@ import numpy as np
 # Install with: pip install owslib
 
 # SoilGrids services are property-specific
-SERVICES = {
-    "sand": "https://maps.isric.org/mapserv?map=/map/sand.map",
-    "silt": "https://maps.isric.org/mapserv?map=/map/silt.map",
-    "clay": "https://maps.isric.org/mapserv?map=/map/clay.map",
+PROPERTY_SERVICES = {
+    "sand": ("https://maps.isric.org/mapserv?map=/map/sand.map", "sand_0-5cm_mean"),
+    "silt": ("https://maps.isric.org/mapserv?map=/map/silt.map", "silt_0-5cm_mean"),
+    "clay": ("https://maps.isric.org/mapserv?map=/map/clay.map", "clay_0-5cm_mean"),
+    "cfvo": ("https://maps.isric.org/mapserv?map=/map/cfvo.map", "cfvo_0-5cm_mean"),
+    "phh2o": ("https://maps.isric.org/mapserv?map=/map/phh2o.map", "phh2o_0-5cm_mean"),
+    "nitrogen": ("https://maps.isric.org/mapserv?map=/map/nitrogen.map", "nitrogen_0-5cm_mean"),
+    "soc": ("https://maps.isric.org/mapserv?map=/map/soc.map", "soc_0-5cm_mean"),
 }
 
 # Bounding box (lon_min, lat_min, lon_max, lat_max); tweak if you want AK/HI, etc.
@@ -40,8 +44,7 @@ def iter_tiles(bbox: Tuple[float, float, float, float], max_span: float) -> Iter
 OUTPUT_DIR = Path("raw/soil_texture")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-for name, base_url in SERVICES.items():
-    coverage_id = f"{name}_0-5cm_mean"
+for name, (base_url, coverage_id) in PROPERTY_SERVICES.items():
     out_path = OUTPUT_DIR / f"{name}.tif"
 
     print(f"Requesting {coverage_id} from {base_url}")
