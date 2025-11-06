@@ -21,7 +21,8 @@ SOIL_TEXTURE_CLAY := $(SOIL_TEXTURE_RAW_DIR)/clay.tif
 SOIL_TEXTURE_OUTPUT := $(PROCESSED_DIR)/soil_texture/soil_texture_100m_cog.tif
 FEATURES_DIR := $(PROCESSED_DIR)/features
 
-.PHONY: all download-dem download-observations download-landcover dem terrain landcover soil-texture regions plots features species warp-dem validate-dem metadata clean
+.PHONY: all download-dem download-observations download-landcover dem terrain landcover soil-texture regions plots features species predict warp-dem validate-dem metadata clean
+.PHONY: predict-heatmap-region predict-heatmap-conus
 
 all: dem terrain landcover
 
@@ -135,6 +136,44 @@ features: regions landcover
 
 species:
 	@$(PYTHON) $(SCRIPTS_DIR)/run_species_pipeline.py $(if $(slug),--slug $(slug),) $(EXTRA)
+
+predict:
+	@if [ -z "$(FEATURES)" ] || [ -z "$(BACKGROUND)" ] || [ -z "$(OUT)" ]; then \
+		echo "Usage: make predict FEATURES=path/to/species_features.csv.gz BACKGROUND=processed/features/<region>.parquet OUT=models [slug=<name>] [sample=<n>]"; \
+		exit 1; \
+	fi
+	@$(PYTHON) $(SCRIPTS_DIR)/model_species_presence.py \
+		--features $(FEATURES) \
+		--background $(BACKGROUND) \
+		--output-dir $(OUT) \
+		$(if $(slug),--species $(slug),) \
+		$(if $(sample),--background-sample $(sample),) \
+		$(PREDICT_EXTRA)
+
+predict-heatmap-region:
+	@if [ -z "$(MODEL_DIR)" ]; then \
+		echo "Usage: make predict-heatmap-region MODEL_DIR=models/<slug> [TITLE='My Title'] [OUT=figures/predictions/<slug>_region.png]"; \
+		exit 1; \
+	fi
+	@$(PYTHON) $(SCRIPTS_DIR)/plot_prediction_heatmap.py \
+		--predictions $(MODEL_DIR)/predictions.parquet \
+		--grid $(GRID_SPEC) \
+		--output $(if $(OUT),$(OUT),figures/predictions/$(notdir $(MODEL_DIR))_region.png) \
+		--crop \
+		--stride 1 \
+		$(if $(TITLE),--title "$(TITLE)",)
+
+predict-heatmap-conus:
+	@if [ -z "$(MODEL_DIR)" ]; then \
+		echo "Usage: make predict-heatmap-conus MODEL_DIR=models/<slug> [TITLE='My Title'] [OUT=figures/predictions/<slug>_conus.png] [STRIDE=5]"; \
+		exit 1; \
+	fi
+	@$(PYTHON) $(SCRIPTS_DIR)/plot_prediction_heatmap.py \
+		--predictions $(MODEL_DIR)/predictions.parquet \
+		--grid $(GRID_SPEC) \
+		--output $(if $(OUT),$(OUT),figures/predictions/$(notdir $(MODEL_DIR))_conus.png) \
+		--stride $(if $(STRIDE),$(STRIDE),5) \
+		$(if $(TITLE),--title "$(TITLE)",)
 
 # Optional validation / QA hooks.
 warp-dem: dem
