@@ -61,6 +61,11 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="Override land cover raster path (default: processed/landcover/landcover_100m_cog.tif).",
     )
     parser.add_argument(
+        "--soil-texture",
+        type=Path,
+        help="Override soil texture raster path (default: processed/soil_texture/soil_texture_100m_cog.tif).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Output CSV/Parquet path for enriched observations (default: alongside input, *_features.csv.gz).",
@@ -109,6 +114,7 @@ def enrich_with_features(
     dem_path: Path,
     terrain_path: Path,
     landcover_path: Optional[Path],
+    soil_texture_path: Optional[Path],
 ) -> pd.DataFrame:
     rows = df["grid_y"].to_numpy()
     cols = df["grid_x"].to_numpy()
@@ -139,6 +145,20 @@ def enrich_with_features(
         print("Land cover raster not found; filling landcover_class with NaN.")
         df["landcover_class"] = np.nan
 
+    if soil_texture_path is not None and soil_texture_path.exists():
+        with rasterio.open(soil_texture_path) as soil_ds:
+            soil_samples = sample_raster(soil_ds, xs, ys)
+            if soil_samples.ndim != 2 or soil_samples.shape[1] < 3:
+                raise ValueError("Soil texture raster must provide at least three bands (sand/silt/clay).")
+        df["soil_sand_pct"] = (soil_samples[:, 0] * 0.1).astype(np.float32)
+        df["soil_silt_pct"] = (soil_samples[:, 1] * 0.1).astype(np.float32)
+        df["soil_clay_pct"] = (soil_samples[:, 2] * 0.1).astype(np.float32)
+    else:
+        print("Soil texture raster not found; filling soil texture columns with NaN.")
+        df["soil_sand_pct"] = np.nan
+        df["soil_silt_pct"] = np.nan
+        df["soil_clay_pct"] = np.nan
+
     if "observed_at" in df.columns:
         observed_dt = pd.to_datetime(df["observed_at"], errors="coerce", utc=True)
         df["observed_at"] = observed_dt.dt.tz_localize(None)
@@ -165,7 +185,16 @@ def write_outputs(df: pd.DataFrame, output_path: Path, summary_path: Optional[Pa
         df.to_csv(output_path, index=False)
     print(f"Wrote enriched observations -> {output_path}")
 
-    numeric_cols = ["elevation_m", "slope_deg", "aspect_deg", "roughness"]
+    numeric_cols = [
+        "elevation_m",
+        "slope_deg",
+        "aspect_deg",
+        "roughness",
+        "soil_sand_pct",
+        "soil_silt_pct",
+        "soil_clay_pct",
+    ]
+    numeric_cols = [col for col in numeric_cols if col in df.columns]
     summary = {
         "count": len(df),
         "numeric_summary": df[numeric_cols].describe().to_dict(),
@@ -216,13 +245,20 @@ def main(argv: Iterable[str]) -> int:
     dem_path = args.dem or processed_root / "dem_100m_cog.tif"
     terrain_path = args.terrain or processed_root / "terrain" / "terrain_stack.tif"
     landcover_path = args.landcover or processed_root / "landcover" / "landcover_100m_cog.tif"
+    soil_texture_path = args.soil_texture or processed_root / "soil_texture" / "soil_texture_100m_cog.tif"
 
     if not dem_path.exists():
         raise FileNotFoundError(f"DEM raster not found: {dem_path}")
     if not terrain_path.exists():
         raise FileNotFoundError(f"Terrain stack not found: {terrain_path}")
 
-    enrich_with_features(df, dem_path, terrain_path, landcover_path if landcover_path.exists() else None)
+    enrich_with_features(
+        df,
+        dem_path,
+        terrain_path,
+        landcover_path if landcover_path.exists() else None,
+        soil_texture_path if soil_texture_path.exists() else None,
+    )
 
     default_output = args.observations.with_name(args.observations.stem.replace("_presence", "_features") + ".csv.gz")
     output_path = args.output or default_output

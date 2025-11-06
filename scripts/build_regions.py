@@ -24,7 +24,10 @@ from extract_cutout import extract_cutout
 DEFAULT_DATASETS = {
     "terrain_stack": Path("processed/terrain/terrain_stack.tif"),
     "landcover": Path("processed/landcover/landcover_100m_cog.tif"),
+    "soil_texture": Path("processed/soil_texture/soil_texture_100m_cog.tif"),
 }
+
+REQUIRED_DATASETS = {"terrain_stack"}
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -73,9 +76,19 @@ def ensure_datasets(keys: Iterable[str], dataset_map: Dict[str, Path]) -> Dict[s
             raise KeyError(f"Unknown dataset key '{key}'. Available: {sorted(dataset_map)}")
         candidate = dataset_map[key]
         if not candidate.exists():
-            raise FileNotFoundError(
-                f"Dataset '{key}' not found at {candidate}. Run the relevant pipeline first."
-            )
+            if key == "soil_texture":
+                alt_candidate = Path("processed/soil_texture/soil_texture_100m.tif")
+                if alt_candidate.exists():
+                    candidate = alt_candidate
+            if not candidate.exists():
+                if key in REQUIRED_DATASETS:
+                    raise FileNotFoundError(
+                        f"Dataset '{key}' not found at {candidate}. Run the relevant pipeline first."
+                    )
+                print(
+                    f"Warning: dataset '{key}' missing at {candidate}; skipping cutouts for this layer."
+                )
+                continue
         paths[key] = candidate
     return paths
 

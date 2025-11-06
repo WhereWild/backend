@@ -64,12 +64,33 @@
       "group": "plant"
     },
     {
+      "slug": "pediocactus_sileri",
+      "inat_id": 166261,
+      "region": "four_corners_mega",
+      "max_records": 150,
+      "group": "plant"
+    },
+    {
+      "slug": "petrophytum_caespitosum",
+      "inat_id": 78463,
+      "region": "four_corners_mega",
+      "max_records": 8000,
+      "group": "plant"
+    },    
+    {
       "slug": "pinus_edulis",
       "inat_id": 57902,
       "region": "four_corners_mega",
       "max_records": 8000,
       "group": "plant"
     },
+    {
+      "slug": "podaxis_pistillaris",
+      "inat_id": 57883,
+      "region": "four_corners_mega",
+      "max_records": 5000,
+      "group": "fungus"
+    },    
     {
       "slug": "populus_tremuloides",
       "inat_id": 54840,

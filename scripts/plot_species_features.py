@@ -115,7 +115,11 @@ def main(argv: list[str]) -> int:
     if "landcover_class" in df.columns:
         df["landcover_label"] = df["landcover_class"].map(NLCD_CLASSES)
 
-    numeric_cols = [col for col in ["elevation_m", "slope_deg", "roughness"] if col in df.columns]
+    numeric_cols = [
+        col
+        for col in ["elevation_m", "slope_deg", "roughness", "soil_sand_pct", "soil_silt_pct", "soil_clay_pct"]
+        if col in df.columns
+    ]
     if not numeric_cols:
         raise ValueError("No numeric feature columns found. Expected columns like elevation_m, slope_deg, roughness.")
 

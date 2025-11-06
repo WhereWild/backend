@@ -138,6 +138,7 @@ def build_feature_table(
     region_label: str,
     terrain_path: Path,
     landcover_path: Optional[Path],
+    soil_texture_path: Optional[Path],
     output_path: Path,
 ) -> None:
     if not terrain_path.exists():
@@ -168,6 +169,21 @@ def build_feature_table(
     else:
         print(f"[{region_slug}] Land cover not found; column will be filled with NaN.")
 
+    sand = silt = clay = None
+    if soil_texture_path and soil_texture_path.exists():
+        print(f"[{region_slug}] Loading soil texture: {soil_texture_path}")
+        with rasterio.open(soil_texture_path) as soil_ds:
+            soil = soil_ds.read(masked=True)
+            if soil.shape[0] < 3:
+                raise ValueError(
+                    f"Soil texture raster must have at least three bands (sand/silt/clay); found {soil.shape[0]}"
+                )
+            sand = soil[0]
+            silt = soil[1]
+            clay = soil[2]
+    else:
+        print(f"[{region_slug}] Soil texture not found; columns will be filled with NaN.")
+
     # Build coordinate grids
     grid_y, grid_x = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
 
@@ -179,6 +195,8 @@ def build_feature_table(
     )
     if landcover is not None:
         valid_mask &= ~landcover.mask
+    if sand is not None and silt is not None and clay is not None:
+        valid_mask &= ~sand.mask & ~silt.mask & ~clay.mask
 
     if not valid_mask.any():
         print(f"[{region_slug}] No valid pixels after masking; skipping.")
@@ -216,6 +234,15 @@ def build_feature_table(
     else:
         data["landcover_class"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
 
+    if sand is not None and silt is not None and clay is not None:
+        data["soil_sand_pct"] = (sand.data[valid_mask] * 0.1).astype(np.float32)
+        data["soil_silt_pct"] = (silt.data[valid_mask] * 0.1).astype(np.float32)
+        data["soil_clay_pct"] = (clay.data[valid_mask] * 0.1).astype(np.float32)
+    else:
+        data["soil_sand_pct"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
+        data["soil_silt_pct"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
+        data["soil_clay_pct"] = np.full(flat_rows.shape, np.nan, dtype=np.float32)
+
     df = pd.DataFrame(data)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"[{region_slug}] Writing {len(df):,} rows -> {output_path}")
@@ -228,6 +255,7 @@ def main(argv: Sequence[str]) -> int:
     processed_root = args.processed_root
     terrain_base = processed_root / "terrain" / "terrain_stack.tif"
     landcover_base = processed_root / "landcover" / "landcover_100m_cog.tif"
+    soil_base = processed_root / "soil_texture" / "soil_texture_100m_cog.tif"
 
     regions = load_regions(args.config)
     if args.regions:
@@ -240,12 +268,14 @@ def main(argv: Sequence[str]) -> int:
     for slug, meta in regions.items():
         terrain_path = processed_root / "cutouts" / slug / "terrain_stack.tif"
         landcover_path = processed_root / "cutouts" / slug / "landcover.tif"
+        soil_path = processed_root / "cutouts" / slug / "soil_texture.tif"
         targets.append(
             {
                 "slug": slug,
                 "label": meta["label"],
                 "terrain": terrain_path,
                 "landcover": landcover_path,
+                "soil": soil_path,
             }
         )
 
@@ -257,6 +287,7 @@ def main(argv: Sequence[str]) -> int:
                 "label": "CONUS",
                 "terrain": terrain_base,
                 "landcover": landcover_base,
+                "soil": soil_base,
             },
         )
 
@@ -272,6 +303,7 @@ def main(argv: Sequence[str]) -> int:
             target["label"],
             target["terrain"],
             target["landcover"],
+            target["soil"],
             output_path,
         )
         append_manifest(args.manifest, output_path, target["label"])

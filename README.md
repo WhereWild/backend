@@ -95,14 +95,27 @@ make landcover           # warps NLCD into processed/landcover/landcover_100m_co
 - Reprojects the categorical land cover codes into EPSG:5070 with nearest-neighbour resampling so class IDs stay intact.
 - Logs both the raw ZIP and the processed COG to `manifest.csv` for provenance.
 
-### 5. Generate Standard Cutouts (Optional)
+### 5. Align Soil Texture (Sand / Silt / Clay)
+```
+# Manually download sand / silt / clay percentage rasters (e.g., SoilGrids 0–5 cm)
+# and place/rename them as:
+#   raw/soil_texture/sand.tif
+#   raw/soil_texture/silt.tif
+#   raw/soil_texture/clay.tif
+make soil-texture
+```
+- Resamples the three percentage rasters into the shared 100 m grid using average resampling.
+- Writes a three-band stack (`processed/soil_texture/soil_texture_100m_cog.tif`) ordered as sand, silt, clay.
+- The script logs provenance to `manifest.csv`. If you prefer different filenames or depth layers, pass `--sand/--silt/--clay` directly.
+
+### 6. Generate Standard Cutouts (Optional)
 ```
 make regions
 ```
 - Clips the multi-band terrain stack into named regions defined in `regions.json` (e.g., Salt Lake Valley, Hounds Tooth) and writes them under `processed/cutouts/<region>/`.
 - Extend `regions.json` with additional snapshots as needed.
 
-### 6. Quick Visualization (Optional)
+### 7. Quick Visualization (Optional)
 ```
 venv/bin/python scripts/plot_quicklooks.py
 ```
@@ -112,23 +125,23 @@ venv/bin/python scripts/plot_quicklooks.py
 - Multi-band rasters emit one PNG per band (e.g., slope, aspect, roughness).
 - Tune preview resolution with `--max-size`.
 
-### 7. Feature Tables (Optional)
+### 8. Feature Tables (Optional)
 ```
 make features
 ```
-- Exports tidy Parquet tables under `processed/features/<region>.parquet` for every configured cutout (coordinates + terrain + land cover columns).
+- Exports tidy Parquet tables under `processed/features/<region>.parquet` for every configured cutout (coordinates + terrain + land cover + soil texture columns).
 - Great for modeling workflows that prefer tabular features over rasters. Enable `--include-conus` in the script if you really need the full domain (beware: huge).
 
-### 8. Sample Species Features (Optional)
+### 9. Sample Species Features (Optional)
 ```
 venv/bin/python scripts/sample_species_features.py \
   --observations processed/observations/escobaria_vivipara/escobaria_vivipara_presence_<timestamp>.csv.gz
 ```
-- Enriches the presence table with elevation, slope, aspect, roughness, and land-cover values sampled from the processed rasters.
+- Enriches the presence table with elevation, slope, aspect, roughness, land cover, and soil texture percentages.
 - Presence rows now also carry basic phenology flags (budding/flowering/fruiting) derived from iNaturalist annotations when available.
 - Writes an augmented table (`*_features.*`) plus a JSON summary (basic stats, land-cover counts) for quick QA.
 
-### 9. Train a Baseline Presence Model (Optional)
+### 10. Train a Baseline Presence Model (Optional)
 ```
 venv/bin/python scripts/model_species_presence.py \
   --features processed/observations/escobaria_vivipara/escobaria_vivipara_features.csv.gz \
@@ -137,7 +150,7 @@ venv/bin/python scripts/model_species_presence.py \
 ```
 - Combines the species features with a random background sample, fits a simple classifier (logistic by default), and writes metrics/predictions under `models/`.
 - Requires `pandas`, `pyarrow`, and `scikit-learn` (install via `pip install -r requirements.txt`).
-### 9b. End-to-End Species Pipeline (Optional)
+### 10b. End-to-End Species Pipeline (Optional)
 ```
 make species slug=escobaria_vivipara
 ```
@@ -146,7 +159,7 @@ make species slug=escobaria_vivipara
 - Each entry in `species.json` can declare a `group` (e.g. `plant`, `fungus`). Plants automatically get phenology plots; disable them with `EXTRA="--no-phenology" make species slug=...`.
 - KDE overlays are on by default; disable with `EXTRA="--no-kde" ...`. Force a refresh run via `EXTRA="--force-download" ...` when you need new observations.
 
-### 10. Validate (Placeholder)
+### 11. Validate (Placeholder)
 ```
 make validate-dem
 ```

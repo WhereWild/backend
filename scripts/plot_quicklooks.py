@@ -41,16 +41,26 @@ DEFAULT_CONFIG = Path("regions.json")
 DEFAULT_BASE_DATASETS: Tuple[Tuple[str, str, Path], ...] = (
     ("Terrain Stack", "terrain_stack", Path("terrain/terrain_stack.tif")),
     ("Land Cover", "landcover", Path("landcover/landcover_100m_cog.tif")),
+    ("Soil Texture", "soil_texture", Path("soil_texture/soil_texture_100m_cog.tif")),
 )
 
 # Named cutouts inherit these datasets when present under processed/cutouts/<region>/.
 CUTOUT_DATASETS: Tuple[Tuple[str, str], ...] = (
     ("Terrain Stack", "terrain_stack"),
     ("Land Cover", "landcover"),
+    ("Soil Texture", "soil_texture"),
 )
 
 # Categorical rasters (we stick to nearest-neighbour sampling + discrete palettes).
 CATEGORICAL_DATASETS = {"landcover"}
+
+SOIL_TEXTURE_BAND_LABELS: Tuple[str, str, str] = (
+    "Soil Sand (%)",
+    "Soil Silt (%)",
+    "Soil Clay (%)",
+)
+SOIL_TEXTURE_SCALE = 0.1
+SOIL_TEXTURE_ALT_BASE = Path("soil_texture/soil_texture_100m.tif")
 
 NLCD_CLASSES = {
     11: ("Open Water", "#476BA1"),
@@ -216,6 +226,10 @@ def gather_default_targets(config_path: Path, processed_root: Path) -> List[Dict
     if base_enabled:
         for display_name, dataset_slug, rel_path in DEFAULT_BASE_DATASETS:
             path = rel_path if rel_path.is_absolute() else processed_root / rel_path
+            if not path.exists() and dataset_slug == "soil_texture":
+                alt = processed_root / SOIL_TEXTURE_ALT_BASE
+                if alt.exists():
+                    path = alt
             if path.exists():
                 targets.append(
                     {
@@ -306,6 +320,8 @@ def pick_colormap(dataset_slug: str, band_label: str) -> Tuple[str, Optional[Tup
     name = f"{dataset_slug.lower()}_{band_label.lower()}"
     if "landcover" in dataset_slug.lower():
         return "tab20", (0.0, 95.0)
+    if "soil_texture" in dataset_slug.lower():
+        return "YlGnBu", (0.0, 60.0)
     if "aspect" in name:
         return "twilight", (0.0, 360.0)
     if "slope" in name:
@@ -363,6 +379,9 @@ def render_quicklook(
 
     with rasterio.open(path) as src:
         data = downsample_raster(src, max_size, band=band, resampling=resampling_method)
+        if dataset_slug == "soil_texture":
+            data = np.ma.array(data, copy=False).astype(np.float32)
+            data *= SOIL_TEXTURE_SCALE
 
     band_text = band_display.replace("_", " ").title() if band_display else dataset_label
     title = f"{region_label} – {dataset_label}"
@@ -450,8 +469,16 @@ def main(argv: Sequence[str]) -> int:
         with rasterio.open(raster_path) as src:
             descriptions = src.descriptions or ()
             band_count = src.count
+            soil_labels: Optional[Tuple[str, ...]] = None
+            if dataset_slug == "soil_texture":
+                if len(SOIL_TEXTURE_BAND_LABELS) >= band_count:
+                    soil_labels = tuple(SOIL_TEXTURE_BAND_LABELS[:band_count])
+
             for band in range(1, band_count + 1):
-                desc = descriptions[band - 1] if descriptions and descriptions[band - 1] else ""
+                if soil_labels:
+                    desc = soil_labels[band - 1]
+                else:
+                    desc = descriptions[band - 1] if descriptions and descriptions[band - 1] else ""
                 band_slug = slugify(desc, f"band{band}")
                 band_display = desc or ("" if band_count == 1 else band_slug)
 

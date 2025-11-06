@@ -14,9 +14,14 @@ TERRAIN_STACK := $(PROCESSED_DIR)/terrain/terrain_stack.tif
 LANDCOVER_RAW_DIR := $(RAW_DIR)/landcover
 LANDCOVER_RAW_TIF := $(LANDCOVER_RAW_DIR)/nlcd_2019_land_cover_l48_20210604.tif
 LANDCOVER_OUTPUT := $(PROCESSED_DIR)/landcover/landcover_100m_cog.tif
+SOIL_TEXTURE_RAW_DIR := $(RAW_DIR)/soil_texture
+SOIL_TEXTURE_SAND := $(SOIL_TEXTURE_RAW_DIR)/sand.tif
+SOIL_TEXTURE_SILT := $(SOIL_TEXTURE_RAW_DIR)/silt.tif
+SOIL_TEXTURE_CLAY := $(SOIL_TEXTURE_RAW_DIR)/clay.tif
+SOIL_TEXTURE_OUTPUT := $(PROCESSED_DIR)/soil_texture/soil_texture_100m_cog.tif
 FEATURES_DIR := $(PROCESSED_DIR)/features
 
-.PHONY: all download-dem download-observations download-landcover dem terrain landcover regions plots features species warp-dem validate-dem metadata clean
+.PHONY: all download-dem download-observations download-landcover dem terrain landcover soil-texture regions plots features species warp-dem validate-dem metadata clean
 
 all: dem terrain landcover
 
@@ -93,6 +98,18 @@ $(LANDCOVER_OUTPUT): $(GRID_SPEC) $(LANDCOVER_RAW_TIF) $(SCRIPTS_DIR)/process_la
 	@$(PYTHON) $(SCRIPTS_DIR)/process_landcover.py \
 		--grid $(GRID_SPEC) \
 		--source $(LANDCOVER_RAW_TIF) \
+		--output $@ \
+		--manifest manifest.csv
+
+soil-texture: $(SOIL_TEXTURE_OUTPUT)
+
+$(SOIL_TEXTURE_OUTPUT): $(GRID_SPEC) $(SCRIPTS_DIR)/process_soil_texture.py $(SOIL_TEXTURE_SAND) $(SOIL_TEXTURE_SILT) $(SOIL_TEXTURE_CLAY)
+	@mkdir -p $(PROCESSED_DIR)/soil_texture
+	@$(PYTHON) $(SCRIPTS_DIR)/process_soil_texture.py \
+		--grid $(GRID_SPEC) \
+		--sand $(SOIL_TEXTURE_SAND) \
+		--silt $(SOIL_TEXTURE_SILT) \
+		--clay $(SOIL_TEXTURE_CLAY) \
 		--output $@ \
 		--manifest manifest.csv
 
