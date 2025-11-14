@@ -1,93 +1,105 @@
-# CreatureFinder
+# Local Setup
 
+## 1. Base Python Tooling (uv)
 
+Install **uv** once.
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://capstone.cs.utah.edu/creaturefinder/creaturefinder.git
-git branch -M main
-git push -uf origin main
+### Windows (PowerShell)
+```powershell
+irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-## Integrate with your tools
+### macOS / Linux
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-- [ ] [Set up project integrations](https://capstone.cs.utah.edu/creaturefinder/creaturefinder/-/settings/integrations)
+### Install Python dependencies and run the app
+```bash
+uv sync
+uv run python main.py
+```
 
-## Collaborate with your team
+*Tip: Install the **Ruff** VS Code extension for inline linting feedback.*
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+---
 
-## Test and Deploy
+## 2. GDAL / Raster Workflow (Optional — GIS Tasks Only)
 
-Use the built-in continuous integration in GitLab.
+### Build the GDAL toolchain via Docker
+1. Install and start **Docker Desktop**.
+2. From the repo root:
+```bash
+docker compose build gdal
+```
+This downloads the GDAL image and bakes in **rasterio**, **geopandas**, **pyproj**, and more. It's a heavy build.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### Verify the container toolchain
+```bash
+python gdal_test.py
+```
+You should see the versions of GDAL/rasterio/geopandas/pyproj printed.
 
-***
+---
 
-# Editing this README
+## Simple Raster Workflows
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### Overview benchmarking (default scaffolding)
 
-## Suggestions for a good README
+1. Drop a raster (e.g., `data/dem_100m_cog.tif`) somewhere inside the repo.
+2. Update the constants at the top of `start_workflow.py` (`RASTER_RELATIVE_PATH`, the base CONUS bbox, either a fixed shrink percent or a `SHRINK_SCHEDULE` such as `0.1:5,0.03:10,0.01:*`, number of steps, `MIN_OVERVIEW_INDEX`, optionally `DROP_MIN_OVERVIEW_EVERY` to start including finer pyramid levels as the viewport shrinks, and `INCLUDE_BASE_AFTER` if you want to begin sampling the raw band once the step index is high enough).
+3. Kick off the benchmark:
+   ```bash
+   python start_workflow.py
+   ```
+   This shells into Docker, runs `benchmark_overviews.py`, and emits one section per viewport step (CONUS, then progressively smaller bboxes). Each overview line reports the raster window size, number of COG blocks touched, approximate cell size, estimated IO (blocks × bytes per block), actual payload bytes (window size), and elapsed time. A JSON dump of all measurements is written to `/workspace/benchmark_results.json`, and PNG previews land in `/workspace/benchmark_plots/` so you can quickly visualize what each overview looks like. Use the info to decide where to switch overview levels or tile more aggressively.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### Single-point sample (direct)
 
-## Name
-Choose a self-explaining name for your project.
+For faster iteration, keep the GDAL container running and call the sampler inside it:
+```bash
+docker compose run --rm gdal bash
+# inside the container prompt:
+python read_raster.py /workspace/data/dem_100m_cog.tif -120.5 38.2
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+If you already have a container session running you can also call the sampler directly from your host shell:
+```bash
+docker compose run --rm gdal python read_raster.py /workspace/data/dem_100m_cog.tif -120.5 38.2
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+### Heatmap-style output (resampled grid)
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+`read_raster.py` also exposes `sample_heatmap_grid`, which converts a bounding box into a list of `{lat, lng, weight}` dicts that can be fed straight into Google Maps' `HeatmapLayer`:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```python
+from pathlib import Path
+from read_raster import sample_heatmap_grid
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+points = sample_heatmap_grid(
+    Path("data/dem_100m_cog.tif"),
+    lon_min=-123,
+    lat_min=36,
+    lon_max=-121,
+    lat_max=38,
+    step_degrees=0.05,
+)
+print(points[:5])
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+If you want to benchmark an ad-hoc bbox without the shrink loop, invoke `benchmark_overviews.py` directly:
+```bash
+docker compose run --rm gdal python benchmark_overviews.py /workspace/data/dem_100m_cog.tif --lon-min -123 --lon-max -121 --lat-min 36 --lat-max 38 --steps 1 --shrink-percent 0.05 --min-overview-index 0 --output /workspace/custom_benchmark.json --plot-dir /workspace/custom_plots
+# Include the base band only after step 5:
+docker compose run --rm gdal python benchmark_overviews.py /workspace/data/dem_100m_cog.tif --lon-min -123 --lon-max -121 --lat-min 36 --lat-max 38 --steps 10 --include-base --include-base-after 5
+# Dynamically choose the finest overview whose payload stays under 5 MB:
+docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m_cog.tif --payload-cap-mb 5 --steps 12 --shrink-percent 0.1 --include-base-after 8 --plot-dir dynamic_plots
+# You can also pass a shrink schedule (percent:steps segments):
+docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m_cog.tif --payload-cap-mb 5 --steps 30 --shrink-schedule "0.1:5,0.03:10,0.01:*" --include-base-after 20 --plot-dir dynamic_plots
+```
+Run `python benchmark_overviews.py --help` for all options.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+---
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## Why Docker?
+GDAL-related libraries require native dependencies that are painful to install consistently across Windows, macOS, Linux, or alongside uv. The Docker image ships everything preconfigured so the entire team runs the exact same stack—no Conda installs, no OS‑specific troubleshooting. Build once, and scripts can call into the container as needed.

@@ -7,11 +7,13 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         python3-dev \
+        python3-gdal \
         build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
 ENV PATH="/opt/venv/bin:${PATH}"
+ENV PYTHONPATH="/usr/lib/python3/dist-packages:${PYTHONPATH}"
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
