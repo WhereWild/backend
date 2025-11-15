@@ -3,3 +3,5 @@ rasterio>=1.4.3
 geopandas>=0.14
 rio-cogeo>=5.3.4
 matplotlib>=3.8
+fastapi>=0.115
+uvicorn[standard]>=0.30

@@ -17,8 +17,9 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### Install Python dependencies and run the app
 ```bash
 uv sync
-uv run python main.py
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
+Visit `http://127.0.0.1:8000/health` to confirm the API is up. `uv run python start.py` is a shortcut that runs the same command.
 
 *Tip: Install the **Ruff** VS Code extension for inline linting feedback.*
 
@@ -96,6 +97,8 @@ docker compose run --rm gdal python benchmark_overviews.py /workspace/data/dem_1
 docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m_cog.tif --payload-cap-mb 5 --steps 12 --shrink-percent 0.1 --include-base-after 8 --plot-dir dynamic_plots
 # You can also pass a shrink schedule (percent:steps segments):
 docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m_cog.tif --payload-cap-mb 5 --steps 30 --shrink-schedule "0.1:5,0.03:10,0.01:*" --include-base-after 20 --plot-dir dynamic_plots
+# Call the FastAPI endpoint directly:
+curl "http://127.0.0.1:8000/heatmap?lon_min=-123&lat_min=36&lon_max=-121&lat_max=38&payload_cap_mb=5"
 ```
 Run `python benchmark_overviews.py --help` for all options.
 
