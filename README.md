@@ -25,6 +25,22 @@ Visit `http://127.0.0.1:8000/health` to confirm the API is up. `uv run python st
 
 ---
 
+## Leaflet + heatmap.js scratchpad (optional)
+
+Need a free map preview without wiring a full frontend? A static page lives at `frontend-demo/index.html` that fetches `/heatmap/image` and overlays the server-rendered PNG on Leaflet (no Google Maps dependency).
+
+1. Start the FastAPI server (e.g. `uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000`).
+2. In another terminal, serve the static page:
+   ```bash
+   cd frontend-demo
+   python -m http.server 4173
+   ```
+3. Open `http://127.0.0.1:4173` in a browser. Pan/zoom the map and the overlay will re-fetch automatically for the current viewport.
+
+The demo hits `http://127.0.0.1:8000/heatmap/image` directly, so update the URL in the script if the backend runs elsewhere. Since it is a throwaway scratchpad, feel free to delete the `frontend-demo` directory once you've evaluated other mapping stacks.
+
+---
+
 ## 2. GDAL / Raster Workflow (Optional — GIS Tasks Only)
 
 ### Build the GDAL toolchain via Docker
@@ -99,6 +115,8 @@ docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m
 docker compose run --rm gdal python dynamic_res_test.py /workspace/data/dem_100m_cog.tif --payload-cap-mb 5 --steps 30 --shrink-schedule "0.1:5,0.03:10,0.01:*" --include-base-after 20 --plot-dir dynamic_plots
 # Call the FastAPI endpoint directly:
 curl "http://127.0.0.1:8000/heatmap?lon_min=-123&lat_min=36&lon_max=-121&lat_max=38&payload_cap_mb=5"
+# Or grab the server-rendered PNG:
+curl "http://127.0.0.1:8000/heatmap/image?lon_min=-123&lat_min=36&lon_max=-121&lat_max=38&payload_cap_mb=5" | jq '.image_base64' | head
 ```
 Run `python benchmark_overviews.py --help` for all options.
 

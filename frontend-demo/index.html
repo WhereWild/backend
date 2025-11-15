@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Raster cell preview</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+        background: #f3f4f6;
+      }
+      header {
+        background: #111827;
+        color: #f9fafb;
+        padding: 0.75rem 1rem;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 500;
+      }
+      main {
+        padding: 1rem;
+        height: calc(100% - 64px);
+        box-sizing: border-box;
+      }
+      #map {
+        width: 100%;
+        height: 100%;
+        border-radius: 0.5rem;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Raster cell preview (dynamic viewport)</h1>
+    </header>
+    <main>
+      <div id="map"></div>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      const map = L.map("map").setView([39.5, -98.35], 4);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 16,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      }).addTo(map);
+
+      let rasterOverlay = null;
+      let pendingRequest = 0;
+      let debounceTimer = null;
+
+      function applyOverlay(imageBase64, extent) {
+        if (!extent) {
+          console.warn("Missing extent for raster overlay.");
+          return;
+        }
+        if (rasterOverlay) {
+          rasterOverlay.remove();
+        }
+        const bounds = [
+          [extent.lat_min, extent.lon_min],
+          [extent.lat_max, extent.lon_max],
+        ];
+        const imageUrl = `data:image/png;base64,${imageBase64}`;
+        rasterOverlay = L.imageOverlay(imageUrl, bounds, { opacity: 0.65 }).addTo(map);
+      }
+
+      function clampBounds(bounds) {
+        const south = Math.max(bounds.getSouth(), -89.9);
+        const north = Math.min(bounds.getNorth(), 89.9);
+        const west = Math.max(bounds.getWest(), -179.9);
+        const east = Math.min(bounds.getEast(), 179.9);
+        return { south, north, west, east };
+      }
+
+      async function fetchOverlay(bounds) {
+        const { south, north, west, east } = clampBounds(bounds);
+        const params = new URLSearchParams({
+          lon_min: west.toFixed(6),
+          lat_min: south.toFixed(6),
+          lon_max: east.toFixed(6),
+          lat_max: north.toFixed(6),
+          payload_cap_mb: 5,
+        });
+        const requestId = ++pendingRequest;
+        const url = `http://127.0.0.1:8000/heatmap/image?${params.toString()}`;
+        try {
+          const res = await fetch(url);
+          if (!res.ok) {
+            throw new Error(`API error (${res.status})`);
+          }
+          const payload = await res.json();
+          if (requestId !== pendingRequest) {
+            return;
+          }
+          if (!payload.image_base64) {
+            console.warn("Heatmap image missing in response.");
+            return;
+          }
+          applyOverlay(payload.image_base64, payload.extent);
+        } catch (err) {
+          if (requestId === pendingRequest) {
+            console.error("Failed to load heatmap image:", err);
+          }
+        }
+      }
+
+      function scheduleFetch() {
+        if (debounceTimer) {
+          clearTimeout(debounceTimer);
+        }
+        debounceTimer = setTimeout(() => {
+          fetchOverlay(map.getBounds());
+        }, 250);
+      }
+
+      map.on("moveend", scheduleFetch);
+      fetchOverlay(map.getBounds());
+    </script>
+  </body>
+</html>
