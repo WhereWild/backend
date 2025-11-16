@@ -19,6 +19,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -41,6 +42,11 @@ DEFAULT_GRID = {
 
 COMPRESS = "deflate"  # lossless compression
 BLOCKSIZE = 512       # tile size in pixels
+
+# Performance knobs (tweak here, not per-command).
+MAX_WARP_THREADS = 12          # cap warp threads; set to 0 to let GDAL use ALL_CPUS
+WARP_MEM_LIMIT_MB = 4096       # per-warp memory hint
+CACHEMAX_MB = 4096             # GDAL cache to reduce I/O thrash (MB)
 
 
 def load_grid(path: Path | None) -> dict:
@@ -120,17 +126,18 @@ def project_onto_grid(
     tmp_dir = Path(tempfile.mkdtemp(prefix="project_grid_"))
     tmp_tif = tmp_dir / "reprojected.tif"
 
-    with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS"):
+    with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=CACHEMAX_MB):
         if use_single_source:
             src_path = sources[0]
             with rasterio.open(src_path) as src:
                 if src.crs is None:
                     raise ValueError("Source raster is missing a CRS; assign it before reprojection.")
+                band_count = src.count
                 profile = {
                     "driver": "GTiff",
                     "height": height,
                     "width": width,
-                    "count": src.count,
+                    "count": band_count,
                     "dtype": dtype,
                     "crs": grid["crs"],
                     "transform": transform,
@@ -143,8 +150,8 @@ def project_onto_grid(
                     "BIGTIFF": "IF_SAFER",
                 }
                 with rasterio.open(tmp_tif, "w", **profile) as dst:
-                    for band_idx in range(1, src.count + 1):
-                        print(f"Reprojecting band {band_idx}/{src.count}")
+                    for band_idx in range(1, band_count + 1):
+                        print(f"Reprojecting band {band_idx}/{band_count}")
                         reproject(
                             source=rasterio.band(src, band_idx),
                             destination=rasterio.band(dst, band_idx),
@@ -155,6 +162,9 @@ def project_onto_grid(
                             dst_crs=grid["crs"],
                             dst_nodata=nodata,
                             resampling=resample_method,
+                            init_dest_nodata=True,
+                            num_threads=MAX_WARP_THREADS,
+                            warp_mem_limit=WARP_MEM_LIMIT_MB,
                         )
                     if overviews:
                         dst.build_overviews(overviews, resampling=resample_method)
@@ -164,11 +174,12 @@ def project_onto_grid(
             with rasterio.open(sources[0]) as first:
                 if first.crs is None:
                     raise ValueError("Source raster is missing a CRS; assign it before reprojection.")
+                band_count = first.count
                 profile = {
                     "driver": "GTiff",
                     "height": height,
                     "width": width,
-                    "count": first.count,
+                    "count": band_count,
                     "dtype": dtype,
                     "crs": grid["crs"],
                     "transform": transform,
@@ -181,21 +192,14 @@ def project_onto_grid(
                     "BIGTIFF": "IF_SAFER",
                 }
             with rasterio.open(tmp_tif, "w", **profile) as dst:
-                # Pre-fill with nodata so untouched areas stay blank
-                nodata_arr = np.array(nodata, dtype=dtype)
-                for b in range(1, dst.count + 1):
-                    for _, window in dst.block_windows(b):
-                        dst.write(
-                            np.full((window.height, window.width), nodata_arr, dtype=dtype),
-                            b,
-                            window=window,
-                        )
                 total = len(sources)
                 for idx, tile_path in enumerate(sources, start=1):
                     print(f"[{idx}/{total}] Reprojecting {tile_path.name}")
                     with rasterio.open(tile_path) as src:
+                        if src.count != band_count:
+                            raise ValueError(f"Band count mismatch: expected {band_count}, got {src.count} in {tile_path}")
                         src_nodata = src.nodata
-                        for band_idx in range(1, src.count + 1):
+                        for band_idx in range(1, band_count + 1):
                             reproject(
                                 source=rasterio.band(src, band_idx),
                                 destination=rasterio.band(dst, band_idx),
@@ -206,7 +210,9 @@ def project_onto_grid(
                                 dst_crs=grid["crs"],
                                 dst_nodata=nodata,
                                 resampling=resample_method,
-                                num_threads=0,  # 0 = all cores
+                                init_dest_nodata=True,
+                                num_threads=MAX_WARP_THREADS,
+                                warp_mem_limit=WARP_MEM_LIMIT_MB,
                             )
                 if overviews:
                     dst.build_overviews(overviews, resampling=resample_method)
@@ -219,7 +225,8 @@ def project_onto_grid(
             "bigtiff": "IF_SAFER",
             "copy_src_overviews": True,
         }
-        rio_copy(tmp_tif, dst_path, driver="COG", **cog_profile)
+        with rasterio.Env(GDAL_CACHEMAX=CACHEMAX_MB):
+            rio_copy(tmp_tif, dst_path, driver="COG", **cog_profile)
     else:
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(tmp_tif, dst_path)
@@ -245,15 +252,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--overview-levels",
         type=int,
         nargs="+",
-        default=[2, 4, 8, 16, 32],
-        help="Overview decimation factors (2 4 8 16 32 ≈ levels 1–5).",
+        default=[],
+        help="Overview decimation factors (empty default = skip overviews).",
     )
     p.add_argument("--no-cog", dest="write_cog", action="store_false", help="Leave output as tiled GeoTIFF.")
     return p.parse_args(argv)
 
 
+def format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {sec}s"
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    start = time.perf_counter()
     try:
         sources, use_single_source = normalize_sources(args.src, args.src_dir, args.src_files or [])
         out = project_onto_grid(
@@ -269,6 +288,8 @@ def main(argv: list[str]) -> int:
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    took = time.perf_counter() - start
+    print(f"Finished in {format_duration(took)}")
     return 0
 
 
