@@ -33,7 +33,7 @@ from rasterio.warp import reproject
 # CRS is coordinate reference system; EPSG:5070 is CONUS Albers (meters, equal-area).
 DEFAULT_GRID = {
     "crs": "EPSG:5070",
-    "pixel_size": 100,  # meters per pixel
+    "pixel_size": 100,  # meters per pixel (can be overridden via CLI)
     "bounds": [-3100000, 200000, 2900000, 3700000],
     "nodata": -9999,
     "dtype": "float32",
@@ -109,13 +109,16 @@ def project_onto_grid(
     use_single_source: bool,
     dst_path: Path,
     grid_path: Path | None = None,
+    pixel_size_override: float | None = None,
     resampling: str = "bilinear",
     overview_levels: Iterable[int] | None = None,
     write_cog: bool = True,
 ) -> Path:
     grid = load_grid(grid_path)
     bounds = grid["bounds"]
-    px = float(grid["pixel_size"])
+    px = float(pixel_size_override if pixel_size_override is not None else grid.get("pixel_size"))
+    if px is None:
+        raise ValueError("Pixel size must be provided via --pixel-size or in the grid specification.")
     width, height = compute_dimensions(bounds, px)
     transform = build_transform(bounds, px)
     nodata = float(grid.get("nodata", -9999))
@@ -147,7 +150,7 @@ def project_onto_grid(
                     "blockysize": BLOCKSIZE,
                     "compress": COMPRESS,
                     "predictor": 3 if "float" in dtype else 2,  # compression hint
-                    "BIGTIFF": "IF_SAFER",
+                    "BIGTIFF": "YES",
                 }
                 with rasterio.open(tmp_tif, "w", **profile) as dst:
                     for band_idx in range(1, band_count + 1):
@@ -189,7 +192,7 @@ def project_onto_grid(
                     "blockysize": BLOCKSIZE,
                     "compress": COMPRESS,
                     "predictor": 3 if "float" in dtype else 2,
-                    "BIGTIFF": "IF_SAFER",
+                    "BIGTIFF": "YES",
                 }
             with rasterio.open(tmp_tif, "w", **profile) as dst:
                 total = len(sources)
@@ -222,7 +225,7 @@ def project_onto_grid(
         cog_profile = {
             "compress": COMPRESS,
             "blocksize": BLOCKSIZE,
-            "bigtiff": "IF_SAFER",
+            "bigtiff": "YES",
             "copy_src_overviews": True,
         }
         with rasterio.Env(GDAL_CACHEMAX=CACHEMAX_MB):
@@ -242,6 +245,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--src-files", type=Path, nargs="+", help="Explicit list of GeoTIFF/COG files (per-tile logging).")
     p.add_argument("--dst", type=Path, required=True, help="Destination path for the warped raster.")
     p.add_argument("--grid", type=Path, help="Path to grid.json (defaults to built-in 100 m EPSG:5070 CONUS grid).")
+    p.add_argument("--pixel-size", type=float, help="Pixel size in target units; overrides grid pixel_size.")
     p.add_argument(
         "--resampling",
         default="bilinear",
@@ -280,6 +284,7 @@ def main(argv: list[str]) -> int:
             use_single_source=use_single_source,
             dst_path=args.dst,
             grid_path=args.grid,
+            pixel_size_override=args.pixel_size,
             resampling=args.resampling,
             overview_levels=args.overview_levels,
             write_cog=args.write_cog,
