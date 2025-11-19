@@ -212,6 +212,8 @@ def project_onto_grid(
                     dst.build_overviews(overviews, resampling=resample_method)
                     dst.update_tags(ns="rio_overview", resampling=resample_method.name)
 
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
     if write_cog:
         cog_profile = {
             "compress": COMPRESS,
@@ -221,7 +223,6 @@ def project_onto_grid(
         }
         rio_copy(tmp_tif, dst_path, driver="COG", **cog_profile)
     else:
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(tmp_tif, dst_path)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
