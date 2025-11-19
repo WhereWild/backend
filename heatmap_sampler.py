@@ -62,7 +62,6 @@ def _subset_geotransform(gt: Sequence[float], col_min: int, row_min: int) -> tup
         gt[5],
     )
 
-
 def _project_bbox_to_pixels(
     transformer: osr.CoordinateTransformation,
     inv_gt: tuple[float, ...],
