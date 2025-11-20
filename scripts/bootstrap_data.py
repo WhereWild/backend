@@ -28,6 +28,19 @@ from urllib.request import urlopen
 # Tweakable knobs (override via env as noted above)
 MAX_CONCURRENT_FETCHES = int(os.getenv("MAX_CONCURRENT_FETCHES", "4"))
 MAX_CONCURRENT_WARPS = int(os.getenv("MAX_CONCURRENT_WARPS", "2"))
+
+GDALDEM_CREATION_OPTS = [
+    "-co",
+    "BIGTIFF=YES",
+    "-co",
+    "COMPRESS=DEFLATE",
+    "-co",
+    "TILED=YES",
+    "-co",
+    "BLOCKXSIZE=512",
+    "-co",
+    "BLOCKYSIZE=512",
+]
 def run(cmd: List[str]) -> None:
     msg = "> " + " ".join(cmd)
     print(msg)
@@ -191,33 +204,33 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
             dst_name = f"{dst_name}.tif"
         dst = dataset_dir / dst_name
         if dst.exists():
-            print(f"Destination exists ({dst}); skipping.")
-            return
-        print(f"Reprojecting {entry['name']} -> {dst}")
-        run(
-            [
-                "docker",
-                "compose",
-                "run",
-                "-T",
-                "--rm",
-                "gdal",
-                "python",
-                "reproject_gis.py",
-                "--src-dir",
-                to_workspace_path(raw_dir, repo_root),
-                "--dst",
-                to_workspace_path(dst, repo_root),
-                "--grid",
-                grid_path,
-                *pixel_size_args,
-                *src_nodata_args,
-                "--resampling",
-                resampling,
-                "--overview-levels",
-                *overview_levels,
-            ]
-        )
+            print(f"Destination exists ({dst}); reusing for derivatives.")
+        else:
+            print(f"Reprojecting {entry['name']} -> {dst}")
+            run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "-T",
+                    "--rm",
+                    "gdal",
+                    "python",
+                    "reproject_gis.py",
+                    "--src-dir",
+                    to_workspace_path(raw_dir, repo_root),
+                    "--dst",
+                    to_workspace_path(dst, repo_root),
+                    "--grid",
+                    grid_path,
+                    *pixel_size_args,
+                    *src_nodata_args,
+                    "--resampling",
+                    resampling,
+                    "--overview-levels",
+                    *overview_levels,
+                ]
+            )
         if dem_derivatives:
             generate_dem_derivatives = make_dem_derivative_runner(
                 dem_derivatives, dataset_dir, repo_root
@@ -283,21 +296,23 @@ def make_dem_derivative_runner(
                 continue
             options = [str(opt) for opt in spec.get("options", [])]
             print(f"Generating {kind} from {source_path.name} -> {out_path.name}")
-            run(
-                [
-                    "docker",
-                    "compose",
-                    "run",
-                    "-T",
-                    "--rm",
-                    "gdal",
-                    "gdaldem",
-                    kind,
-                    to_workspace_path(source_path, repo_root),
-                    to_workspace_path(out_path, repo_root),
-                    *options,
-                ]
-            )
+            cmd = [
+                "docker",
+                "compose",
+                "run",
+                "-T",
+                "--rm",
+                "gdal",
+                "gdaldem",
+                kind,
+                to_workspace_path(source_path, repo_root),
+                to_workspace_path(out_path, repo_root),
+            ]
+            if kind.lower() == "slope":
+                cmd.extend(["-s", "1.0"])
+            cmd.extend(GDALDEM_CREATION_OPTS)
+            cmd.extend(options)
+            run(cmd)
 
     return runner
 
