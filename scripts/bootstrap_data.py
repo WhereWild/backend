@@ -19,6 +19,7 @@ import sys
 import tempfile
 import zipfile
 import subprocess
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -27,7 +28,7 @@ from urllib.request import urlopen
 
 # Tweakable knobs (override via env as noted above)
 MAX_CONCURRENT_FETCHES = int(os.getenv("MAX_CONCURRENT_FETCHES", "4"))
-MAX_CONCURRENT_WARPS = int(os.getenv("MAX_CONCURRENT_WARPS", "1"))
+MAX_CONCURRENT_WARPS = int(os.getenv("MAX_CONCURRENT_WARPS", "2"))
 def run(cmd: List[str]) -> None:
     msg = "> " + " ".join(cmd)
     print(msg)
@@ -81,8 +82,12 @@ def fetch_direct_zip(entry: Dict[str, Any], raw_root: Path) -> Path:
     else:
         print(f"{zip_path} already exists; skipping download")
     if entry["fetch"].get("extract", True):
-        print(f"Extracting {zip_path} -> {dest_dir}")
-        extract_zip(zip_path, dest_dir)
+        skip_glob = entry["fetch"].get("skip_extract_if_present")
+        if skip_glob and any(dest_dir.glob(skip_glob)):
+            print(f"Files matching '{skip_glob}' already present; skipping extraction")
+        else:
+            print(f"Extracting {zip_path} -> {dest_dir}")
+            extract_zip(zip_path, dest_dir)
     return dest_dir
 
 
@@ -123,8 +128,16 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
     overview_levels = [str(level) for level in entry["process"].get("overview_levels", [2, 4, 8, 16, 32])]
     pixel_size = entry["process"].get("pixel_size")
     rename_map = entry["process"].get("rename_map", {})
+    src_nodata_override = entry["process"].get("src_nodata")
+    src_nodata_args = []
+    if src_nodata_override is not None:
+        src_nodata_args = [f"--src-nodata={src_nodata_override}"]
+    dem_derivatives = entry["process"].get("dem_derivatives", [])
 
     processed_root.mkdir(parents=True, exist_ok=True)
+    processed_subdir = entry["process"].get("processed_subdir", entry["name"])
+    dataset_dir = processed_root / processed_subdir
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     grid_path = to_workspace_path(repo_root / grid, repo_root) if grid else to_workspace_path(repo_root / "grid.json", repo_root)
     tmp_grid: Path | None = None
     if pixel_size is not None:
@@ -136,7 +149,7 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
             grid_spec["dtype"] = entry["process"]["dtype"]
         if "nodata" in entry["process"]:
             grid_spec["nodata"] = entry["process"]["nodata"]
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", dir=repo_root)
+        tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".json", dir=repo_root)
         tmp_grid = Path(tmp.name)
         json.dump(grid_spec, tmp)
         tmp.close()
@@ -144,7 +157,10 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
 
     try:
         if entry["fetch"]["type"] == "grid_tiles":
-            dst = processed_root / f"{entry['name']}_cog.tif"
+            dst_name = entry["process"].get("single_output_name", entry["name"])
+            if not dst_name.lower().endswith(".tif"):
+                dst_name = f"{dst_name}.tif"
+            dst = dataset_dir / dst_name
             if dst.exists():
                 print(f"Destination exists ({dst}); skipping.")
                 return
@@ -160,17 +176,23 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
                     "python",
                     "reproject_gis.py",
                     "--src-dir",
-                    to_workspace_path(raw_dir / entry["fetch"].get("raw_subdir", ""), repo_root),
+                    to_workspace_path(raw_dir, repo_root),
                     "--dst",
                     to_workspace_path(dst, repo_root),
                     "--grid",
                     grid_path,
+                    *src_nodata_args,
                     "--resampling",
                     resampling,
                     "--overview-levels",
                     *overview_levels,
                 ]
             )
+            if dem_derivatives:
+                generate_dem_derivatives = make_dem_derivative_runner(
+                    dem_derivatives, dataset_dir, repo_root
+                )
+                generate_dem_derivatives(dst)
         else:
             tifs = sorted(raw_dir.rglob("*.tif"))
             if not tifs:
@@ -183,7 +205,8 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
                     if part.isdigit():
                         idx = part
                 friendly = rename_map.get(idx, stem)
-                dst = processed_root / f"{entry['name']}_{friendly}_cog.tif"
+                dst_name = friendly if friendly.lower().endswith(".tif") else f"{friendly}.tif"
+                dst = dataset_dir / dst_name
                 if dst.exists():
                     print(f"{dst.name} exists; skipping.")
                     continue
@@ -204,6 +227,7 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
                         to_workspace_path(dst, repo_root),
                         "--grid",
                         grid_path,
+                        *src_nodata_args,
                         "--resampling",
                         resampling,
                         "--overview-levels",
@@ -213,6 +237,37 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
     finally:
         if tmp_grid is not None:
             tmp_grid.unlink(missing_ok=True)
+
+def make_dem_derivative_runner(
+    derivative_specs: list[dict[str, Any]], dataset_dir: Path, repo_root: Path
+) -> Any:
+    def runner(source_path: Path) -> None:
+        for spec in derivative_specs:
+            kind = spec["type"]
+            out_name = spec.get("output", f"{kind}.tif")
+            out_path = dataset_dir / out_name
+            if out_path.exists():
+                print(f"{out_path.name} exists; skipping.")
+                continue
+            options = [str(opt) for opt in spec.get("options", [])]
+            print(f"Generating {kind} from {source_path.name} -> {out_path.name}")
+            run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "-T",
+                    "--rm",
+                    "gdal",
+                    "gdaldem",
+                    kind,
+                    to_workspace_path(source_path, repo_root),
+                    to_workspace_path(out_path, repo_root),
+                    *options,
+                ]
+            )
+
+    return runner
 
 
 def main(argv: List[str]) -> int:
@@ -236,17 +291,22 @@ def main(argv: List[str]) -> int:
         return entry, raw_dest
 
     def project(entry: Dict[str, Any], raw_dest: Path) -> None:
-        if entry.get("kind") == "raster":
-            process_raster(
-                entry,
-                raw_dest,
-                processed_root,
-                entry["process"].get("grid", entry["fetch"].get("grid", "grid.json")),
-                repo_root,
-            )
+        try:
+            if entry.get("kind") == "raster":
+                process_raster(
+                    entry,
+                    raw_dest,
+                    processed_root,
+                    entry["process"].get("grid", entry["fetch"].get("grid", "grid.json")),
+                    repo_root,
+                )
+            else:
+                print(f"Skipping processing for non-raster dataset {entry['name']}")
+        except Exception:
+            print(f"Processing failed for {entry['name']}:", file=sys.stderr)
+            traceback.print_exc()
         else:
-            print(f"Skipping processing for non-raster dataset {entry['name']}")
-        print()
+            print()
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WARPS) as warp_pool:
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as fetch_pool:

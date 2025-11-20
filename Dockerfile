@@ -9,7 +9,7 @@ RUN apt-get update \
         python3-dev \
         build-essential \
     && rm -rf /var/lib/apt/lists/* \
-    && python3 -m venv /opt/venv
+    && python3 -m venv --system-site-packages /opt/venv
 
 ENV PATH="/opt/venv/bin:${PATH}"
 

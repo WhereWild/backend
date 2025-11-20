@@ -15,7 +15,13 @@
         "resampling": "bilinear",
         "overview_levels": [2, 4, 8, 16, 32],
         "dtype": "float32",
-        "nodata": -9999
+        "nodata": -9999,
+        "processed_subdir": "dem",
+        "single_output_name": "elevation",
+        "dem_derivatives": [
+          {"type": "slope", "output": "slope.tif"},
+          {"type": "aspect", "output": "aspect.tif"}
+        ]
       }
     },
     {
@@ -25,34 +31,37 @@
         "type": "direct_zip",
         "url": "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_30s_bio.zip",
         "raw_subdir": "bioclim",
-        "extract": true
+        "extract": true,
+        "skip_extract_if_present": "*.tif"
       },
       "process": {
         "resampling": "bilinear",
         "overview_levels": [2, 4, 8, 16, 32],
         "dtype": "float32",
         "nodata": -9999,
+        "src_nodata": -3.3999999521443642e38,
         "pixel_size": 1000,
+        "processed_subdir": "bioclim",
         "rename_map": {
-          "1": "bio01_annual_mean_temp",
-          "2": "bio02_mean_diurnal_range",
-          "3": "bio03_isothermality",
-          "4": "bio04_temp_seasonality",
-          "5": "bio05_max_temp_warmest_month",
-          "6": "bio06_min_temp_coldest_month",
-          "7": "bio07_temp_annual_range",
-          "8": "bio08_mean_temp_wettest_quarter",
-          "9": "bio09_mean_temp_driest_quarter",
-          "10": "bio10_mean_temp_warmest_quarter",
-          "11": "bio11_mean_temp_coldest_quarter",
-          "12": "bio12_annual_precip",
-          "13": "bio13_precip_wettest_month",
-          "14": "bio14_precip_driest_month",
-          "15": "bio15_precip_seasonality",
-          "16": "bio16_precip_wettest_quarter",
-          "17": "bio17_precip_driest_quarter",
-          "18": "bio18_precip_warmest_quarter",
-          "19": "bio19_precip_coldest_quarter"
+          "1": "annual_mean_temp",
+          "2": "mean_diurnal_range",
+          "3": "isothermality",
+          "4": "temp_seasonality",
+          "5": "max_temp_warmest_month",
+          "6": "min_temp_coldest_month",
+          "7": "temp_annual_range",
+          "8": "mean_temp_wettest_quarter",
+          "9": "mean_temp_driest_quarter",
+          "10": "mean_temp_warmest_quarter",
+          "11": "mean_temp_coldest_quarter",
+          "12": "annual_precip",
+          "13": "precip_wettest_month",
+          "14": "precip_driest_month",
+          "15": "precip_seasonality",
+          "16": "precip_wettest_quarter",
+          "17": "precip_driest_quarter",
+          "18": "precip_warmest_quarter",
+          "19": "precip_coldest_quarter"
         }
       }
     }
