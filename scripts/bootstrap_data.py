@@ -59,8 +59,10 @@ def download_file(url: str, destination: Path) -> None:
                 out.write(chunk)
                 chunk = resp.read(1024 * 1024)
     except HTTPError as exc:
+        temp.unlink(missing_ok=True)
         raise RuntimeError(f"HTTP error {exc.code} for {url}") from exc
     except URLError as exc:
+        temp.unlink(missing_ok=True)
         raise RuntimeError(f"Network error for {url}: {exc.reason}") from exc
     else:
         temp.replace(destination)
@@ -72,13 +74,42 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> None:
 
 
 def fetch_direct_zip(entry: Dict[str, Any], raw_root: Path) -> Path:
-    url = entry["fetch"]["url"]
     subdir = entry["fetch"].get("raw_subdir", entry["name"])
     dest_dir = raw_root / subdir
-    zip_path = dest_dir / Path(url).name
+    fetch_cfg = entry["fetch"]
+    urls = fetch_cfg.get("urls")
+    url = fetch_cfg.get("url")
+    env_url_var = fetch_cfg.get("env_url_var")
+    env_override = os.getenv(env_url_var) if env_url_var else None
+    if urls:
+        candidates = list(urls)
+    elif url:
+        candidates = [url]
+    else:
+        raise ValueError(f"{entry['name']} is missing a 'url' or 'urls' entry")
+    if env_override:
+        print(f"Using override URL from ${env_url_var}")
+        candidates.insert(0, env_override)
+    zip_name = fetch_cfg.get("zip_name")
+    if zip_name:
+        zip_path = dest_dir / zip_name
+    else:
+        zip_path = dest_dir / Path(candidates[0]).name
+
     if not zip_path.exists():
-        print(f"Downloading {entry['name']} from {url}")
-        download_file(url, zip_path)
+        last_error: Exception | None = None
+        for candidate in candidates:
+            print(f"Downloading {entry['name']} from {candidate}")
+            try:
+                download_file(candidate, zip_path)
+            except RuntimeError as exc:
+                last_error = exc
+                print(f"  Failed: {exc}")
+                continue
+            else:
+                break
+        else:
+            raise RuntimeError(f"Failed to fetch {entry['name']} from any provided URL") from last_error
     else:
         print(f"{zip_path} already exists; skipping download")
     if entry["fetch"].get("extract", True):
@@ -94,6 +125,16 @@ def fetch_direct_zip(entry: Dict[str, Any], raw_root: Path) -> Path:
 def fetch_grid_tiles(entry: Dict[str, Any], raw_root: Path, repo_root: Path) -> Path:
     grid = entry["fetch"].get("grid", "grid.json")
     workers = str(entry["fetch"].get("workers", 4))
+    subdir = entry["fetch"].get("raw_subdir", "dem")
+    dest_dir = raw_root / subdir
+    skip_threshold = entry["fetch"].get("skip_if_tif_count_at_least")
+    if skip_threshold is not None:
+        tif_count = sum(1 for _ in dest_dir.rglob("*.tif")) if dest_dir.exists() else 0
+        if tif_count >= int(skip_threshold):
+            print(
+                f"Detected {tif_count} TIFFs in {dest_dir} (>= {skip_threshold}); skipping tile download."
+            )
+            return dest_dir
     raw_dir = to_workspace_path(raw_root, repo_root)
     grid_path = to_workspace_path(repo_root / grid, repo_root)
     print(f"Downloading tiles for {entry['name']} with {workers} workers")
@@ -126,8 +167,11 @@ def clean_partials(raw_dir: Path) -> None:
 def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, grid: str, repo_root: Path) -> None:
     resampling = entry["process"].get("resampling", "bilinear")
     overview_levels = [str(level) for level in entry["process"].get("overview_levels", [2, 4, 8, 16, 32])]
-    pixel_size = entry["process"].get("pixel_size")
+    pixel_size_override = entry["process"].get("pixel_size")
+    dtype_override = entry["process"].get("dtype")
+    nodata_override = entry["process"].get("nodata")
     rename_map = entry["process"].get("rename_map", {})
+    single_output_name = entry["process"].get("single_output_name")
     src_nodata_override = entry["process"].get("src_nodata")
     src_nodata_args = []
     if src_nodata_override is not None:
@@ -140,15 +184,18 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
     dataset_dir.mkdir(parents=True, exist_ok=True)
     grid_path = to_workspace_path(repo_root / grid, repo_root) if grid else to_workspace_path(repo_root / "grid.json", repo_root)
     tmp_grid: Path | None = None
-    if pixel_size is not None:
+    grid_overrides: Dict[str, Any] = {}
+    if pixel_size_override is not None:
+        grid_overrides["pixel_size"] = pixel_size_override
+    if dtype_override is not None:
+        grid_overrides["dtype"] = dtype_override
+    if nodata_override is not None:
+        grid_overrides["nodata"] = nodata_override
+    if grid_overrides:
         base_grid_path = Path(grid) if grid else Path("grid.json")
         with base_grid_path.open() as fp:
             grid_spec = json.load(fp)
-        grid_spec["pixel_size"] = pixel_size
-        if "dtype" in entry["process"]:
-            grid_spec["dtype"] = entry["process"]["dtype"]
-        if "nodata" in entry["process"]:
-            grid_spec["nodata"] = entry["process"]["nodata"]
+        grid_spec.update(grid_overrides)
         tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".json", dir=repo_root)
         tmp_grid = Path(tmp.name)
         json.dump(grid_spec, tmp)
@@ -198,13 +245,17 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
             if not tifs:
                 print(f"No TIFFs found under {raw_dir} for {entry['name']}", file=sys.stderr)
                 return
+            total_tifs = len(tifs)
             for tif in tifs:
                 stem = tif.stem
                 idx = ""
                 for part in stem.split("_"):
                     if part.isdigit():
                         idx = part
-                friendly = rename_map.get(idx, stem)
+                if single_output_name and total_tifs == 1:
+                    friendly = single_output_name
+                else:
+                    friendly = rename_map.get(idx, stem)
                 dst_name = friendly if friendly.lower().endswith(".tif") else f"{friendly}.tif"
                 dst = dataset_dir / dst_name
                 if dst.exists():

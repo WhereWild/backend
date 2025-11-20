@@ -9,7 +9,8 @@
         "raw_subdir": "dem",
         "template": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/{tile}/USGS_1_{tile}.tif",
         "tile_scheme": "usgs_1deg",
-        "workers": 8
+        "workers": 8,
+        "skip_if_tif_count_at_least": 1292
       },
       "process": {
         "resampling": "bilinear",
@@ -63,6 +64,30 @@
           "18": "precip_warmest_quarter",
           "19": "precip_coldest_quarter"
         }
+      }
+    },
+    {
+      "name": "nlcd_2024_landcover",
+      "kind": "raster",
+      "fetch": {
+        "type": "direct_zip",
+        "env_url_var": "NLCD_2024_URL",
+        "urls": [
+          "https://www.mrlc.gov/downloads/sciweb1/shared/mrlc/data-bundles/Annual_NLCD_LndCov_2024_CU_C1V1.zip"
+        ],
+        "zip_name": "Annual_NLCD_LndCov_2024_CU_C1V1.zip",
+        "raw_subdir": "landcover",
+        "extract": true,
+        "skip_extract_if_present": "*.tif"
+      },
+      "process": {
+        "resampling": "mode",
+        "overview_levels": [2, 4, 8, 16, 32],
+        "dtype": "uint8",
+        "nodata": 0,
+        "src_nodata": 0,
+        "processed_subdir": "landcover_2024",
+        "single_output_name": "landcover_2024"
       }
     }
   ]
