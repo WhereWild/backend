@@ -16,7 +16,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import zipfile
 import subprocess
 import traceback
@@ -168,8 +167,6 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
     resampling = entry["process"].get("resampling", "bilinear")
     overview_levels = [str(level) for level in entry["process"].get("overview_levels", [2, 4, 8, 16, 32])]
     pixel_size_override = entry["process"].get("pixel_size")
-    dtype_override = entry["process"].get("dtype")
-    nodata_override = entry["process"].get("nodata")
     rename_map = entry["process"].get("rename_map", {})
     single_output_name = entry["process"].get("single_output_name")
     src_nodata_override = entry["process"].get("src_nodata")
@@ -182,36 +179,72 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
     processed_subdir = entry["process"].get("processed_subdir", entry["name"])
     dataset_dir = processed_root / processed_subdir
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    grid_path = to_workspace_path(repo_root / grid, repo_root) if grid else to_workspace_path(repo_root / "grid.json", repo_root)
-    tmp_grid: Path | None = None
-    grid_overrides: Dict[str, Any] = {}
+    grid_file = (repo_root / grid) if grid else (repo_root / "grid.json")
+    grid_path = to_workspace_path(grid_file, repo_root)
+    pixel_size_args: List[str] = []
     if pixel_size_override is not None:
-        grid_overrides["pixel_size"] = pixel_size_override
-    if dtype_override is not None:
-        grid_overrides["dtype"] = dtype_override
-    if nodata_override is not None:
-        grid_overrides["nodata"] = nodata_override
-    if grid_overrides:
-        base_grid_path = Path(grid) if grid else Path("grid.json")
-        with base_grid_path.open() as fp:
-            grid_spec = json.load(fp)
-        grid_spec.update(grid_overrides)
-        tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".json", dir=repo_root)
-        tmp_grid = Path(tmp.name)
-        json.dump(grid_spec, tmp)
-        tmp.close()
-        grid_path = to_workspace_path(tmp_grid, repo_root)
+        pixel_size_args = ["--pixel-size", str(pixel_size_override)]
 
-    try:
-        if entry["fetch"]["type"] == "grid_tiles":
-            dst_name = entry["process"].get("single_output_name", entry["name"])
-            if not dst_name.lower().endswith(".tif"):
-                dst_name = f"{dst_name}.tif"
+    if entry["fetch"]["type"] == "grid_tiles":
+        dst_name = entry["process"].get("single_output_name", entry["name"])
+        if not dst_name.lower().endswith(".tif"):
+            dst_name = f"{dst_name}.tif"
+        dst = dataset_dir / dst_name
+        if dst.exists():
+            print(f"Destination exists ({dst}); skipping.")
+            return
+        print(f"Reprojecting {entry['name']} -> {dst}")
+        run(
+            [
+                "docker",
+                "compose",
+                "run",
+                "-T",
+                "--rm",
+                "gdal",
+                "python",
+                "reproject_gis.py",
+                "--src-dir",
+                to_workspace_path(raw_dir, repo_root),
+                "--dst",
+                to_workspace_path(dst, repo_root),
+                "--grid",
+                grid_path,
+                *pixel_size_args,
+                *src_nodata_args,
+                "--resampling",
+                resampling,
+                "--overview-levels",
+                *overview_levels,
+            ]
+        )
+        if dem_derivatives:
+            generate_dem_derivatives = make_dem_derivative_runner(
+                dem_derivatives, dataset_dir, repo_root
+            )
+            generate_dem_derivatives(dst)
+    else:
+        tifs = sorted(raw_dir.rglob("*.tif"))
+        if not tifs:
+            print(f"No TIFFs found under {raw_dir} for {entry['name']}", file=sys.stderr)
+            return
+        total_tifs = len(tifs)
+        for tif in tifs:
+            stem = tif.stem
+            idx = ""
+            for part in stem.split("_"):
+                if part.isdigit():
+                    idx = part
+            if single_output_name and total_tifs == 1:
+                friendly = single_output_name
+            else:
+                friendly = rename_map.get(idx, stem)
+            dst_name = friendly if friendly.lower().endswith(".tif") else f"{friendly}.tif"
             dst = dataset_dir / dst_name
             if dst.exists():
-                print(f"Destination exists ({dst}); skipping.")
-                return
-            print(f"Reprojecting {entry['name']} -> {dst}")
+                print(f"{dst.name} exists; skipping.")
+                continue
+            print(f"Reprojecting {tif.name} -> {dst.name}")
             run(
                 [
                     "docker",
@@ -222,12 +255,13 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
                     "gdal",
                     "python",
                     "reproject_gis.py",
-                    "--src-dir",
-                    to_workspace_path(raw_dir, repo_root),
+                    "--src-files",
+                    to_workspace_path(tif, repo_root),
                     "--dst",
                     to_workspace_path(dst, repo_root),
                     "--grid",
                     grid_path,
+                    *pixel_size_args,
                     *src_nodata_args,
                     "--resampling",
                     resampling,
@@ -235,59 +269,6 @@ def process_raster(entry: Dict[str, Any], raw_dir: Path, processed_root: Path, g
                     *overview_levels,
                 ]
             )
-            if dem_derivatives:
-                generate_dem_derivatives = make_dem_derivative_runner(
-                    dem_derivatives, dataset_dir, repo_root
-                )
-                generate_dem_derivatives(dst)
-        else:
-            tifs = sorted(raw_dir.rglob("*.tif"))
-            if not tifs:
-                print(f"No TIFFs found under {raw_dir} for {entry['name']}", file=sys.stderr)
-                return
-            total_tifs = len(tifs)
-            for tif in tifs:
-                stem = tif.stem
-                idx = ""
-                for part in stem.split("_"):
-                    if part.isdigit():
-                        idx = part
-                if single_output_name and total_tifs == 1:
-                    friendly = single_output_name
-                else:
-                    friendly = rename_map.get(idx, stem)
-                dst_name = friendly if friendly.lower().endswith(".tif") else f"{friendly}.tif"
-                dst = dataset_dir / dst_name
-                if dst.exists():
-                    print(f"{dst.name} exists; skipping.")
-                    continue
-                print(f"Reprojecting {tif.name} -> {dst.name}")
-                run(
-                    [
-                        "docker",
-                        "compose",
-                        "run",
-                        "-T",
-                        "--rm",
-                        "gdal",
-                        "python",
-                        "reproject_gis.py",
-                        "--src-files",
-                        to_workspace_path(tif, repo_root),
-                        "--dst",
-                        to_workspace_path(dst, repo_root),
-                        "--grid",
-                        grid_path,
-                        *src_nodata_args,
-                        "--resampling",
-                        resampling,
-                        "--overview-levels",
-                        *overview_levels,
-                    ]
-                )
-    finally:
-        if tmp_grid is not None:
-            tmp_grid.unlink(missing_ok=True)
 
 def make_dem_derivative_runner(
     derivative_specs: list[dict[str, Any]], dataset_dir: Path, repo_root: Path
