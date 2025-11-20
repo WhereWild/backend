@@ -95,6 +95,44 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> None:
         zf.extractall(dest_dir)
 
 
+def ensure_tif_name(name: str) -> str:
+    return name if name.lower().endswith(".tif") else f"{name}.tif"
+
+
+def expected_processed_outputs(entry: Dict[str, Any], processed_root: Path) -> Tuple[List[Path], Path]:
+    process_cfg = entry.get("process", {})
+    processed_subdir = process_cfg.get("processed_subdir", entry["name"])
+    dataset_dir = processed_root / processed_subdir
+    outputs: List[Path] = []
+    if entry.get("kind") != "raster":
+        return outputs, dataset_dir
+
+    fetch_type = entry.get("fetch", {}).get("type")
+    single_output_name = process_cfg.get("single_output_name")
+    rename_map = process_cfg.get("rename_map", {})
+
+    if fetch_type == "grid_tiles":
+        name = ensure_tif_name(single_output_name or entry["name"])
+        outputs.append(dataset_dir / name)
+    else:
+        if single_output_name:
+            outputs.append(dataset_dir / ensure_tif_name(single_output_name))
+        elif rename_map:
+            for friendly in rename_map.values():
+                outputs.append(dataset_dir / ensure_tif_name(friendly))
+
+    return outputs, dataset_dir
+
+
+def processed_outputs_exist(entry: Dict[str, Any], processed_root: Path) -> bool:
+    outputs, dataset_dir = expected_processed_outputs(entry, processed_root)
+    if not dataset_dir.exists():
+        return False
+    if outputs:
+        return all(path.exists() for path in outputs)
+    return any(dataset_dir.glob("*.tif"))
+
+
 def fetch_direct_zip(entry: Dict[str, Any], raw_root: Path) -> Path:
     subdir = entry["fetch"].get("raw_subdir", entry["name"])
     dest_dir = raw_root / subdir
@@ -354,6 +392,14 @@ def main(argv: List[str]) -> int:
     catalog_path = Path(os.getenv("CATALOG", "scripts/data_catalog.json"))
 
     catalog = load_catalog(catalog_path)
+    datasets = catalog.get("datasets", [])
+    pending_entries: List[Dict[str, Any]] = []
+    for entry in datasets:
+        if entry.get("kind") == "raster" and processed_outputs_exist(entry, processed_root):
+            print(f"==> {entry['name']}")
+            print("Processed outputs present; skipping download and reprojection.")
+            continue
+        pending_entries.append(entry)
 
     def fetch(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Path]:
         print(f"==> {entry['name']}")
@@ -387,7 +433,7 @@ def main(argv: List[str]) -> int:
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_WARPS) as warp_pool:
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as fetch_pool:
-            futures = {fetch_pool.submit(fetch, entry): entry for entry in catalog.get("datasets", [])}
+            futures = {fetch_pool.submit(fetch, entry): entry for entry in pending_entries}
             for fut in as_completed(futures):
                 try:
                     entry, raw_dest = fut.result()
