@@ -86,8 +86,8 @@
         "dtype": "uint8",
         "nodata": 0,
         "src_nodata": 0,
-        "processed_subdir": "landcover_2024",
-        "single_output_name": "landcover_2024"
+        "processed_subdir": "landcover",
+        "single_output_name": "landcover"
       }
     }
   ]
