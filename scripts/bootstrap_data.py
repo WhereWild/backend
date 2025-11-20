@@ -41,6 +41,16 @@ GDALDEM_CREATION_OPTS = [
     "-co",
     "BLOCKYSIZE=512",
 ]
+COG_CREATION_OPTS = [
+    "-of",
+    "COG",
+    "-co",
+    "COMPRESS=DEFLATE",
+    "-co",
+    "BLOCKSIZE=512",
+    "-co",
+    "BIGTIFF=YES",
+]
 def run(cmd: List[str]) -> None:
     msg = "> " + " ".join(cmd)
     print(msg)
@@ -295,6 +305,11 @@ def make_dem_derivative_runner(
                 print(f"{out_path.name} exists; skipping.")
                 continue
             options = [str(opt) for opt in spec.get("options", [])]
+            if out_path.suffix:
+                tmp_path = out_path.with_suffix(f".tmp{out_path.suffix}")
+            else:
+                tmp_path = out_path.with_name(out_path.name + ".tmp")
+            tmp_path.unlink(missing_ok=True)
             print(f"Generating {kind} from {source_path.name} -> {out_path.name}")
             cmd = [
                 "docker",
@@ -306,13 +321,28 @@ def make_dem_derivative_runner(
                 "gdaldem",
                 kind,
                 to_workspace_path(source_path, repo_root),
-                to_workspace_path(out_path, repo_root),
+                to_workspace_path(tmp_path, repo_root),
             ]
             if kind.lower() == "slope":
                 cmd.extend(["-s", "1.0"])
             cmd.extend(GDALDEM_CREATION_OPTS)
             cmd.extend(options)
             run(cmd)
+            run(
+                [
+                    "docker",
+                    "compose",
+                    "run",
+                    "-T",
+                    "--rm",
+                    "gdal",
+                    "gdal_translate",
+                    *COG_CREATION_OPTS,
+                    to_workspace_path(tmp_path, repo_root),
+                    to_workspace_path(out_path, repo_root),
+                ]
+            )
+            tmp_path.unlink(missing_ok=True)
 
     return runner
 
