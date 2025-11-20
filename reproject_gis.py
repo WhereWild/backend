@@ -3,6 +3,7 @@
 Reproject raster(s) onto a canonical grid and emit a COG.
 - Preserves per-band nodata and dtype by default.
 - Copies overviews if you build them before COG.
+- Automatically mosaics multiple inputs into a VRT (disable via --no-mosaic).
 """
 
 from __future__ import annotations
@@ -163,6 +164,26 @@ def collect_sources(src: Path | None, src_dir: Path | None, src_files: list[Path
     raise ValueError("Provide --src or --src-dir or --src-files.")
 
 
+def build_vrt_mosaic(sources: Sequence[Path], dst: Path, nodata: float | None) -> Path:
+    """Build a VRT that mosaics all sources so we can warp once instead of per-tile."""
+    from osgeo import gdal
+
+    gdal.UseExceptions()
+    kwargs: dict[str, float] = {}
+    if nodata is not None:
+        nodata_val = float(nodata)
+        kwargs["srcNodata"] = nodata_val
+        kwargs["VRTNodata"] = nodata_val
+    vrt = gdal.BuildVRT(str(dst), [str(path) for path in sources], **kwargs)
+    if vrt is None:
+        raise RuntimeError("GDAL failed to build VRT mosaic")
+    try:
+        vrt.FlushCache()
+    finally:
+        vrt = None
+    return dst
+
+
 def reproject_to_grid(
     sources: list[Path],
     use_single_source: bool,
@@ -173,6 +194,7 @@ def reproject_to_grid(
     resampling: str,
     overview_levels: Iterable[int],
     write_cog: bool,
+    mosaic_sources: bool,
 ) -> Path:
     grid = load_grid(grid_path)
     bounds = grid["bounds"]
@@ -184,8 +206,19 @@ def reproject_to_grid(
 
     tmpdir = Path(tempfile.mkdtemp(prefix="reproj_"))
     tmp_tif = tmpdir / "out.tif"
+    tmp_vrt: Path | None = None
 
     with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS", GDAL_CACHEMAX=CACHEMAX_MB):
+        # Mosaic multiple tiles into a temporary VRT so we warp once across the stack.
+        if mosaic_sources and not use_single_source and len(sources) > 1:
+            with rasterio.open(sources[0]) as sample:
+                mosaic_nodata = resolve_src_nodata(sample, src_nodata_override)
+            tmp_vrt = tmpdir / "sources.vrt"
+            print(f"Building VRT mosaic from {len(sources)} sources ...")
+            build_vrt_mosaic(sources, tmp_vrt, mosaic_nodata)
+            sources = [tmp_vrt]
+            use_single_source = True
+
         # Inspect first source for dtype/count; we do not up/downcast unless explicitly asked.
         with rasterio.open(sources[0]) as first:
             if first.crs is None:
@@ -289,6 +322,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--resampling", default="bilinear")
     p.add_argument("--overview-levels", type=int, nargs="+", default=[])
     p.add_argument("--no-cog", dest="write_cog", action="store_false")
+    p.add_argument(
+        "--no-mosaic",
+        dest="mosaic_sources",
+        action="store_false",
+        help="Process multi-source inputs tile-by-tile instead of building a VRT mosaic automatically.",
+    )
+    p.set_defaults(mosaic_sources=True)
     return p.parse_args(argv)
 
 
@@ -306,6 +346,7 @@ def main(argv: list[str]) -> int:
             resampling=args.resampling,
             overview_levels=args.overview_levels,
             write_cog=args.write_cog,
+            mosaic_sources=args.mosaic_sources,
         )
         print(out)
         return 0
