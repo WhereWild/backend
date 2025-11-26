@@ -10,6 +10,10 @@ from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+try:
+    import pyarrow.parquet as pq
+except ImportError:  # pragma: no cover - optional dependency
+    pq = None
 import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform as rio_transform
@@ -22,6 +26,8 @@ STATS_DIR = SPECIES_DIR / "stats"
 LEADERBOARD_DIR = STATS_DIR / "leaderboard"
 GIS_CATALOG_PATH = REPO_ROOT / "gis_catalog.json"
 WGS84 = CRS.from_epsg(4326)
+MAX_POSITIONAL_ACCURACY_METERS: int | None = 500
+EXCLUDE_OBSCURED_OBSERVATIONS = True
 
 
 @dataclass(frozen=True)
@@ -160,11 +166,53 @@ def load_gis_catalog() -> list[GISVariable]:
 
 
 def load_observations(parquet_path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(parquet_path, columns=["id", "latitude", "longitude"])
+    base_columns = ["id", "latitude", "longitude"]
+    optional_columns = ["coordinates_obscured", "positional_accuracy"]
+    available_optional: list[str] = []
+    if pq is not None:
+        try:
+            schema_names = set(pq.ParquetFile(parquet_path).schema.names)
+        except Exception:  # pragma: no cover - corrupted parquet metadata
+            schema_names = set()
+        available_optional = [col for col in optional_columns if col in schema_names]
+    columns = base_columns + available_optional
+    df = pd.read_parquet(parquet_path, columns=columns)
+    if pq is None:
+        for col in optional_columns:
+            if col in df.columns:
+                continue
+            try:
+                extra = pd.read_parquet(parquet_path, columns=[col])
+            except Exception:
+                continue
+            df[col] = extra[col]
+    for col in optional_columns:
+        if col not in df.columns:
+            df[col] = np.nan
     df = df.dropna(subset=["latitude", "longitude"])
     if df.empty:
-        return df
-    return df.astype({"id": "int64"})
+        return df.astype({"id": "int64"})
+    if EXCLUDE_OBSCURED_OBSERVATIONS and "coordinates_obscured" in df.columns:
+        mask = ~df["coordinates_obscured"].fillna(False)
+        df = df.loc[mask]
+    if (
+        MAX_POSITIONAL_ACCURACY_METERS is not None
+        and "positional_accuracy" in df.columns
+    ):
+        accuracy = df["positional_accuracy"]
+        mask = accuracy.isna() | (accuracy <= MAX_POSITIONAL_ACCURACY_METERS)
+        df = df.loc[mask]
+    if df.empty:
+        return df.astype({"id": "int64"})
+    df = df.astype({"id": "int64"})
+    drop_cols = [
+        col
+        for col in optional_columns
+        if col in df.columns
+    ]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    return df
 
 
 def project_coords(
@@ -209,14 +257,22 @@ def summarize_values(values: np.ndarray) -> dict:
             "stddev": None,
             "q10": None,
             "q90": None,
+            "min": None,
+            "max": None,
+            "q1": None,
+            "q99": None,
         }
-    quantiles = np.quantile(values, [0.1, 0.9])
+    quantiles = np.quantile(values, [0.01, 0.1, 0.9, 0.99])
     return {
         "count": int(values.size),
         "mean": float(np.mean(values)),
         "stddev": float(np.std(values)),
-        "q10": float(quantiles[0]),
-        "q90": float(quantiles[1]),
+        "q1": float(quantiles[0]),
+        "q10": float(quantiles[1]),
+        "q90": float(quantiles[2]),
+        "q99": float(quantiles[3]),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
     }
 
 
@@ -336,6 +392,10 @@ def build_leaderboard(
         "q90": {"field": "q90", "order": "desc"},
         "q10": {"field": "q10", "order": "desc"},
         "stddev": {"field": "stddev", "order": "desc"},
+        "q99": {"field": "q99", "order": "desc"},
+        "q1": {"field": "q1", "order": "desc"},
+        "max": {"field": "max", "order": "desc"},
+        "min": {"field": "min", "order": "asc"},
     }
     metric_payload: dict[str, dict] = {}
     for metric_name, cfg in metrics.items():
@@ -476,7 +536,8 @@ def run_for_variable(
     leaderboard_entries: list[dict] = []
     with rasterio.open(raster_path) as dataset:
         for record in records:
-            output_path = output_dir / f"{record.taxon_id}.json"
+            slug_prefix = record.slug or record.scientific_name.replace(" ", "_")
+            output_path = output_dir / f"{slug_prefix}_{record.taxon_id}.json"
             if output_path.exists() and not overwrite:
                 continue
             observations = load_observations(record.parquet_path)
