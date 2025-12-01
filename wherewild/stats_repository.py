@@ -7,9 +7,11 @@ from typing import Any, Dict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = REPO_ROOT / "processed"
-SPECIES_STATS_DIR = PROCESSED_DIR / "species" / "stats"
+SPECIES_DIR = PROCESSED_DIR / "species"
+SPECIES_STATS_DIR = SPECIES_DIR / "stats"
 LEADERBOARD_DIR = SPECIES_STATS_DIR / "leaderboard"
 GIS_CATALOG_PATH = REPO_ROOT / "gis_catalog.json"
+SPECIES_CATALOG_PATH = SPECIES_DIR / "species_catalog.json" 
 
 
 class VariableNotFoundError(KeyError):
@@ -28,6 +30,19 @@ def _load_gis_catalog() -> Dict[str, Dict[str, Any]]:
     with GIS_CATALOG_PATH.open() as fp:
         entries = json.load(fp)
     return {entry["id"]: entry for entry in entries}
+
+
+@lru_cache()
+def load_species_names():
+    if not SPECIES_CATALOG_PATH.exists():
+        msg = f"Species catalog not found at {SPECIES_CATALOG_PATH}"
+        raise FileNotFoundError(msg)
+    with SPECIES_CATALOG_PATH.open() as fp:
+        entries = json.load(fp)
+    
+    common_names = {entry["common_name"]: entry for entry in entries}
+    scientific_names = {entry["scientific_name"]: entry for entry in entries}
+    return (common_names, scientific_names)    
 
 
 def get_variable_definition(variable_id: str) -> dict[str, Any]:

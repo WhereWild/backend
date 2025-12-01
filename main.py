@@ -6,15 +6,31 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from rapidfuzz import fuzz, process
 
 from wherewild.stats_repository import (
     SpeciesStatsNotFoundError,
     VariableNotFoundError,
     get_species_stats,
     get_variable_leaderboard,
+    load_species_names
 )
 
+# Maximum number of search results to return
+# (Very low for now because we have such a small database)
+SEARCH_RESULT_LIMIT = 6
+
 app = FastAPI(title="WhereWild API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -178,6 +194,34 @@ def debug_species_info():
         "sample_common_names": [s.get("common_name") for s in CATALOG[:10]]
     }
 
+@app.get(
+    "/search/{query}",
+    summary="Return the best matches for a search query, using both common and scientific names"
+)
+def species_search(query: str) -> list:
+    (common, scientific) = load_species_names()
+    
+    common_results = process.extract(query, common.keys(), scorer=fuzz.WRatio, limit=SEARCH_RESULT_LIMIT)
+    scientific_results = process.extract(query, scientific.keys(), scorer=fuzz.WRatio, limit=SEARCH_RESULT_LIMIT)
+
+    result_idx = 0
+    common_idx = 0
+    scientific_idx = 0
+    result_entries = []
+
+    while result_idx < SEARCH_RESULT_LIMIT:
+        if common_results[common_idx][1] >= scientific_results[scientific_idx][1]:
+            current = common[common_results[common_idx][0]]
+            common_idx += 1
+        else:
+            current = scientific[scientific_results[scientific_idx][0]]
+            scientific_idx += 1
+
+        if current not in result_entries:
+            result_entries.append(current)
+            result_idx += 1
+        
+    return result_entries
 
 if __name__ == "__main__":
     import uvicorn
