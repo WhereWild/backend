@@ -21,8 +21,7 @@ GIS_CATALOG_PATH = REPO_ROOT / "gis_catalog.json"
 MODELS_DIR = PROCESSED_DIR / "models" / "gbt"
 WGS84 = CRS.from_epsg(4326)
 
-# Tunable knobs. Leave filters as None to run on every species and GIS variable.
-SPECIES_ID_FILTER: list[int] | None = [148405]
+# Tunable knobs.
 VARIABLE_ID_FILTER: list[str] | None = None
 NEGATIVES_PER_POSITIVE = 3
 LEARNING_RATE = 0.05
@@ -61,6 +60,16 @@ class RasterVariable:
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
+
+def model_artifact_exists(species_id: int) -> bool:
+    if not MODELS_DIR.exists():
+        return False
+    legacy = MODELS_DIR / f"{species_id}.json"
+    if legacy.exists():
+        return True
+    return any(MODELS_DIR.glob(f"*_{species_id}.json"))
+
+
 def load_species_catalog() -> dict[int, dict]:
     with SPECIES_CATALOG_PATH.open() as fp:
         entries = json.load(fp)
@@ -94,7 +103,15 @@ def load_direction_bins(definition_path: str | None) -> list[DirectionBin]:
 
 
 def load_presence_points(parquet_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    df = pd.read_parquet(parquet_path, columns=["latitude", "longitude"]).dropna()
+    base_cols = ["latitude", "longitude"]
+    try:
+        df = pd.read_parquet(parquet_path, columns=base_cols + ["label"])
+    except (ValueError, KeyError):
+        df = pd.read_parquet(parquet_path, columns=base_cols)
+        df["label"] = 1.0
+    df = df.dropna(subset=base_cols)
+    mask = df["label"].astype("float64").fillna(1.0) >= 0.5
+    df = df.loc[mask]
     if df.empty:
         raise RuntimeError(f"No valid coordinates found in {parquet_path}")
     return df["latitude"].to_numpy(), df["longitude"].to_numpy()
@@ -210,7 +227,8 @@ def coords_to_feature_matrix(
     lats: np.ndarray,
     lons: np.ndarray,
     rasters: list[RasterVariable],
-) -> np.ndarray:
+    return_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     if lats.size == 0:
         raise RuntimeError("No coordinates provided for feature extraction.")
     feature_columns: list[np.ndarray] = []
@@ -222,6 +240,8 @@ def coords_to_feature_matrix(
     filtered = matrix[valid_mask]
     if filtered.size == 0:
         raise RuntimeError("All samples were filtered out as invalid.")
+    if return_mask:
+        return filtered, valid_mask
     return filtered
 
 
@@ -234,6 +254,14 @@ def build_training_arrays(
 ) -> tuple[np.ndarray, np.ndarray]:
     pos_matrix = coords_to_feature_matrix(positive_lats, positive_lons, rasters)
     neg_matrix = coords_to_feature_matrix(negative_lats, negative_lons, rasters)
+    if pos_matrix.size == 0:
+        raise RuntimeError("All positive samples were filtered out while building features.")
+    target_negatives = max(1, int(len(pos_matrix) * NEGATIVES_PER_POSITIVE))
+    if len(neg_matrix) == 0:
+        raise RuntimeError("All negative samples were filtered out while building features.")
+    if len(neg_matrix) < target_negatives:
+        target_negatives = len(neg_matrix)
+    neg_matrix = neg_matrix[:target_negatives]
     y_pos = np.ones(len(pos_matrix), dtype="float64")
     y_neg = np.zeros(len(neg_matrix), dtype="float64")
     x = np.vstack([pos_matrix, neg_matrix])
@@ -455,15 +483,9 @@ def save_model_artifacts(
 def main() -> None:
     rng = np.random.default_rng(SEED)
     species_catalog = load_species_catalog()
-    if SPECIES_ID_FILTER:
-        missing_species = [sid for sid in SPECIES_ID_FILTER if sid not in species_catalog]
-        if missing_species:
-            raise SystemExit(f"Species missing from catalog: {', '.join(map(str, missing_species))}")
-        target_species_ids = SPECIES_ID_FILTER
-    else:
-        target_species_ids = sorted(species_catalog.keys())
+    target_species_ids = sorted(species_catalog.keys())
     if not target_species_ids:
-        raise SystemExit("No species selected for training.")
+        raise SystemExit("No species available in the catalog to train.")
     gis_catalog = load_gis_catalog()
     if VARIABLE_ID_FILTER:
         missing_vars = [var for var in VARIABLE_ID_FILTER if var not in gis_catalog]
@@ -509,11 +531,19 @@ def main() -> None:
             species_entry = species_catalog[species_id]
             species_name = species_entry.get("scientific_name", str(species_id))
             species_slug = species_entry.get("slug") or species_name.lower().replace(" ", "_")
+            if model_artifact_exists(species_id):
+                print(
+                    f"[SKIP] Model artifacts already exist for {species_name} "
+                    f"(taxon_id={species_id})."
+                )
+                continue
             parquet_path = SPECIES_ROOT / species_entry["parquet_file"]
             print(
                 f"\n=== Training {species_name} (taxon_id={species_id}) "
                 f"using {len(variable_ids)} variables ==="
             )
+            cv_seed = int(rng.integers(0, 2**32 - 1))
+            cv_rng = np.random.default_rng(cv_seed)
             try:
                 pos_lats, pos_lons = load_presence_points(parquet_path)
             except RuntimeError as exc:
@@ -521,11 +551,11 @@ def main() -> None:
                 continue
             neg_target = max(1, int(len(pos_lats) * NEGATIVES_PER_POSITIVE))
             reference_dataset = rasters[0].dataset
+            sampling_seed = int(rng.integers(0, 2**32 - 1))
+            sampling_rng = np.random.default_rng(sampling_seed)
             try:
-                species_seed = int(rng.integers(0, 2**32 - 1))
-                species_rng = np.random.default_rng(species_seed)
                 neg_lats, neg_lons = sample_background_coords(
-                    reference_dataset, neg_target, species_rng, MAX_BACKGROUND_ATTEMPTS
+                    reference_dataset, neg_target, sampling_rng, MAX_BACKGROUND_ATTEMPTS
                 )
                 features, labels = build_training_arrays(
                     pos_lats, pos_lons, neg_lats, neg_lons, rasters
@@ -543,7 +573,7 @@ def main() -> None:
                 features,
                 labels,
                 folds=FOLDS,
-                rng=species_rng,
+                rng=cv_rng,
                 categorical_mask=categorical_mask,
                 categorical_features=categorical_features,
             )

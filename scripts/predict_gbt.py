@@ -21,7 +21,6 @@ GIS_CATALOG_PATH = REPO_ROOT / "gis_catalog.json"
 OUTPUT_DIR = PROCESSED_DIR / "predictions"
 
 # Tunable knobs
-TARGET_SPECIES_IDS = [148405]
 TEMPLATE_VARIABLE_ID = "annual_precip"
 PLOT_DOWNSAMPLE = 4  # use every Nth pixel when plotting to keep memory reasonable
 
@@ -76,6 +75,17 @@ def get_slug(entry: dict, fallback_id: int) -> str:
     if scientific:
         return scientific.lower().replace(" ", "_")
     return f"species_{fallback_id}"
+
+
+def prediction_output_paths(species_id: int, slug: str) -> tuple[Path, Path]:
+    base = f"{slug}_{species_id}_probability"
+    probability_raster = OUTPUT_DIR / f"{base}.tif"
+    plot_path = OUTPUT_DIR / f"{base}.png"
+    return probability_raster, plot_path
+
+
+def prediction_outputs_exist(probability_path: Path, plot_path: Path) -> bool:
+    return probability_path.exists() and plot_path.exists()
 
 
 def load_direction_bins(definition_path: str | None) -> list[DirectionBin]:
@@ -307,23 +317,25 @@ def plot_prediction(prob_path: Path, plot_path: Path, label: str) -> Path:
 
 def main() -> None:
     species_catalog = load_species_catalog()
-    if not TARGET_SPECIES_IDS:
-        raise SystemExit("No species IDs specified in TARGET_SPECIES_IDS.")
-    for species_id in TARGET_SPECIES_IDS:
-        entry = species_catalog.get(species_id)
-        if not entry:
-            print(f"[SKIP] Species {species_id} not found in catalog.")
-            continue
+    if not species_catalog:
+        raise SystemExit("Species catalog is empty; nothing to predict.")
+    for species_id in sorted(species_catalog.keys()):
+        entry = species_catalog[species_id]
         slug = get_slug(entry, species_id)
         species_label = entry.get("scientific_name", slug)
+        prediction_tiff, plot_path_file = prediction_output_paths(species_id, slug)
+        if prediction_outputs_exist(prediction_tiff, plot_path_file):
+            print(
+                f"[SKIP] Prediction artifacts already exist for {species_label} "
+                f"({species_id})."
+            )
+            continue
         try:
             model_path = resolve_model_path(species_id, slug)
         except FileNotFoundError as exc:
             print(f"[SKIP] {exc}")
             continue
         model_payload = load_model(model_path)
-        prediction_tiff = OUTPUT_DIR / f"{slug}_{species_id}_probability.tif"
-        plot_path_file = OUTPUT_DIR / f"{slug}_{species_id}_probability.png"
         prob_path = predict_surface(model_payload, prediction_tiff)
         plot_path = plot_prediction(prob_path, plot_path_file, species_label)
         rel_prob = prob_path.relative_to(REPO_ROOT)
