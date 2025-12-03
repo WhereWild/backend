@@ -81,7 +81,6 @@ logging.info("SPECIES_DIR = %s", SPECIES_DIR)
 logging.info("catalog_path = %s", CATALOG_PATH)
 logging.info("loaded %d species; sample common_names: %s", len(CATALOG), [s.get("common_name") for s in CATALOG[:8]])
 
-app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 if (SPECIES_DIR / "images").exists():
