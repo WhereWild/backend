@@ -1,11 +1,11 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+import json
+import logging
+import os
 from pathlib import Path
-import json, os
 
-import logging, os, json
-from pathlib import Path
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from wherewild.stats_repository import (
     SpeciesStatsNotFoundError,
@@ -74,7 +74,35 @@ CATALOG = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
 if isinstance(CATALOG, dict):
     CATALOG = [CATALOG]
 
-BY_SLUG = {s.get("common_name"): s for s in CATALOG if isinstance(s, dict) and s.get("common_name")}
+def normalize_taxon_id(value: int | str | None) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.isdigit():
+            return int(candidate)
+    return None
+
+def build_taxon_index(entries: list[dict]) -> dict[int, dict]:
+    index: dict[int, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        taxon_id = normalize_taxon_id(entry.get("taxon_id"))
+        if taxon_id is None:
+            continue
+        if taxon_id in index:
+            first = index[taxon_id].get("scientific_name") or index[taxon_id].get("common_name") or "unknown"
+            duplicate = entry.get("scientific_name") or entry.get("common_name") or "unknown"
+            raise ValueError(
+                f"Duplicate taxon_id {taxon_id} detected between '{first}' and '{duplicate}'."
+            )
+        index[taxon_id] = entry
+    return index
+
+TAXON_ID_INDEX = build_taxon_index(CATALOG)
 
 logging.info("Running file: %s", Path(__file__).resolve())
 logging.info("SPECIES_DIR = %s", SPECIES_DIR)
@@ -87,9 +115,18 @@ if (SPECIES_DIR / "images").exists():
     app.mount("/static/species_images", StaticFiles(directory=str(SPECIES_DIR / "images")), name="species_images")
 
 def image_url(request: Request, fname: str):
+    if not fname: 
+        return None
     base = str(request.base_url).rstrip("/")
     filename = fname.replace("images/", "")
-    return f"{base}/static/species_images/{filename}" if fname else None
+    return f"{base}/static/species_images/{filename}"
+
+def serialize_species_brief(species: dict, request: Request) -> dict:
+    """Return the subset of species fields used by the list endpoint."""
+    fields = ("taxon_id", "slug", "common_name", "scientific_name")
+    payload = {field: species.get(field) for field in fields}
+    payload["image_url"] = image_url(request, species.get("image_file"))
+    return payload
 
 @app.get("/api/species")
 def list_species(request: Request, q: str | None = None, limit: int | None = None):
@@ -97,16 +134,22 @@ def list_species(request: Request, q: str | None = None, limit: int | None = Non
     if q:
         ql = q.lower()
         items = [i for i in items if ql in (i.get("common_name","").lower() + i.get("scientific_name","").lower() + i.get("slug",""))]
-    if limit: items = items[:limit]
-    return [{**{"image_url": image_url(request, it.get("image_file"))}, **{k: it[k] for k in ("taxon_id","slug","common_name","scientific_name")}} for it in items]
+    if limit:
+        items = items[:limit]
+    response: list[dict] = []
+    for species in items:
+        response.append(serialize_species_brief(species, request))
+    return response
 
-@app.get("/api/species/{slug}")
-def get_species(slug: str, request: Request):
-    it = BY_SLUG.get(slug)
-    if not it: raise HTTPException(404)
+@app.get("/api/species/{taxon_id}")
+def get_species(taxon_id: int, request: Request):
+    it = TAXON_ID_INDEX.get(taxon_id)
+    if not it:
+        raise HTTPException(status_code=404, detail=f"Species with taxon_id {taxon_id} not found")
     out = dict(it)
     out["image_url"] = image_url(request, it.get("image_file"))
     return out
+
 @app.get("/_debug/species_info")
 def debug_species_info():
     return {
