@@ -26,6 +26,7 @@ PLOT_DOWNSAMPLE = 4  # use every Nth pixel when plotting to keep memory reasonab
 RECALCULATE_TIFF = False  # toggle to force raster recomputation when needed
 PLOT_MAX_NORTHING = 3_200_000  # crop anything north of roughly Maine/Canada boundary
 PLOT_MIN_SOUTHING = None  # set to a value (meters) to crop south as well
+IGNORE_VARIABLE_IDS = {"landcover"}  # provide mean value everywhere to neutralize bias
 
 
 @dataclass(frozen=True)
@@ -244,35 +245,46 @@ def predict_surface(model_payload: dict, output_path: Path) -> Path:
                 window_bounds = rasterio.windows.bounds(window, template.transform)
                 for raster_spec in rasters:
                     dataset = raster_spec.dataset
-                    is_template = dataset is template
-                    if is_template:
-                        data = dataset.read(1, window=window).astype("float64")
-                        valid = np.isfinite(data)
-                        if dataset.nodata is not None:
-                            valid &= data != dataset.nodata
-                        if template_mask is None:
-                            template_mask = valid.copy()
+                    ignore_variable = raster_spec.id in IGNORE_VARIABLE_IDS
+                    if ignore_variable:
+                        fill_value = mean[var_index[raster_spec.id]]
+                        data = np.full((window.height, window.width), fill_value, dtype="float64")
+                        valid = np.ones_like(data, dtype=bool)
                     else:
-                        dataset_window = from_bounds(
-                            *window_bounds,
-                            transform=dataset.transform,
-                        )
-                        resampling = Resampling.nearest if raster_spec.id in categorical_variables else Resampling.bilinear
-                        data = dataset.read(
-                            1,
-                            window=dataset_window,
-                            out_shape=(window.height, window.width),
-                            resampling=resampling,
-                            boundless=True,
-                            fill_value=dataset.nodata if dataset.nodata is not None else np.nan,
-                        ).astype("float64")
-                        valid = np.isfinite(data)
-                        if dataset.nodata is not None:
-                            valid &= data != dataset.nodata
+                        is_template = dataset is template
+                        if is_template:
+                            data = dataset.read(1, window=window).astype("float64")
+                            valid = np.isfinite(data)
+                            if dataset.nodata is not None:
+                                valid &= data != dataset.nodata
+                            if template_mask is None:
+                                template_mask = valid.copy()
+                        else:
+                            dataset_window = from_bounds(
+                                *window_bounds,
+                                transform=dataset.transform,
+                            )
+                            resampling = (
+                                Resampling.nearest
+                                if raster_spec.id in categorical_variables
+                                else Resampling.bilinear
+                            )
+                            data = dataset.read(
+                                1,
+                                window=dataset_window,
+                                out_shape=(window.height, window.width),
+                                resampling=resampling,
+                                boundless=True,
+                                fill_value=dataset.nodata if dataset.nodata is not None else np.nan,
+                            ).astype("float64")
+                            valid = np.isfinite(data)
+                            if dataset.nodata is not None:
+                                valid &= data != dataset.nodata
                     if raster_spec.id in categorical_variables and raster_spec.value_type == "circular":
                         data, valid = transform_raster_values(data, valid, raster_spec)
-                    fill_value = mean[var_index[raster_spec.id]]
-                    data = np.where(valid, data, fill_value)
+                    if not ignore_variable:
+                        fill_value = mean[var_index[raster_spec.id]]
+                        data = np.where(valid, data, fill_value)
                     stacked.append(data)
                 if not stacked or template_mask is None:
                     continue
