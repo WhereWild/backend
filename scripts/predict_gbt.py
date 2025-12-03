@@ -23,6 +23,9 @@ OUTPUT_DIR = PROCESSED_DIR / "predictions"
 # Tunable knobs
 TEMPLATE_VARIABLE_ID = "annual_precip"
 PLOT_DOWNSAMPLE = 4  # use every Nth pixel when plotting to keep memory reasonable
+RECALCULATE_TIFF = False  # toggle to force raster recomputation when needed
+PLOT_MAX_NORTHING = 3_200_000  # crop anything north of roughly Maine/Canada boundary
+PLOT_MIN_SOUTHING = None  # set to a value (meters) to crop south as well
 
 
 @dataclass(frozen=True)
@@ -289,6 +292,7 @@ def predict_surface(model_payload: dict, output_path: Path) -> Path:
 
 
 def plot_prediction(prob_path: Path, plot_path: Path, label: str) -> Path:
+    _ = label  # label kept for future annotations if needed
     with rasterio.open(prob_path) as src:
         data = src.read(
             1,
@@ -298,19 +302,56 @@ def plot_prediction(prob_path: Path, plot_path: Path, label: str) -> Path:
             ),
             resampling=rasterio.enums.Resampling.bilinear,
         )
+        data = data.astype("float32")
         data[data == src.nodata] = np.nan
         bounds = src.bounds
-    fig, ax = plt.subplots(figsize=(10, 6))
-    extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
+        pixel_height = (bounds.top - bounds.bottom) / data.shape[0]
+    if PLOT_MAX_NORTHING is not None or PLOT_MIN_SOUTHING is not None:
+        # Remove anything outside the configured vertical extent.
+        row_centers = np.linspace(
+            bounds.top - pixel_height / 2,
+            bounds.bottom + pixel_height / 2,
+            data.shape[0],
+        )
+        mask = np.ones_like(row_centers, dtype=bool)
+        if PLOT_MAX_NORTHING is not None:
+            mask &= row_centers <= PLOT_MAX_NORTHING
+        if PLOT_MIN_SOUTHING is not None:
+            mask &= row_centers >= PLOT_MIN_SOUTHING
+        data[~mask, :] = np.nan
+    valid_mask = np.isfinite(data)
+    row_mask = np.any(valid_mask, axis=1)
+    if not np.any(row_mask):
+        return plot_path
+    top_idx = row_mask.argmax()
+    bottom_idx = len(row_mask) - row_mask[::-1].argmax() - 1
+    data = data[top_idx : bottom_idx + 1, :]
+    valid_mask = valid_mask[top_idx : bottom_idx + 1, :]
+    alpha = np.where(valid_mask, 1.0, 0.0)
+    display = np.where(valid_mask, data, 0.0)
+    top_bound = bounds.top - top_idx * pixel_height
+    bottom_bound = bounds.top - (bottom_idx + 1) * pixel_height
+    extent = [bounds.left, bounds.right, bottom_bound, top_bound]
+    width = extent[1] - extent[0]
+    height = extent[3] - extent[2]
+    aspect = width / height if height else 1
+    fig_width = 12
+    fig_height = max(4, fig_width / max(aspect, 1e-6))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.set_aspect("equal")
     cmap = plt.cm.viridis
-    img = ax.imshow(data, origin="upper", extent=extent, cmap=cmap, vmin=0, vmax=1)
-    ax.set_title(f"Predicted presence probability for {label}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    cbar = fig.colorbar(img, ax=ax, fraction=0.036, pad=0.04)
-    cbar.set_label("Probability")
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=200)
+    ax.imshow(
+        display,
+        origin="upper",
+        extent=extent,
+        cmap=cmap,
+        vmin=0,
+        vmax=1,
+        alpha=alpha,
+    )
+    ax.set_axis_off()
+    fig.subplots_adjust(0, 0, 1, 1)
+    fig.savefig(plot_path, dpi=200, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
     return plot_path
 
@@ -324,7 +365,9 @@ def main() -> None:
         slug = get_slug(entry, species_id)
         species_label = entry.get("scientific_name", slug)
         prediction_tiff, plot_path_file = prediction_output_paths(species_id, slug)
-        if prediction_outputs_exist(prediction_tiff, plot_path_file):
+        raster_exists = prediction_tiff.exists()
+        plot_exists = plot_path_file.exists()
+        if raster_exists and plot_exists:
             print(
                 f"[SKIP] Prediction artifacts already exist for {species_label} "
                 f"({species_id})."
@@ -336,11 +379,16 @@ def main() -> None:
             print(f"[SKIP] {exc}")
             continue
         model_payload = load_model(model_path)
-        prob_path = predict_surface(model_payload, prediction_tiff)
-        plot_path = plot_prediction(prob_path, plot_path_file, species_label)
+        if not raster_exists or RECALCULATE_TIFF:
+            prob_path = predict_surface(model_payload, prediction_tiff)
+        else:
+            prob_path = prediction_tiff
+        plot_prediction(prob_path, plot_path_file, species_label)
         rel_prob = prob_path.relative_to(REPO_ROOT)
-        rel_plot = plot_path.relative_to(REPO_ROOT)
-        print(f"[DONE] {species_label} ({species_id}) -> raster: {rel_prob}, plot: {rel_plot}")
+        rel_plot = plot_path_file.relative_to(REPO_ROOT)
+        print(
+            f"[DONE] {species_label} ({species_id}) -> raster: {rel_prob}, plot: {rel_plot}"
+        )
 
 
 if __name__ == "__main__":

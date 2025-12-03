@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
+from wherewild.model_repository import (
+    FeatureImportancesUnavailableError,
+    ModelArtifactNotFoundError,
+    SpeciesMetadataNotFoundError,
+    get_feature_importances,
+)
+from wherewild.prediction_repository import (
+    PredictionMapNotFoundError,
+    SpeciesNotFoundError,
+    get_prediction_map,
+)
 from wherewild.stats_repository import (
     SpeciesStatsNotFoundError,
     VariableNotFoundError,
@@ -54,6 +66,63 @@ def variable_leaderboard(variable: str) -> dict:
         raise HTTPException(
             status_code=404,
             detail=f"No leaderboard found for variable '{variable_id}'.",
+        ) from None
+
+
+@app.get(
+    "/species/{species_id}/prediction-map",
+    summary="Retrieve a pre-rendered prediction map for a species",
+)
+def species_prediction_map(species_id: int, format: str = "png") -> StreamingResponse:
+    fmt = format.lower()
+    if fmt not in {"png", "tif"}:
+        raise HTTPException(
+            status_code=400, detail="Format must be either 'png' or 'tif'."
+        )
+    try:
+        map_path = get_prediction_map(species_id=species_id, fmt=fmt)
+    except SpeciesNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Species '{species_id}' is not available.",
+        ) from None
+    except PredictionMapNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No prediction map found for species '{species_id}' in format '{fmt}'.",
+        ) from None
+    media_type = "image/png" if fmt == "png" else "image/tiff"
+    file_handle = map_path.open("rb")
+    return StreamingResponse(
+        file_handle,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename=\"{map_path.name}\"'},
+    )
+
+
+@app.get(
+    "/species/{species_id}/feature-importances",
+    summary="Retrieve the ranked feature importances for a species model",
+)
+def species_feature_importances(
+    species_id: int, limit: int | None = Query(default=None, ge=1, le=50)
+) -> dict:
+    try:
+        return get_feature_importances(species_id=species_id, limit=limit)
+    except SpeciesMetadataNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Species '{species_id}' is not available.",
+        ) from None
+    except ModelArtifactNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No trained model found for species '{species_id}'.",
+        ) from None
+    except FeatureImportancesUnavailableError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Feature importances are unavailable for species '{species_id}'.",
         ) from None
 
 
