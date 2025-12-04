@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from bisect import bisect_right
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -12,6 +13,7 @@ from wherewild.stats_repository import (
     VariableNotFoundError,
     get_species_stats,
     get_variable_leaderboard,
+    list_variables,
 )
 
 app = FastAPI(title="WhereWild API", version="0.1.0")
@@ -29,7 +31,9 @@ def health_check() -> dict[str, str]:
 def species_environment_stats(species_id: int, variable: str) -> dict:
     variable_id = variable.strip()
     try:
-        return get_species_stats(species_id=species_id, variable_id=variable_id)
+        stats = get_species_stats(species_id=species_id, variable_id=variable_id)
+        attach_bin_samples(stats)
+        return stats
     except VariableNotFoundError:
         raise HTTPException(
             status_code=404,
@@ -60,6 +64,14 @@ def variable_leaderboard(variable: str) -> dict:
             status_code=404,
             detail=f"No leaderboard found for variable '{variable_id}'.",
         ) from None
+
+
+@app.get(
+    "/variables",
+    summary="List available GIS variables",
+)
+def list_gis_variables() -> list[dict]:
+    return list_variables()
 
 logging.basicConfig(level=logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -163,3 +175,46 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
+
+def attach_bin_samples(stats: dict, limit: int = 12) -> None:
+    histogram = stats.get("histogram") or {}
+    values_sorted = stats.get("values_sorted") or []
+    bins = histogram.get("bins") or []
+    counts = histogram.get("counts") or []
+    if not bins or not counts or not values_sorted:
+        stats.pop("values_sorted", None)
+        return
+
+    sample_lists: list[list[int]] = [[] for _ in counts]
+    max_index = len(counts) - 1
+    filled_targets = sum(1 for count in counts if count > 0)
+    filled_complete = 0
+
+    for entry in values_sorted:
+        value = entry.get("value")
+        if not isinstance(value, (int, float)):
+            continue
+        idx = bisect_right(bins, value) - 1
+        if idx < 0:
+            idx = 0
+        if idx > max_index:
+            idx = max_index
+        bucket = sample_lists[idx]
+        if len(bucket) >= min(limit, counts[idx]):
+            continue
+        obs_id = entry.get("observation_id")
+        if obs_id is None:
+            continue
+        bucket.append(obs_id)
+        if len(bucket) == min(limit, counts[idx]):
+            filled_complete += 1
+            if filled_complete >= filled_targets:
+                break
+
+    stats["bin_samples"] = [
+        {"index": idx, "observation_ids": bucket}
+        for idx, bucket in enumerate(sample_lists)
+        if bucket
+    ]
+    stats.pop("values_sorted", None)

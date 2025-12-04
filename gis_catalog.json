@@ -1,0 +1,187 @@
+[
+  {
+    "id": "annual_mean_temp",
+    "name": "Annual Mean Temperature",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO1 annual mean temperature",
+    "path": "/workspace/processed/bioclim/annual_mean_temp.tif"
+  },
+  {
+    "id": "annual_precip",
+    "name": "Annual Precipitation",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO12",
+    "path": "/workspace/processed/bioclim/annual_precip.tif"
+  },
+  {
+    "id": "aspect",
+    "name": "Aspect",
+    "units": "degrees",
+    "value_type": "circular",
+    "description": "Aspect azimuth derived from DEM",
+    "path": "/workspace/processed/dem/aspect.tif"
+  },
+  {
+    "id": "elevation",
+    "name": "Elevation",
+    "units": "m",
+    "value_type": "continuous",
+    "description": "Digital elevation model",
+    "path": "/workspace/processed/dem/elevation.tif"
+  },
+  {
+    "id": "isothermality",
+    "name": "Isothermality",
+    "units": "ratio",
+    "value_type": "continuous",
+    "description": "WorldClim BIO3 (mean diurnal range / temperature annual range)",
+    "path": "/workspace/processed/bioclim/isothermality.tif"
+  },
+  {
+    "id": "landcover",
+    "name": "Landcover",
+    "units": "class",
+    "value_type": "categorical",
+    "description": "Categorical landcover classification",
+    "path": "/workspace/processed/landcover/landcover.tif",
+    "classes_file": "processed/landcover/landcover_classes.json"
+  },
+  {
+    "id": "max_temp_warmest_month",
+    "name": "Max Temperature of Warmest Month",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO5",
+    "path": "/workspace/processed/bioclim/max_temp_warmest_month.tif"
+  },
+  {
+    "id": "mean_diurnal_range",
+    "name": "Mean Diurnal Range",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO2 mean of monthly temperature range",
+    "path": "/workspace/processed/bioclim/mean_diurnal_range.tif"
+  },
+  {
+    "id": "mean_temp_coldest_quarter",
+    "name": "Mean Temperature of Coldest Quarter",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO11",
+    "path": "/workspace/processed/bioclim/mean_temp_coldest_quarter.tif"
+  },
+  {
+    "id": "mean_temp_driest_quarter",
+    "name": "Mean Temperature of Driest Quarter",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO9",
+    "path": "/workspace/processed/bioclim/mean_temp_driest_quarter.tif"
+  },
+  {
+    "id": "mean_temp_warmest_quarter",
+    "name": "Mean Temperature of Warmest Quarter",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO10",
+    "path": "/workspace/processed/bioclim/mean_temp_warmest_quarter.tif"
+  },
+  {
+    "id": "mean_temp_wettest_quarter",
+    "name": "Mean Temperature of Wettest Quarter",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO8",
+    "path": "/workspace/processed/bioclim/mean_temp_wettest_quarter.tif"
+  },
+  {
+    "id": "min_temp_coldest_month",
+    "name": "Min Temperature of Coldest Month",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO6",
+    "path": "/workspace/processed/bioclim/min_temp_coldest_month.tif"
+  },
+  {
+    "id": "precip_coldest_quarter",
+    "name": "Precipitation of Coldest Quarter",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO19",
+    "path": "/workspace/processed/bioclim/precip_coldest_quarter.tif"
+  },
+  {
+    "id": "precip_driest_month",
+    "name": "Precipitation of Driest Month",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO14",
+    "path": "/workspace/processed/bioclim/precip_driest_month.tif"
+  },
+  {
+    "id": "precip_driest_quarter",
+    "name": "Precipitation of Driest Quarter",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO17",
+    "path": "/workspace/processed/bioclim/precip_driest_quarter.tif"
+  },
+  {
+    "id": "precip_seasonality",
+    "name": "Precipitation Seasonality",
+    "units": "cv",
+    "value_type": "continuous",
+    "description": "WorldClim BIO15 (coefficient of variation)",
+    "path": "/workspace/processed/bioclim/precip_seasonality.tif"
+  },
+  {
+    "id": "precip_warmest_quarter",
+    "name": "Precipitation of Warmest Quarter",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO18",
+    "path": "/workspace/processed/bioclim/precip_warmest_quarter.tif"
+  },
+  {
+    "id": "precip_wettest_month",
+    "name": "Precipitation of Wettest Month",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO13",
+    "path": "/workspace/processed/bioclim/precip_wettest_month.tif"
+  },
+  {
+    "id": "precip_wettest_quarter",
+    "name": "Precipitation of Wettest Quarter",
+    "units": "mm",
+    "value_type": "continuous",
+    "description": "WorldClim BIO16",
+    "path": "/workspace/processed/bioclim/precip_wettest_quarter.tif"
+  },
+  {
+    "id": "slope",
+    "name": "Slope",
+    "units": "degrees",
+    "value_type": "continuous",
+    "description": "Surface slope derived from DEM",
+    "path": "/workspace/processed/dem/slope.tif"
+  },
+  {
+    "id": "temp_annual_range",
+    "name": "Temperature Annual Range",
+    "units": "degC",
+    "value_type": "continuous",
+    "description": "WorldClim BIO7 (BIO5-BIO6)",
+    "path": "/workspace/processed/bioclim/temp_annual_range.tif"
+  },
+  {
+    "id": "temp_seasonality",
+    "name": "Temperature Seasonality",
+    "units": "std_x100",
+    "value_type": "continuous",
+    "description": "WorldClim BIO4 temperature standard deviation \u00d7100",
+    "path": "/workspace/processed/bioclim/temp_seasonality.tif"
+  }
+]
