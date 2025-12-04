@@ -139,7 +139,12 @@ logging.info("loaded %d species; sample common_names: %s", len(CATALOG), [s.get(
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 if (SPECIES_DIR / "images").exists():
-    app.mount("/static/species_images", StaticFiles(directory=str(SPECIES_DIR / "images")), name="species_images")
+    app.mount("/static/species_images",
+              StaticFiles(directory=str(SPECIES_DIR / "images")), name="species_images")
+if (SPECIES_DIR / "probabilities").exists():
+    app.mount("/static/species_probabilities",
+              StaticFiles(directory=str(SPECIES_DIR / "probabilities")), name="species_probabilities")
+
 
 def image_url(request: Request, fname: str):
     if not fname: 
@@ -147,6 +152,15 @@ def image_url(request: Request, fname: str):
     base = str(request.base_url).rstrip("/")
     filename = fname.replace("images/", "")
     return f"{base}/static/species_images/{filename}"
+
+def heatmap_url(request: Request, fname: str):
+    """Return public URL for a 'probabilities/...' file or None."""
+    if not fname:
+        return None
+    base = str(request.base_url).rstrip("/")
+    filename = fname.replace("probabilities/", "")
+    return f"{base}/static/species_probabilities/{filename}"
+
 
 def serialize_species_brief(species: dict, request: Request) -> dict:
     """Return the subset of species fields used by the list endpoint."""
@@ -175,6 +189,7 @@ def get_species(taxon_id: int, request: Request):
         raise HTTPException(status_code=404, detail=f"Species with taxon_id {taxon_id} not found")
     out = dict(it)
     out["image_url"] = image_url(request, it.get("image_file"))
+    out["heatmap_image_url"] = heatmap_url(request, it.get("heatmap_image_file"))
     return out
 
 @app.get("/_debug/species_info")
