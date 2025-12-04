@@ -141,9 +141,26 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], a
 if (SPECIES_DIR / "images").exists():
     app.mount("/static/species_images",
               StaticFiles(directory=str(SPECIES_DIR / "images")), name="species_images")
-if (SPECIES_DIR / "probabilities").exists():
-    app.mount("/static/species_probabilities",
-              StaticFiles(directory=str(SPECIES_DIR / "probabilities")), name="species_probabilities")
+probabilities_dir = SPECIES_DIR / "probabilities"
+legacy_predictions_dir = SPECIES_DIR / "predictions"
+heatmap_static_dir = None
+if probabilities_dir.exists():
+    heatmap_static_dir = probabilities_dir
+elif legacy_predictions_dir.exists():
+    heatmap_static_dir = legacy_predictions_dir
+
+if heatmap_static_dir:
+    app.mount(
+        "/static/species_probabilities",
+        StaticFiles(directory=str(heatmap_static_dir)),
+        name="species_probabilities",
+    )
+else:
+    logging.warning(
+        "No probabilities or predictions directory found under %s; "
+        "species heatmap images will 404.",
+        SPECIES_DIR,
+    )
 
 
 def image_url(request: Request, fname: str):
@@ -158,7 +175,11 @@ def heatmap_url(request: Request, fname: str):
     if not fname:
         return None
     base = str(request.base_url).rstrip("/")
-    filename = fname.replace("probabilities/", "")
+    filename = fname
+    for prefix in ("probabilities/", "predictions/"):
+        if filename.startswith(prefix):
+            filename = filename[len(prefix):]
+            break
     return f"{base}/static/species_probabilities/{filename}"
 
 
