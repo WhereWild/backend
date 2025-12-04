@@ -28,6 +28,7 @@ GIS_CATALOG_PATH = REPO_ROOT / "gis_catalog.json"
 WGS84 = CRS.from_epsg(4326)
 MAX_POSITIONAL_ACCURACY_METERS: int | None = 500
 EXCLUDE_OBSCURED_OBSERVATIONS = True
+ALLOWED_QUALITY_GRADES: set[str] | None = {"research"}
 CATEGORY_SAMPLE_LIMIT = 12
 
 
@@ -168,7 +169,7 @@ def load_gis_catalog() -> list[GISVariable]:
 
 def load_observations(parquet_path: Path) -> pd.DataFrame:
     base_columns = ["id", "latitude", "longitude"]
-    optional_columns = ["coordinates_obscured", "positional_accuracy"]
+    optional_columns = ["coordinates_obscured", "positional_accuracy", "quality_grade"]
     available_optional: list[str] = []
     if pq is not None:
         try:
@@ -202,6 +203,13 @@ def load_observations(parquet_path: Path) -> pd.DataFrame:
     ):
         accuracy = df["positional_accuracy"]
         mask = accuracy.isna() | (accuracy <= MAX_POSITIONAL_ACCURACY_METERS)
+        df = df.loc[mask]
+    if (
+        ALLOWED_QUALITY_GRADES is not None
+        and "quality_grade" in df.columns
+        and ALLOWED_QUALITY_GRADES
+    ):
+        mask = df["quality_grade"].isin(ALLOWED_QUALITY_GRADES)
         df = df.loc[mask]
     if df.empty:
         return df.astype({"id": "int64"})
@@ -670,7 +678,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hist-bins",
         type=int,
-        default=30,
+        default=12,
         help="Number of bins to use when building histograms.",
     )
     parser.add_argument(
