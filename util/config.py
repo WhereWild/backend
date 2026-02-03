@@ -65,8 +65,8 @@ class GlobalConfig:
     # Base root
     project_root: Path = field(default_factory=_project_root)
 
-    # Pipeline tuning
-    root_taxon_id: str = "1"
+    # Pipeline tuning (default to Pediocactus simpsonii subset for debugging)
+    root_taxon_id: str = "2429791"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
@@ -129,6 +129,85 @@ class GlobalConfig:
             0: "level0Gid",
             1: "level1Gid",
             2: "level2Gid",
+        }
+    )
+
+    # Temporal weather enrichment
+    temporal_cache_dirname: str = "temporal_cache"
+    temporal_models_by_variable: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: {
+            "cloud_cover": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "dew_point_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "precipitation": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "snow_depth": ("copernicus_era5_land",),
+            "snowfall_water_equivalent": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "soil_moisture_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_moisture_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "wind_gusts_10m": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+        }
+    )
+    temporal_model_preference: tuple[str, ...] = (
+        "copernicus_era5_land",
+        "copernicus_era5",
+        "copernicus_era5_ensemble",
+    )
+    temporal_window_hours_default: tuple[int, ...] = (1, 8, 24, 72)
+    temporal_window_hours_by_variable: dict[str, tuple[int, ...]] = field(
+        default_factory=lambda: {
+            "cloud_cover": (1, 8, 24, 72),
+            "dew_point_2m": (1, 8, 24, 72),
+            "precipitation": (1, 8, 24, 72),
+            "snowfall_water_equivalent": (1, 8, 24, 72),
+            "soil_moisture_0_to_7cm": (1, 8, 24, 72),
+            "soil_moisture_7_to_28cm": (1, 8, 24, 72),
+            "soil_temperature_0_to_7cm": (1, 8, 24, 72),
+            "soil_temperature_7_to_28cm": (1, 8, 24, 72),
+            "temperature_2m": (1, 8, 24, 72),
+            # Snapshots
+            "snow_depth": (1,),
+            "weather_code_simple": (1,),
+            # Leave wind gusts without aggregates for now
+            "wind_gusts_10m": (),
+        }
+    )
+    temporal_agg_by_variable: dict[str, str] = field(
+        default_factory=lambda: {
+            "precipitation": "sum",
+            "snowfall_water_equivalent": "sum",
+            # Everything else is averaged
+            "cloud_cover": "avg",
+            "dew_point_2m": "avg",
+            "snow_depth": "avg",
+            "soil_moisture_0_to_7cm": "avg",
+            "soil_moisture_7_to_28cm": "avg",
+            "soil_temperature_0_to_7cm": "avg",
+            "soil_temperature_7_to_28cm": "avg",
+            "temperature_2m": "avg",
+            "wind_gusts_10m": "avg",
+        }
+    )
+    # If set to None, overwrite all temporal columns every run.
+    temporal_overwrite_columns: tuple[str, ...] | None = None
+    inat_mapping_offline_filename: str = "inat_gbif_mapping.csv"
+    inat_mapping_api_filename: str = "inat_gbif_mapping_api.csv"
+    inat_mapping_obs_filename: str = "inat_gbif_mapping_obs.csv"
+    inat_preferred_common_name_locale: str = "en"
+    inat_preferred_common_name_batch_size: int = 200
+    inat_preferred_common_name_request_limit: int = 0
+    inat_preferred_common_name_progress_every: int = 50
+    inat_preferred_common_name_overwrite: bool = False
+    inat_preferred_common_name_rate_limit_per_second: float = 1.0
+    inat_preferred_common_name_max_requests: int = 10_000
+    common_name_language: str = "en"
+    location_scope_by_level: dict[int, str] = field(
+        default_factory=lambda: {
+            0: "gadm_level0",
+            1: "gadm_level1",
+            2: "gadm_level2",
         }
     )
 

@@ -192,6 +192,16 @@ def build_index_parquet(node_path: Path) -> None:
             mask = pc.invert(pc.is_null(layer_col))
             if pa.types.is_floating(layer_col.type):
                 mask = pc.and_(mask, pc.invert(pc.is_nan(layer_col)))
+            try:
+                obscured_col = table["obscured"]
+                mask = pc.and_(mask, pc.equal(obscured_col, "No"))
+            except KeyError:
+                pass
+            try:
+                coord_col = table["coordinateUncertaintyInMeters"]
+                mask = pc.and_(mask, pc.less_equal(coord_col, 500))
+            except KeyError:
+                pass
 
             # filter the catalogs the same way so we have indexes of equal length as the original cols
             filtered_values = pc.filter(layer_col, mask).combine_chunks()
