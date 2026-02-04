@@ -65,8 +65,8 @@ class GlobalConfig:
     # Base root
     project_root: Path = field(default_factory=_project_root)
 
-    # Pipeline tuning (default to Pediocactus simpsonii subset for debugging)
-    root_taxon_id: str = "2429791"
+    # Pipeline tuning
+    root_taxon_id: str = "2519"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
@@ -146,7 +146,6 @@ class GlobalConfig:
             "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
-            "wind_gusts_10m": ("copernicus_era5", "copernicus_era5_ensemble"),
             "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
         }
     )
@@ -155,23 +154,21 @@ class GlobalConfig:
         "copernicus_era5",
         "copernicus_era5_ensemble",
     )
-    temporal_window_hours_default: tuple[int, ...] = (1, 8, 24, 72)
+    temporal_window_hours_default: tuple[int, ...] = (1, 8, 24, 72, 168, 720, 2160)
     temporal_window_hours_by_variable: dict[str, tuple[int, ...]] = field(
         default_factory=lambda: {
-            "cloud_cover": (1, 8, 24, 72),
-            "dew_point_2m": (1, 8, 24, 72),
-            "precipitation": (1, 8, 24, 72),
-            "snowfall_water_equivalent": (1, 8, 24, 72),
-            "soil_moisture_0_to_7cm": (1, 8, 24, 72),
-            "soil_moisture_7_to_28cm": (1, 8, 24, 72),
-            "soil_temperature_0_to_7cm": (1, 8, 24, 72),
-            "soil_temperature_7_to_28cm": (1, 8, 24, 72),
-            "temperature_2m": (1, 8, 24, 72),
+            "cloud_cover": (1, 8, 24, 72, 168, 720, 2160),
+            "dew_point_2m": (1, 8, 24, 72, 168, 720, 2160),
+            "precipitation": (1, 8, 24, 72, 168, 720, 2160),
+            "snowfall_water_equivalent": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_moisture_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_moisture_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_temperature_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_temperature_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
+            "temperature_2m": (1, 8, 24, 72, 168, 720, 2160),
             # Snapshots
             "snow_depth": (1,),
             "weather_code_simple": (1,),
-            # Leave wind gusts without aggregates for now
-            "wind_gusts_10m": (),
         }
     )
     temporal_agg_by_variable: dict[str, str] = field(
@@ -187,7 +184,15 @@ class GlobalConfig:
             "soil_temperature_0_to_7cm": "avg",
             "soil_temperature_7_to_28cm": "avg",
             "temperature_2m": "avg",
-            "wind_gusts_10m": "avg",
+        }
+    )
+    # Override grid mode per model for temporal OM files.
+    # Valid modes: lat_asc_lon_pm180, lat_asc_lon_360, lat_desc_lon_pm180, lat_desc_lon_360
+    temporal_grid_mode_by_model: dict[str, str] = field(
+        default_factory=lambda: {
+            "copernicus_era5": "lat_asc_lon_pm180",
+            "copernicus_era5_land": "lat_asc_lon_pm180",
+            "copernicus_era5_ensemble": "lat_asc_lon_pm180",
         }
     )
     # If set to None, overwrite all temporal columns every run.

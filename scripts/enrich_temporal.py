@@ -605,9 +605,9 @@ def _ensure_columns(df: pd.DataFrame, cols: Iterable[str]) -> None:
             df[col] = np.nan
 
 
-def _window_steps(resolution: float) -> dict[int, int]:
+def _window_steps(resolution: float, window_hours: tuple[int, ...]) -> dict[int, int]:
     """Precompute window lengths (in steps) for each configured hour span."""
-    return {hours: int(round((hours * 3600) / resolution)) for hours in WINDOW_HOURS}
+    return {hours: int(round((hours * 3600) / resolution)) for hours in window_hours}
 
 
 def _window_stats_batch(
@@ -772,10 +772,41 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
     row_idx = np.array(data["row_idx"], dtype=int)
     taxon_path = np.array(data["taxon_path"])
 
+    if MIN_YEAR is not None:
+        cutoff = datetime(MIN_YEAR, 1, 1, tzinfo=timezone.utc).timestamp()
+        valid_mask = times >= cutoff
+        if not valid_mask.any():
+            return pa.Table.from_pydict(
+                {
+                    "taxon_path": np.array([], dtype=object),
+                    "row_idx": np.array([], dtype=np.int64),
+                    "chunk_num": np.array([], dtype=np.int32),
+                    "lat_idx": np.array([], dtype=np.int32),
+                    "lon_idx": np.array([], dtype=np.int32),
+                    "time_idx": np.array([], dtype=np.int32),
+                }
+            )
+        times = times[valid_mask]
+        lats = lats[valid_mask]
+        lons = lons[valid_mask]
+        row_idx = row_idx[valid_mask]
+        taxon_path = taxon_path[valid_mask]
+
     # Resolve grid mode by probing sample points against actual data (more reliable than meta for era5_land)
     cache_key = (model, variable)
     grid_meta = _GRID_MODE_CACHE.get(cache_key)
     if grid_meta is None:
+        override_mode = CONFIG.temporal_grid_mode_by_model.get(model)
+        allowed_modes = {
+            "lat_asc_lon_pm180",
+            "lat_asc_lon_360",
+            "lat_desc_lon_pm180",
+            "lat_desc_lon_360",
+        }
+        if override_mode not in allowed_modes:
+            raise RuntimeError(
+                f"Missing/invalid temporal_grid_mode_by_model for {model}: {override_mode}"
+            )
         # Pick a representative range (latest in time) and open the right file (chunk/year)
         sample_range = chunk_index.ranges[-1]
         if sample_range.source == "year":
@@ -786,12 +817,12 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
         try:
             ny, nx, _ = reader.shape
             step = 0.1 if (ny in (1801, 1800) and nx in (3600, 3601)) else 0.25
-            grid_mode = _resolve_grid_mode_from_samples(reader, lats, lons, step)
+            grid_mode = override_mode
+            print(f"[grid] variable={variable} model={model} mode={grid_mode} (override)")
         finally:
             reader.close()
         grid_meta = (grid_mode, ny, nx, step)
         _GRID_MODE_CACHE[cache_key] = grid_meta
-        print(f"[grid] variable={variable} model={model} mode={grid_mode}")
 
     # Compute grid indices per observation using chosen grid mode
     grid_mode, ny, nx, step = grid_meta
@@ -815,7 +846,8 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
     chunk_nums = asc_chunk_nums[chunk_lookup]
     chunk_starts = asc_starts[chunk_lookup]
     chunk_time_lens = asc_time_lens[chunk_lookup]
-    time_indices = np.rint((times - chunk_starts) / chunk_index.resolution).astype(int)
+    # Align to the start of the hour (floor), matching Open-Meteo + OM 24h window logic.
+    time_indices = np.floor((times - chunk_starts) / chunk_index.resolution).astype(int)
     time_indices = np.clip(time_indices, 0, chunk_time_lens - 1)
 
     total_rows = len(row_idx)
@@ -832,9 +864,46 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
     )
 
 
+def _apply_pre_cutoff_nans(
+    occ_table: pa.Table,
+    variable: str,
+    window_hours: tuple[int, ...],
+    agg_mode: str,
+) -> None:
+    if MIN_YEAR is None:
+        return
+    cutoff = datetime(MIN_YEAR, 1, 1, tzinfo=timezone.utc).timestamp()
+    data = occ_table.to_pydict()
+    times = np.array(data["timestamp"], dtype=float)
+    pre_mask = times < cutoff
+    if not pre_mask.any():
+        return
+    taxon_path = np.array(data["taxon_path"])[pre_mask]
+    row_idx = np.array(data["row_idx"], dtype=int)[pre_mask]
+
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    for tpath in np.unique(taxon_path):
+        mask = taxon_path == tpath
+        rows = row_idx[mask]
+        if rows.size == 0:
+            continue
+        colmap = updates.setdefault(tpath, {})
+        for hours in window_hours:
+            col = f"{variable}_{agg_mode}_{hours}h"
+            colmap.setdefault(col, []).append((rows, np.full(rows.shape, np.nan, dtype=float)))
+
+    for tpath, colmap in updates.items():
+        lock = _WRITE_LOCKS.setdefault(tpath, threading.Lock())
+        with lock:
+            parquet_path = Path(tpath)
+            table = pq.read_table(parquet_path).combine_chunks()
+            updated = _apply_updates_arrow(table, colmap)
+            _atomic_write(parquet_path, updated)
+
+
 def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, variable: str, window_hours: tuple[int, ...]) -> None:
     """Process global worklist: read each chunk once, write results back to parquets."""
-    steps = _window_steps(chunk_index.resolution)
+    steps = _window_steps(chunk_index.resolution, window_hours)
     total_rows = worklist.num_rows
     rows_done = 0
     chunks_done = 0
@@ -1343,6 +1412,7 @@ def main() -> None:
             # weather code is derived after all other variables complete
             return
         agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
+        _apply_pre_cutoff_nans(occ_table, variable, window_hours, agg_mode)
         print(f"[process] variable={variable} model={model} agg={agg_mode} rows={worklist_table.num_rows}")
         _process_worklist(chunk_index, worklist_table, model, variable, window_hours)
 

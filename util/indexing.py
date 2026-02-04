@@ -213,6 +213,13 @@ def build_index_parquet(node_path: Path) -> None:
             if len(filtered_values) == 0:
                 continue
 
+            # Normalize types across datasets to avoid concat type mismatches
+            target_type = pa.int64() if categorical_layers.get(layer_id) else pa.float64()
+            try:
+                filtered_values = pc.cast(filtered_values, target_type)
+            except pa.ArrowInvalid:
+                filtered_values = pc.cast(filtered_values, pa.float64())
+
             # append the filtered values and catalogs and origins. origin allows the index user to correctly identify which file it came from
             combined_values.append(filtered_values)
             combined_catalogs.append(filtered_catalogs)
