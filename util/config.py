@@ -146,6 +146,7 @@ class GlobalConfig:
             "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "vapor_pressure_deficit": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
         }
     )
@@ -195,6 +196,9 @@ class GlobalConfig:
             "copernicus_era5_ensemble": "lat_asc_lon_pm180",
         }
     )
+    # Cap the number of occurrence rows per worklist batch to bound memory.
+    # Set to 0 to disable batching (process all rows at once).
+    temporal_worklist_batch_rows: int = 1_500_000
     # If set to None, overwrite all temporal columns every run.
     temporal_overwrite_columns: tuple[str, ...] | None = None
     inat_mapping_offline_filename: str = "inat_gbif_mapping.csv"

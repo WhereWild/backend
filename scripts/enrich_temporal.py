@@ -759,6 +759,15 @@ def _build_occ_index(index_path: Path) -> int:
     return total_rows
 
 
+def _iter_occ_index_batches(index_path: Path, batch_rows: int) -> Iterable[pa.Table]:
+    if batch_rows <= 0:
+        yield pq.read_table(index_path).combine_chunks()
+        return
+    parquet = pq.ParquetFile(index_path)
+    for batch in parquet.iter_batches(batch_size=batch_rows):
+        yield pa.Table.from_batches([batch]).combine_chunks()
+
+
 def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, model: str, variable: str) -> pa.Table:
     """Project base occurrence index onto a model/variable chunk grid (in-memory)."""
     # Use ascending-by-start ordering for searchsorted
@@ -1022,55 +1031,155 @@ def _process_worklist(
         if prev_reader is not None:
             prev_reader.close()
 
-        # Merge local updates into shared dict
+
+def _process_vpd_worklist(
+    chunk_index: ChunkIndex,
+    worklist: pa.Table,
+    model: str,
+    window_hours: tuple[int, ...],
+) -> None:
+    """Compute VPD per hour from temperature_2m and dew_point_2m, then aggregate."""
+    steps = _window_steps(chunk_index.resolution, window_hours)
+    ranges_by_start = sorted(chunk_index.ranges, key=lambda r: r.start)
+    prev_by_chunk: dict[int, ChunkRange | None] = {}
+    for idx, entry in enumerate(ranges_by_start):
+        prev_by_chunk[entry.chunk_num] = ranges_by_start[idx - 1] if idx > 0 else None
+
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    updates_lock = threading.Lock()
+
+    def _open_chunk_reader(entry: ChunkRange, variable: str) -> OmFileReader:
+        if entry.source == "year":
+            data_uri = f"s3://openmeteo/data/{model}/{variable}/year_{entry.chunk_num}.om"
+            if entry.chunk_num >= YEAR_PREFETCH_CUTOFF:
+                local_chunk = _prefetch_chunk(data_uri)
+                return _open_reader(local_chunk.as_posix(), block_size=YEAR_REMOTE_BLOCK_SIZE)
+            return _open_reader(data_uri, block_size=YEAR_REMOTE_BLOCK_SIZE)
+        data_uri = f"s3://openmeteo/data/{model}/{variable}/chunk_{entry.chunk_num}.om"
+        local_chunk = _prefetch_chunk(data_uri)
+        return _open_reader(local_chunk.as_posix())
+
+    def _process_chunk(chunk_entry: ChunkRange, chunk_table: pa.Table) -> None:
+        data = chunk_table.to_pydict()
+        lat = np.array(data["lat_idx"], dtype=int)
+        lon = np.array(data["lon_idx"], dtype=int)
+        time_idx = np.array(data["time_idx"], dtype=int)
+        taxon_path = np.array(data["taxon_path"])
+        row_idx = np.array(data["row_idx"], dtype=int)
+
+        order = np.lexsort((lon, lat))
+        lat = lat[order]; lon = lon[order]; time_idx = time_idx[order]
+        taxon_path = taxon_path[order]; row_idx = row_idx[order]
+
+        change = np.empty_like(lat, dtype=bool)
+        change[0] = True
+        change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+        group_starts = np.flatnonzero(change)
+        group_ends = np.append(group_starts[1:], len(lat))
+
+        temp_reader = _open_chunk_reader(chunk_entry, "temperature_2m")
+        dew_reader = _open_chunk_reader(chunk_entry, "dew_point_2m")
+        ny, nx, _ = temp_reader.shape
+
+        max_window_steps = max(steps.values()) if steps else 0
+        prev_entry = prev_by_chunk.get(chunk_entry.chunk_num)
+        prev_temp_reader: OmFileReader | None = None
+        prev_dew_reader: OmFileReader | None = None
+
+        local_updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+
+        for s, e in zip(group_starts, group_ends):
+            li = int(lat[s]); lo = int(lon[s])
+            if li >= ny or lo >= nx:
+                continue
+            try:
+                temp_series = np.array(temp_reader[li, lo, :], dtype=float)
+            except Exception:
+                temp_series = np.array([temp_reader[li, lo, i] for i in range(temp_reader.shape[2])], dtype=float)
+            try:
+                dew_series = np.array(dew_reader[li, lo, :], dtype=float)
+            except Exception:
+                dew_series = np.array([dew_reader[li, lo, i] for i in range(dew_reader.shape[2])], dtype=float)
+
+            if temp_series.size == 0 or dew_series.size == 0:
+                continue
+
+            time_slice = time_idx[s:e]
+            min_idx = int(time_slice.min())
+            max_idx = int(time_slice.max())
+            prev_len = 0
+            if prev_entry is not None and max_window_steps > 1 and min_idx < (max_window_steps - 1):
+                need = (max_window_steps - 1) - min_idx
+                if need > 0:
+                    if prev_temp_reader is None:
+                        prev_temp_reader = _open_chunk_reader(prev_entry, "temperature_2m")
+                    if prev_dew_reader is None:
+                        prev_dew_reader = _open_chunk_reader(prev_entry, "dew_point_2m")
+                    try:
+                        prev_temp = np.array(prev_temp_reader[li, lo, :], dtype=float)
+                        prev_dew = np.array(prev_dew_reader[li, lo, :], dtype=float)
+                        prev_len = min(int(need), int(prev_temp.size), int(prev_dew.size))
+                        if prev_len > 0:
+                            temp_series = np.concatenate([prev_temp[-prev_len:], temp_series])
+                            dew_series = np.concatenate([prev_dew[-prev_len:], dew_series])
+                    except Exception:
+                        prev_len = 0
+
+            slice_start = max(0, (min_idx + prev_len) - (max_window_steps - 1))
+            slice_end = min(temp_series.size - 1, max_idx + prev_len)
+            temp_slice = temp_series[slice_start : slice_end + 1]
+            dew_slice = dew_series[slice_start : slice_end + 1]
+            local_time = np.clip((time_slice + prev_len) - slice_start, 0, temp_slice.size - 1)
+
+            # Compute VPD per hour (kPa)
+            es = 0.6108 * np.exp((17.27 * temp_slice) / (temp_slice + 237.3))
+            ea = 0.6108 * np.exp((17.27 * dew_slice) / (dew_slice + 237.3))
+            vpd_series = es - ea
+
+            window_sums, window_counts = _window_stats_batch(vpd_series, local_time, steps)
+
+            paths_slice = taxon_path[s:e]
+            rows_slice = row_idx[s:e]
+            for tpath in np.unique(paths_slice):
+                mask = paths_slice == tpath
+                if not mask.any():
+                    continue
+                row_ids = rows_slice[mask]
+                for hours, sums in window_sums.items():
+                    counts = window_counts[hours]
+                    values = np.full_like(sums, np.nan, dtype=float)
+                    np.divide(sums, counts, out=values, where=counts > 0)
+                    col = f"vapor_pressure_deficit_avg_{hours}h"
+                    local_updates.setdefault(tpath, {}).setdefault(col, []).append((row_ids, values[mask]))
+
+        temp_reader.close()
+        dew_reader.close()
+        if prev_temp_reader is not None:
+            prev_temp_reader.close()
+        if prev_dew_reader is not None:
+            prev_dew_reader.close()
+
         with updates_lock:
             for tpath, colmap in local_updates.items():
                 for col, chunks in colmap.items():
                     updates.setdefault(tpath, {}).setdefault(col, []).extend(chunks)
 
-        with PROGRESS_LOCK:
-            done_now = PROGRESS_DONE_ROWS
-        # verbose chunk done suppressed for normal runs
-        return 1, len(lat), True, threading.current_thread().name
-
-    # Pre-split worklist by chunk for parallelism
     chunk_tables: list[tuple[ChunkRange, pa.Table]] = []
     for chunk_entry in chunk_index.ranges:
         table = worklist.filter(pa.compute.equal(worklist["chunk_num"], chunk_entry.chunk_num))
         if table.num_rows == 0:
             continue
         chunk_tables.append((chunk_entry, table))
-    # concise plan log
-    print(f"[process-plan] {variable} {model} chunks={len(chunk_tables)}")
+
     if not chunk_tables:
         return
-    total_groups = max(1, len(chunk_tables))
 
     worker_count = min(MAX_CHUNK_WORKERS, len(chunk_tables) or 1)
-
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [executor.submit(_process_chunk, ce, tbl) for ce, tbl in chunk_tables]
-        try:
-            for future in as_completed(futures):
-                result = future.result()
-                if len(result) == 4:
-                    groups, rows, progress_counted, worker_name = result
-                else:
-                    groups, rows, worker_name = result
-                    progress_counted = False
-                groups_done += groups
-                rows_done += rows
-                chunks_done += 1
-                per_worker_rows[worker_name] = per_worker_rows.get(worker_name, 0) + rows
-                if not progress_counted:
-                    _add_progress(rows)
-        except KeyboardInterrupt:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            pass
+        for future in as_completed(futures):
+            future.result()
 
-    # Write back once per taxon under lock (read-modify-write)
     for tpath, colmap in updates.items():
         lock = _WRITE_LOCKS.setdefault(tpath, threading.Lock())
         with lock:
@@ -1078,7 +1187,6 @@ def _process_worklist(
             table = pq.read_table(parquet_path).combine_chunks()
             updated = _apply_updates_arrow(table, colmap)
             _atomic_write(parquet_path, updated)
-
 
 def _process_taxon(taxon: taxa_navigation.TaxonRecord, chunk_index: ChunkIndex) -> None:
     path = Path(taxon["path"]) / CONFIG.occurrence_parquet_filename
@@ -1294,10 +1402,14 @@ def _run_variable(model: str, variable: str, window_hours: tuple[int, ...]) -> N
         return
     print(f"[init] chunks={len(chunk_index.ranges)} latest_end={datetime.fromtimestamp(chunk_index.latest_end_time, tz=timezone.utc).isoformat()}")
 
-    total_rows = _build_worklist_from_index(chunk_index, OCC_INDEX_PATH, WORKLIST_PATH)
-    print(f"[worklist] built rows={total_rows} file={WORKLIST_PATH}")
+    batch_rows = CONFIG.temporal_worklist_batch_rows
     agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
-    _process_worklist(chunk_index, WORKLIST_PATH, model, variable, window_hours, agg_mode)
+    for occ_batch in _iter_occ_index_batches(OCC_INDEX_PATH, batch_rows):
+        _apply_pre_cutoff_nans(occ_batch, variable, window_hours, agg_mode)
+        worklist_table = _build_worklist_from_index(chunk_index, occ_batch, model, variable)
+        if worklist_table.num_rows == 0:
+            continue
+        _process_worklist(chunk_index, worklist_table, model, variable, window_hours, agg_mode)
     WORKLIST_PATH.unlink(missing_ok=True)
 
 
@@ -1342,6 +1454,59 @@ def _run_weather_code_simple(model: str) -> None:
     print(f"[weather_code] derived {target_col} for model={model}")
 
 
+def _run_vapor_pressure_deficit() -> None:
+    """Derive vapor_pressure_deficit from temperature_2m and dew_point_2m aggregates."""
+    root = CONFIG.root_taxon_id
+    root_record = taxa_navigation.get_taxon_by_id(root)
+    if root_record is None:
+        raise RuntimeError(f"Unknown root taxon {root}")
+
+    temporal_registry = gis_lookup.load_temporal_registry()
+    registry_windows = temporal_registry.get("windows", [])
+    windows_by_var = {
+        str(entry.get("id")): tuple(entry.get("windows") or registry_windows or ())
+        for entry in temporal_registry.get("layers", [])
+        if entry.get("id")
+    }
+    windows = windows_by_var.get("vapor_pressure_deficit", tuple(registry_windows))
+    if not windows:
+        print("[vpd] no windows configured; skipping")
+        return
+
+    for node in taxa_navigation.iter_descendants(root_record, include_self=True):
+        path = Path(node["path"]) / CONFIG.occurrence_parquet_filename
+        if not path.exists():
+            continue
+        table = pq.read_table(path).combine_chunks()
+        df = table.to_pandas()
+        if df.empty:
+            continue
+
+        updated_any = False
+        for hours in windows:
+            t_col = f"temperature_2m_avg_{hours}h"
+            td_col = f"dew_point_2m_avg_{hours}h"
+            vpd_col = f"vapor_pressure_deficit_avg_{hours}h"
+            if t_col not in df.columns or td_col not in df.columns:
+                continue
+
+            t = df[t_col].to_numpy(dtype=float)
+            td = df[td_col].to_numpy(dtype=float)
+            # Saturation vapor pressure (kPa)
+            es = 0.6108 * np.exp((17.27 * t) / (t + 237.3))
+            ea = 0.6108 * np.exp((17.27 * td) / (td + 237.3))
+            vpd = es - ea
+            vpd[~np.isfinite(vpd)] = np.nan
+            df[vpd_col] = vpd
+            updated_any = True
+
+        if updated_any:
+            updated = pa.Table.from_pandas(df, preserve_index=False)
+            _atomic_write(path, updated)
+
+    print("[vpd] derived vapor_pressure_deficit")
+
+
 def main() -> None:
     cache_dir = DEFAULT_CACHE_DIR
     global CACHE_DIR
@@ -1363,7 +1528,7 @@ def main() -> None:
     model_preference = CONFIG.temporal_model_preference
     temporal_registry = gis_lookup.load_temporal_registry()
     registry_windows = temporal_registry.get("windows", [])
-    registry_vars = temporal_registry.get("variables", [])
+    registry_vars = temporal_registry.get("layers", [])
     windows_by_var = {
         str(entry.get("id")): tuple(entry.get("windows") or registry_windows or ())
         for entry in registry_vars
@@ -1373,6 +1538,11 @@ def main() -> None:
         str(entry.get("id")): str(entry.get("agg"))
         for entry in registry_vars
         if entry.get("id") and entry.get("agg")
+    }
+    derived_by_var = {
+        str(entry.get("id")): bool(entry.get("derived"))
+        for entry in registry_vars
+        if entry.get("id")
     }
     default_windows = tuple(registry_windows or CONFIG.temporal_window_hours_default)
 
@@ -1385,10 +1555,9 @@ def main() -> None:
         occ_index_path.unlink()
     occ_rows = _build_occ_index(occ_index_path)
     print(f"[occ_index] built rows={occ_rows} file={occ_index_path} root={CONFIG.root_taxon_id}")
-    occ_table = pq.read_table(occ_index_path).combine_chunks()
 
-    # Phase 1: build worklists for preferred model per variable
-    work_plan: list[tuple[str, str, tuple[int, ...], Path, ChunkIndex]] = []
+    # Phase 1: build processing plan per variable
+    work_plan: list[tuple[str, str, tuple[int, ...], str, ChunkIndex]] = []
     global PROGRESS_TOTAL_ROWS, PROGRESS_DONE_ROWS
     PROGRESS_DONE_ROWS = 0
     PROGRESS_STOP.clear()
@@ -1422,6 +1591,14 @@ def main() -> None:
         temporal_vars = list(models_by_var.keys())
 
     for variable in temporal_vars:
+        if derived_by_var.get(variable) and variable != "vapor_pressure_deficit":
+            window_hours = windows_by_var.get(variable, default_windows)
+            if not window_hours:
+                print(f"[skip] variable={variable} (no windows configured)")
+                continue
+            work_plan.append((variable, "derived", window_hours, "derived", None))
+            continue
+
         models = models_by_var.get(variable, ())
         if not models:
             print(f"[skip] variable={variable} (no models configured)")
@@ -1431,11 +1608,12 @@ def main() -> None:
             print(f"[skip] variable={variable} (no windows configured)")
             continue
         if variable == "weather_code_simple":
-            work_plan.append((variable, "derived", window_hours, Path(), None))  # handled later
+            work_plan.append((variable, "derived", window_hours, "snapshot", None))  # handled later
             continue
         chosen_model = next((m for m in model_preference if m in models), models[0])
         try:
-            chunk_index = _build_chunk_index(chosen_model, variable)
+            chunk_var = "temperature_2m" if variable == "vapor_pressure_deficit" else variable
+            chunk_index = _build_chunk_index(chosen_model, chunk_var)
         except FileNotFoundError:
             print(f"[skip] variable={variable} model={chosen_model} missing on s3; skipping")
             continue
@@ -1447,22 +1625,41 @@ def main() -> None:
         if _all_columns_present(target_cols) and not overwrite_all and not any(col in overwrite_cols for col in target_cols):
             print(f"[skip] variable={variable} (columns already present for all taxa)")
             continue
-        worklist_table = _build_worklist_from_index(chunk_index, occ_table, chosen_model, variable)
-        print(f"[worklist] built rows={worklist_table.num_rows} (in-memory)")
-        work_plan.append((variable, chosen_model, window_hours, worklist_table, chunk_index))
-        total_rows_all += worklist_table.num_rows
+        work_plan.append((variable, chosen_model, window_hours, agg_mode, chunk_index))
 
+    # Approximate total rows for progress
+    total_rows_all = occ_rows * sum(1 for v, *_ in work_plan if v != "weather_code_simple")
     PROGRESS_TOTAL_ROWS = total_rows_all
 
     # Phase 2: process worklists (parallel across variables)
-    def _process_task(variable: str, model: str, window_hours: tuple[int, ...], worklist_table: pa.Table, chunk_index: ChunkIndex) -> None:
+    def _process_task(variable: str, model: str, window_hours: tuple[int, ...], agg_mode: str, chunk_index: ChunkIndex) -> None:
         if variable == "weather_code_simple":
             # weather code is derived after all other variables complete
             return
-        agg_mode = agg_by_var.get(variable, CONFIG.temporal_agg_by_variable.get(variable, "avg"))
-        _apply_pre_cutoff_nans(occ_table, variable, window_hours, agg_mode)
-        print(f"[process] variable={variable} model={model} agg={agg_mode} rows={worklist_table.num_rows}")
-        _process_worklist(chunk_index, worklist_table, model, variable, window_hours, agg_mode)
+        if variable == "vapor_pressure_deficit":
+            batch_rows = CONFIG.temporal_worklist_batch_rows
+            print(f"[process] variable={variable} model={model} agg=avg batch_rows={batch_rows}")
+            for occ_batch in _iter_occ_index_batches(occ_index_path, batch_rows):
+                if occ_batch.num_rows == 0:
+                    continue
+                _apply_pre_cutoff_nans(occ_batch, variable, window_hours, "avg")
+                worklist_table = _build_worklist_from_index(chunk_index, occ_batch, model, "temperature_2m")
+                if worklist_table.num_rows == 0:
+                    continue
+                _process_vpd_worklist(chunk_index, worklist_table, model, window_hours)
+            return
+        if model == "derived" or agg_mode == "derived":
+            return
+        batch_rows = CONFIG.temporal_worklist_batch_rows
+        print(f"[process] variable={variable} model={model} agg={agg_mode} batch_rows={batch_rows}")
+        for occ_batch in _iter_occ_index_batches(occ_index_path, batch_rows):
+            if occ_batch.num_rows == 0:
+                continue
+            _apply_pre_cutoff_nans(occ_batch, variable, window_hours, agg_mode)
+            worklist_table = _build_worklist_from_index(chunk_index, occ_batch, model, variable)
+            if worklist_table.num_rows == 0:
+                continue
+            _process_worklist(chunk_index, worklist_table, model, variable, window_hours, agg_mode)
 
     def _print_global_progress(start_time: float) -> None:
         if PROGRESS_TOTAL_ROWS == 0:
@@ -1490,18 +1687,19 @@ def main() -> None:
         progress_thread.start()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
-            for variable, model, window_hours, worklist_table, chunk_index in work_plan:
+            for variable, model, window_hours, agg_mode, chunk_index in work_plan:
                 futures.append(
-                    executor.submit(_process_task, variable, model, window_hours, worklist_table, chunk_index)
+                    executor.submit(_process_task, variable, model, window_hours, agg_mode, chunk_index)
                 )
             for future in as_completed(futures):
                 future.result()
         PROGRESS_STOP.set()
         progress_thread.join()
 
-    # Run weather_code_simple after all other variables complete
+    # Run derived variables after all other variables complete
     if any(v == "weather_code_simple" for v, *_ in work_plan):
         _run_weather_code_simple("derived")
+    # VPD is derived during processing using hourly temperature/dew point.
 
     # Cleanup temp cache artifacts
     try:

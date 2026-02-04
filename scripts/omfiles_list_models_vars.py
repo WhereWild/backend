@@ -4,12 +4,6 @@ import fsspec
 
 
 BASE_PREFIX = "s3://openmeteo/data"
-MODEL_WHITELIST = {
-    "copernicus_era5",
-    "copernicus_era5_land",
-    "copernicus_era5_ensemble",
-    "cerra",
-}
 WHITELIST = {
     "temperature_2m",
     "apparent_temperature",
@@ -60,8 +54,6 @@ def main() -> None:
 
     for model_path in models:
         model = model_path.split("/")[-1]
-        if model not in MODEL_WHITELIST:
-            continue
         vars_paths = _ls_dirs(fs, model_path)
         variables = [p.split("/")[-1] for p in vars_paths]
         variables = [v for v in variables if v != "static"]
