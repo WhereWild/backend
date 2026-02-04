@@ -24,6 +24,7 @@ import fsspec
 from omfiles import OmFileReader
 
 from util.config import load_config
+import util.gis_lookup as gis_lookup
 from util import taxa_navigation
 
 
@@ -901,7 +902,14 @@ def _apply_pre_cutoff_nans(
             _atomic_write(parquet_path, updated)
 
 
-def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, variable: str, window_hours: tuple[int, ...]) -> None:
+def _process_worklist(
+    chunk_index: ChunkIndex,
+    worklist: pa.Table,
+    model: str,
+    variable: str,
+    window_hours: tuple[int, ...],
+    agg_mode: str,
+) -> None:
     """Process global worklist: read each chunk once, write results back to parquets."""
     steps = _window_steps(chunk_index.resolution, window_hours)
     ranges_by_start = sorted(chunk_index.ranges, key=lambda r: r.start)
@@ -918,8 +926,6 @@ def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, v
     updates_lock = threading.Lock()
 
     groups_done = 0
-
-    agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
 
     def _open_chunk_reader(entry: ChunkRange) -> OmFileReader:
         if entry.source == "year":
@@ -1290,7 +1296,8 @@ def _run_variable(model: str, variable: str, window_hours: tuple[int, ...]) -> N
 
     total_rows = _build_worklist_from_index(chunk_index, OCC_INDEX_PATH, WORKLIST_PATH)
     print(f"[worklist] built rows={total_rows} file={WORKLIST_PATH}")
-    _process_worklist(chunk_index, WORKLIST_PATH)
+    agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
+    _process_worklist(chunk_index, WORKLIST_PATH, model, variable, window_hours, agg_mode)
     WORKLIST_PATH.unlink(missing_ok=True)
 
 
@@ -1353,9 +1360,21 @@ def main() -> None:
         pass
 
     models_by_var = CONFIG.temporal_models_by_variable
-    windows_by_var = CONFIG.temporal_window_hours_by_variable
-    default_windows = CONFIG.temporal_window_hours_default
     model_preference = CONFIG.temporal_model_preference
+    temporal_registry = gis_lookup.load_temporal_registry()
+    registry_windows = temporal_registry.get("windows", [])
+    registry_vars = temporal_registry.get("variables", [])
+    windows_by_var = {
+        str(entry.get("id")): tuple(entry.get("windows") or registry_windows or ())
+        for entry in registry_vars
+        if entry.get("id")
+    }
+    agg_by_var = {
+        str(entry.get("id")): str(entry.get("agg"))
+        for entry in registry_vars
+        if entry.get("id") and entry.get("agg")
+    }
+    default_windows = tuple(registry_windows or CONFIG.temporal_window_hours_default)
 
     # Build occurrence index once for the chosen root
     if OCC_INDEX_PATH is None:
@@ -1397,7 +1416,16 @@ def main() -> None:
                 return False
         return True
 
-    for variable, models in models_by_var.items():
+    if registry_vars:
+        temporal_vars = [str(entry.get("id")) for entry in registry_vars if entry.get("id")]
+    else:
+        temporal_vars = list(models_by_var.keys())
+
+    for variable in temporal_vars:
+        models = models_by_var.get(variable, ())
+        if not models:
+            print(f"[skip] variable={variable} (no models configured)")
+            continue
         window_hours = windows_by_var.get(variable, default_windows)
         if not window_hours:
             print(f"[skip] variable={variable} (no windows configured)")
@@ -1411,7 +1439,7 @@ def main() -> None:
         except FileNotFoundError:
             print(f"[skip] variable={variable} model={chosen_model} missing on s3; skipping")
             continue
-        agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
+        agg_mode = agg_by_var.get(variable, CONFIG.temporal_agg_by_variable.get(variable, "avg"))
         target_cols = [f"{variable}_{agg_mode}_{h}h" for h in window_hours]
         overwrite_all = CONFIG.temporal_overwrite_columns is None
         overwrite_cols = set(CONFIG.temporal_overwrite_columns or ())
@@ -1431,10 +1459,10 @@ def main() -> None:
         if variable == "weather_code_simple":
             # weather code is derived after all other variables complete
             return
-        agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
+        agg_mode = agg_by_var.get(variable, CONFIG.temporal_agg_by_variable.get(variable, "avg"))
         _apply_pre_cutoff_nans(occ_table, variable, window_hours, agg_mode)
         print(f"[process] variable={variable} model={model} agg={agg_mode} rows={worklist_table.num_rows}")
-        _process_worklist(chunk_index, worklist_table, model, variable, window_hours)
+        _process_worklist(chunk_index, worklist_table, model, variable, window_hours, agg_mode)
 
     def _print_global_progress(start_time: float) -> None:
         if PROGRESS_TOTAL_ROWS == 0:

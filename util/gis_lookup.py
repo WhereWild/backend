@@ -83,6 +83,24 @@ def load_layer_metadata() -> Dict[str, Dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
+def load_temporal_registry() -> dict[str, Any]:
+    """Load temporal registry from the GIS catalog.
+
+    Returns a dict with keys:
+      - windows: default windows list
+      - variables: list of variable dicts (id, agg, windows override, etc.)
+    """
+    catalog = _load_gis_catalog()
+    for category in catalog.get("categories", []):
+        if category.get("name") == "temporal":
+            return {
+                "windows": category.get("windows", []),
+                "variables": category.get("variables", []),
+            }
+    return {"windows": [], "variables": []}
+
+
+@lru_cache(maxsize=1)
 def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Builds a list of variable metadata entries and a lookup by id.
     
@@ -404,6 +422,7 @@ def list_layer_ids() -> List[str]:
     return [
         layer["id"]
         for category in catalog["categories"]
+        if category.get("name") != "temporal"
         for layer in category["layers"]
     ]
 
