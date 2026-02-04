@@ -904,6 +904,10 @@ def _apply_pre_cutoff_nans(
 def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, variable: str, window_hours: tuple[int, ...]) -> None:
     """Process global worklist: read each chunk once, write results back to parquets."""
     steps = _window_steps(chunk_index.resolution, window_hours)
+    ranges_by_start = sorted(chunk_index.ranges, key=lambda r: r.start)
+    prev_by_chunk: dict[int, ChunkRange | None] = {}
+    for idx, entry in enumerate(ranges_by_start):
+        prev_by_chunk[entry.chunk_num] = ranges_by_start[idx - 1] if idx > 0 else None
     total_rows = worklist.num_rows
     rows_done = 0
     chunks_done = 0
@@ -916,6 +920,17 @@ def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, v
     groups_done = 0
 
     agg_mode = CONFIG.temporal_agg_by_variable.get(variable, "avg")
+
+    def _open_chunk_reader(entry: ChunkRange) -> OmFileReader:
+        if entry.source == "year":
+            data_uri = f"s3://openmeteo/data/{model}/{variable}/year_{entry.chunk_num}.om"
+            if entry.chunk_num >= YEAR_PREFETCH_CUTOFF:
+                local_chunk = _prefetch_chunk(data_uri)
+                return _open_reader(local_chunk.as_posix(), block_size=YEAR_REMOTE_BLOCK_SIZE)
+            return _open_reader(data_uri, block_size=YEAR_REMOTE_BLOCK_SIZE)
+        data_uri = f"s3://openmeteo/data/{model}/{variable}/chunk_{entry.chunk_num}.om"
+        local_chunk = _prefetch_chunk(data_uri)
+        return _open_reader(local_chunk.as_posix())
 
     def _process_chunk(chunk_entry: ChunkRange, chunk_table: pa.Table) -> tuple[int, int, bool, str]:
         # verbose chunk start suppressed for normal runs
@@ -936,24 +951,15 @@ def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, v
         group_starts = np.flatnonzero(change)
         group_ends = np.append(group_starts[1:], len(lat))
 
-        if chunk_entry.source == "year":
-            data_uri = f"s3://openmeteo/data/{model}/{variable}/year_{chunk_entry.chunk_num}.om"
-            if chunk_entry.chunk_num >= YEAR_PREFETCH_CUTOFF:
-                local_chunk = _prefetch_chunk(data_uri)
-                reader = _open_reader(local_chunk.as_posix(), block_size=YEAR_REMOTE_BLOCK_SIZE)
-            else:
-                reader = _open_reader(data_uri, block_size=YEAR_REMOTE_BLOCK_SIZE)
-        else:
-            data_uri = f"s3://openmeteo/data/{model}/{variable}/chunk_{chunk_entry.chunk_num}.om"
-            # Chunk files are small enough to prefetch
-            local_chunk = _prefetch_chunk(data_uri)
-            reader = _open_reader(local_chunk.as_posix())
+        reader = _open_chunk_reader(chunk_entry)
         ny, nx, _ = reader.shape
         axis_info = _axis_info(reader, model, variable)
 
         local_updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
 
         max_window_steps = max(steps.values()) if steps else 0
+        prev_entry = prev_by_chunk.get(chunk_entry.chunk_num)
+        prev_reader: OmFileReader | None = None
 
         for s, e in zip(group_starts, group_ends):
             li = int(lat[s]); lo = int(lon[s])
@@ -969,10 +975,22 @@ def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, v
             time_slice = time_idx[s:e]
             min_idx = int(time_slice.min())
             max_idx = int(time_slice.max())
-            slice_start = max(0, min_idx - (max_window_steps - 1))
-            slice_end = min(series.size - 1, max_idx)
+            prev_len = 0
+            if prev_entry is not None and max_window_steps > 1 and min_idx < (max_window_steps - 1):
+                try:
+                    if prev_reader is None:
+                        prev_reader = _open_chunk_reader(prev_entry)
+                    prev_series = np.array(prev_reader[li, lo, :], dtype=float)
+                    need = (max_window_steps - 1) - min_idx
+                    if prev_series.size > 0 and need > 0:
+                        prev_len = min(int(need), int(prev_series.size))
+                        series = np.concatenate([prev_series[-prev_len:], series])
+                except Exception:
+                    prev_len = 0
+            slice_start = max(0, (min_idx + prev_len) - (max_window_steps - 1))
+            slice_end = min(series.size - 1, max_idx + prev_len)
             series_slice = series[slice_start : slice_end + 1]
-            local_time = np.clip(time_slice - slice_start, 0, series_slice.size - 1)
+            local_time = np.clip((time_slice + prev_len) - slice_start, 0, series_slice.size - 1)
             window_sums, window_counts = _window_stats_batch(series_slice, local_time, steps)
 
             paths_slice = taxon_path[s:e]
@@ -995,6 +1013,8 @@ def _process_worklist(chunk_index: ChunkIndex, worklist: pa.Table, model: str, v
             _add_progress(e - s)
 
         reader.close()
+        if prev_reader is not None:
+            prev_reader.close()
 
         # Merge local updates into shared dict
         with updates_lock:
