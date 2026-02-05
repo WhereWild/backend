@@ -66,7 +66,7 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = "6"
+    root_taxon_id: str = "2519"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
@@ -172,6 +172,22 @@ class GlobalConfig:
             "weather_code_simple": (1,),
         }
     )
+    # Columns that may contain target elevation in occurrence parquets (first found is used).
+    temporal_elevation_columns: tuple[str, ...] = (
+        "elevation",
+        "elevationMeters",
+        "elevation_m",
+        "elevation_meters",
+        "dem_elevation",
+        "dem_elevation_m",
+    )
+    # Variables eligible for elevation lapse-rate correction.
+    temporal_elevation_correctable_vars: tuple[str, ...] = (
+        "temperature_2m",
+        "dew_point_2m",
+        "soil_temperature_0_to_7cm",
+        "soil_temperature_7_to_28cm",
+    )
     temporal_agg_by_variable: dict[str, str] = field(
         default_factory=lambda: {
             "precipitation": "sum",
@@ -199,6 +215,8 @@ class GlobalConfig:
     # Cap the number of occurrence rows per worklist batch to bound memory.
     # Set to 0 to disable batching (process all rows at once).
     temporal_worklist_batch_rows: int = 1_500_000
+    # Log a one-time model elevation summary per model to validate HSURF access.
+    temporal_debug_model_elevation: bool = True
     # If set to None, overwrite all temporal columns every run.
     temporal_overwrite_columns: tuple[str, ...] | None = None
     inat_mapping_offline_filename: str = "inat_gbif_mapping.csv"

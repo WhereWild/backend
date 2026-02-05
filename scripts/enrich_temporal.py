@@ -57,6 +57,10 @@ OCC_INDEX_PATH: Path | None = None
 OCC_TABLE: pa.Table | None = None
 _GRID_MODE_CACHE: dict[tuple[str, str], tuple[str, int, int, float]] = {}
 _WRITE_LOCKS: dict[str, threading.Lock] = {}
+_MODEL_ELEV_LOCK = threading.Lock()
+_MODEL_ELEV_LOGGED: set[str] = set()
+_MODEL_ELEV_GRID_CACHE: dict[str, np.ndarray] = {}
+_ELEVATION_WARNED = False
 
 
 def _add_progress(rows: int) -> None:
@@ -200,6 +204,20 @@ def _open_reader(uri: str, *, block_size: int | None = None) -> OmFileReader:
     if last_exc:
         raise last_exc
     raise RuntimeError("Failed to open reader; no attempts executed")
+
+
+def _read_model_elevation(model: str, lat_idx: np.ndarray, lon_idx: np.ndarray) -> np.ndarray:
+    with _MODEL_ELEV_LOCK:
+        grid = _MODEL_ELEV_GRID_CACHE.get(model)
+        if grid is None:
+            uri = f"s3://openmeteo/data/{model}/static/HSURF.om"
+            reader = _open_reader(uri)
+            try:
+                grid = np.asarray(reader[:, :], dtype=float)
+            finally:
+                reader.close()
+            _MODEL_ELEV_GRID_CACHE[model] = grid
+    return grid[lat_idx, lon_idx]
 
 
 def _prefetch_chunk(data_uri: str) -> Path:
@@ -694,7 +712,9 @@ def _build_occ_index(index_path: Path) -> int:
     """Scan all taxa once and write base occurrence index with lat/lon/time."""
     if index_path.exists():
         table = pq.ParquetFile(index_path)
-        return table.metadata.num_rows
+        if "target_elevation" in (table.schema.names or []):
+            return table.metadata.num_rows
+        index_path.unlink()
 
     schema = pa.schema(
         [
@@ -703,6 +723,7 @@ def _build_occ_index(index_path: Path) -> int:
             ("timestamp", pa.float64()),
             ("latitude", pa.float64()),
             ("longitude", pa.float64()),
+            ("target_elevation", pa.float64()),
         ]
     )
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -746,6 +767,12 @@ def _build_occ_index(index_path: Path) -> int:
                 times = times / 1e9
         lats = pending[LAT_COL].to_numpy(dtype=float)
         lons = pending[LON_COL].to_numpy(dtype=float)
+        elev_cols = getattr(CONFIG, "temporal_elevation_columns", ())
+        elev_col = next((c for c in elev_cols if c in pending.columns), None)
+        if elev_col is None:
+            target_elev = np.full(len(pending_index), np.nan, dtype=float)
+        else:
+            target_elev = pending[elev_col].to_numpy(dtype=float)
 
         base_table = pa.Table.from_pydict(
             {
@@ -754,6 +781,7 @@ def _build_occ_index(index_path: Path) -> int:
                 "timestamp": times.astype(np.float64),
                 "latitude": lats.astype(np.float64),
                 "longitude": lons.astype(np.float64),
+                "target_elevation": target_elev.astype(np.float64),
             }
         )
         writer.write_table(base_table)
@@ -798,6 +826,7 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
     lons = np.array(data["longitude"], dtype=float)
     row_idx = np.array(data["row_idx"], dtype=int)
     taxon_path = np.array(data["taxon_path"])
+    target_elev = np.array(data.get("target_elevation", np.full(len(times), np.nan)), dtype=float)
 
     if MIN_YEAR is not None:
         cutoff = datetime(MIN_YEAR, 1, 1, tzinfo=timezone.utc).timestamp()
@@ -818,6 +847,7 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
         lons = lons[valid_mask]
         row_idx = row_idx[valid_mask]
         taxon_path = taxon_path[valid_mask]
+        target_elev = target_elev[valid_mask]
 
     # Resolve grid mode by probing sample points against actual data (more reliable than meta for era5_land)
     cache_key = (model, variable)
@@ -879,6 +909,34 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
 
     total_rows = len(row_idx)
     print(f"[worklist] projected {total_rows}/{occ_table.num_rows} rows onto model grid")
+    if getattr(CONFIG, "temporal_debug_model_elevation", False) and model not in _MODEL_ELEV_LOGGED:
+        try:
+            elev = _read_model_elevation(model, lat_idx, lon_idx)
+            elev = np.where(elev <= -900, np.nan, elev)
+            finite = np.isfinite(elev)
+            if finite.any():
+                elev_min = float(np.nanmin(elev))
+                elev_med = float(np.nanmedian(elev))
+                elev_max = float(np.nanmax(elev))
+                min_i = int(np.nanargmin(elev))
+                max_i = int(np.nanargmax(elev))
+                min_lat = float(lats[min_i])
+                min_lon = float(lons[min_i])
+                max_lat = float(lats[max_i])
+                max_lon = float(lons[max_i])
+                missing = 1.0 - (finite.sum() / len(elev))
+                print(
+                    f"[model_elev] model={model} rows={len(elev)} "
+                    f"min={elev_min:.2f} @({min_lat:.5f},{min_lon:.5f}) "
+                    f"med={elev_med:.2f} "
+                    f"max={elev_max:.2f} @({max_lat:.5f},{max_lon:.5f}) "
+                    f"missing={missing:.3%}"
+                )
+            else:
+                print(f"[model_elev] model={model} rows={len(elev)} all_missing")
+        except Exception as exc:
+            print(f"[model_elev] model={model} failed: {exc}")
+        _MODEL_ELEV_LOGGED.add(model)
     return pa.Table.from_pydict(
         {
             "taxon_path": taxon_path,
@@ -887,6 +945,7 @@ def _build_worklist_from_index(chunk_index: ChunkIndex, occ_table: pa.Table, mod
             "lat_idx": lat_idx.astype(np.int32),
             "lon_idx": lon_idx.astype(np.int32),
             "time_idx": time_indices.astype(np.int32),
+            "target_elevation": target_elev.astype(np.float32),
         }
     )
 
@@ -972,10 +1031,28 @@ def _process_worklist(
         time_idx = np.array(data["time_idx"], dtype=int)
         taxon_path = np.array(data["taxon_path"])
         row_idx = np.array(data["row_idx"], dtype=int)
+        target_elev = np.array(data.get("target_elevation", np.full(len(lat), np.nan)), dtype=float)
+        do_elev = variable in getattr(CONFIG, "temporal_elevation_correctable_vars", ())
+        correction = None
 
         order = np.lexsort((lon, lat))
         lat = lat[order]; lon = lon[order]; time_idx = time_idx[order]
         taxon_path = taxon_path[order]; row_idx = row_idx[order]
+        target_elev = target_elev[order]
+
+        if do_elev:
+            if not np.isfinite(target_elev).any():
+                global _ELEVATION_WARNED
+                if not _ELEVATION_WARNED:
+                    print("[elevation] missing target elevation column; skipping correction")
+                    _ELEVATION_WARNED = True
+                do_elev = False
+            else:
+                model_elev = _read_model_elevation(model, lat, lon)
+                # Treat nodata/invalid model elevations as missing
+                model_elev = np.where(model_elev <= -900, np.nan, model_elev)
+                correction = (model_elev - target_elev) * 0.0065
+                correction_mask = np.isfinite(correction)
 
         change = np.empty_like(lat, dtype=bool)
         change[0] = True
@@ -1039,6 +1116,12 @@ def _process_worklist(
                     else:
                         values = np.full_like(sums, np.nan, dtype=float)
                         np.divide(sums, counts, out=values, where=counts > 0)
+                        if do_elev and correction is not None:
+                            corr_slice = correction[s:e]
+                            mask_slice = correction_mask[s:e]
+                            if mask_slice.any():
+                                values = values.copy()
+                                values[mask_slice] += corr_slice[mask_slice]
                     col = f"{variable}_{agg_mode}_{hours}h"
                     local_updates.setdefault(tpath, {}).setdefault(col, []).append((row_ids, values[mask]))
 
@@ -1112,10 +1195,27 @@ def _process_vpd_worklist(
         time_idx = np.array(data["time_idx"], dtype=int)
         taxon_path = np.array(data["taxon_path"])
         row_idx = np.array(data["row_idx"], dtype=int)
+        target_elev = np.array(data.get("target_elevation", np.full(len(lat), np.nan)), dtype=float)
+        do_elev = "temperature_2m" in getattr(CONFIG, "temporal_elevation_correctable_vars", ())
+        correction = None
 
         order = np.lexsort((lon, lat))
         lat = lat[order]; lon = lon[order]; time_idx = time_idx[order]
         taxon_path = taxon_path[order]; row_idx = row_idx[order]
+        target_elev = target_elev[order]
+
+        if do_elev:
+            if not np.isfinite(target_elev).any():
+                global _ELEVATION_WARNED
+                if not _ELEVATION_WARNED:
+                    print("[elevation] missing target elevation column; skipping correction")
+                    _ELEVATION_WARNED = True
+                do_elev = False
+            else:
+                model_elev = _read_model_elevation(model, lat, lon)
+                model_elev = np.where(model_elev <= -900, np.nan, model_elev)
+                correction = (model_elev - target_elev) * 0.0065
+                correction_mask = np.isfinite(correction)
 
         change = np.empty_like(lat, dtype=bool)
         change[0] = True
@@ -1176,6 +1276,12 @@ def _process_vpd_worklist(
             temp_slice = temp_series[slice_start : slice_end + 1]
             dew_slice = dew_series[slice_start : slice_end + 1]
             local_time = np.clip((time_slice + prev_len) - slice_start, 0, temp_slice.size - 1)
+
+            if do_elev and correction is not None:
+                corr = correction[s]
+                if np.isfinite(corr):
+                    temp_slice = temp_slice + corr
+                    dew_slice = dew_slice + corr
 
             # Compute VPD per hour (kPa)
             es = 0.6108 * np.exp((17.27 * temp_slice) / (temp_slice + 237.3))
