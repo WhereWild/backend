@@ -714,7 +714,11 @@ def _build_occ_index(index_path: Path) -> int:
     if root_record is None:
         raise RuntimeError(f"Unknown root taxon {root}")
 
-    for node in taxa_navigation.iter_descendants(root_record, include_self=True):
+    nodes = list(taxa_navigation.iter_descendants(root_record, include_self=True))
+    total_nodes = len(nodes)
+    start_time = time.time()
+    last_log = start_time
+    for idx, node in enumerate(nodes, 1):
         occ_path = Path(node["path"]) / CONFIG.occurrence_parquet_filename
         if not occ_path.exists():
             continue
@@ -754,6 +758,19 @@ def _build_occ_index(index_path: Path) -> int:
         )
         writer.write_table(base_table)
         total_rows += len(pending_index)
+
+        now = time.time()
+        if (idx == 1) or (idx % 250 == 0) or (now - last_log) >= 10:
+            elapsed = now - start_time
+            rate = total_rows / elapsed if elapsed > 0 else 0.0
+            remaining_nodes = max(0, total_nodes - idx)
+            eta = (elapsed / idx) * remaining_nodes if idx > 0 else float("inf")
+            eta_text = "--" if not math.isfinite(eta) else f"{int(eta//60)}m{int(eta%60):02d}s"
+            print(
+                f"[occ_index] taxa {idx}/{total_nodes} rows={total_rows} "
+                f"avg {rate:.1f} rows/s eta {eta_text}"
+            )
+            last_log = now
 
     writer.close()
     return total_rows
@@ -1030,6 +1047,35 @@ def _process_worklist(
         reader.close()
         if prev_reader is not None:
             prev_reader.close()
+
+        with updates_lock:
+            for tpath, colmap in local_updates.items():
+                for col, chunks in colmap.items():
+                    updates.setdefault(tpath, {}).setdefault(col, []).extend(chunks)
+
+    chunk_tables: list[tuple[ChunkRange, pa.Table]] = []
+    for chunk_entry in chunk_index.ranges:
+        table = worklist.filter(pa.compute.equal(worklist["chunk_num"], chunk_entry.chunk_num))
+        if table.num_rows == 0:
+            continue
+        chunk_tables.append((chunk_entry, table))
+
+    if not chunk_tables:
+        return
+
+    worker_count = min(MAX_CHUNK_WORKERS, len(chunk_tables) or 1)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_process_chunk, ce, tbl) for ce, tbl in chunk_tables]
+        for future in as_completed(futures):
+            future.result()
+
+    for tpath, colmap in updates.items():
+        lock = _WRITE_LOCKS.setdefault(tpath, threading.Lock())
+        with lock:
+            parquet_path = Path(tpath)
+            table = pq.read_table(parquet_path).combine_chunks()
+            updated = _apply_updates_arrow(table, colmap)
+            _atomic_write(parquet_path, updated)
 
 
 def _process_vpd_worklist(

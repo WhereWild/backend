@@ -66,7 +66,7 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = "2519"
+    root_taxon_id: str = "6"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
