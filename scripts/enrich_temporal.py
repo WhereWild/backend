@@ -3,16 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple, DefaultDict
+from typing import Any, Iterable, Tuple
 import math
 import tempfile
 import json
 import time
 import threading
 import os
-import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import uuid
 import shutil
 
 import numpy as np
@@ -296,9 +294,6 @@ def _build_chunk_index(model: str, variable: str) -> ChunkIndex:
     ranges: list[ChunkRange] = []
     range_by_chunk: dict[int, ChunkRange] = {}
 
-    chunk_nums_set = set(chunk_nums)
-    year_nums_set = set(year_files)
-
     def _year_time_len(year: int, res: float) -> int:
         from datetime import datetime, timezone
         start = datetime(year, 1, 1, tzinfo=timezone.utc)
@@ -444,8 +439,8 @@ def _axis_info(reader: OmFileReader, model: str, variable: str) -> AxisInfo:
     ny, nx, _ = reader.shape
 
     if lat_meta and lon_meta:
-        lat_start, lat_step, lat_count = lat_meta
-        lon_start, lon_step, lon_count = lon_meta
+        lat_start, lat_step, _ = lat_meta
+        lon_start, lon_step, _ = lon_meta
     else:
         # Fallback to heuristic based on shape
         if ny in (1801, 1800) and nx in (3600, 3601):
@@ -454,8 +449,6 @@ def _axis_info(reader: OmFileReader, model: str, variable: str) -> AxisInfo:
         else:
             lat_start, lat_step = 90.0, -0.25
             lon_start, lon_step = -180.0, 0.25
-        lat_count = ny
-        lon_count = nx
 
     info = AxisInfo(
         lat_start=lat_start,
@@ -1001,16 +994,9 @@ def _process_worklist(
     prev_by_chunk: dict[int, ChunkRange | None] = {}
     for idx, entry in enumerate(ranges_by_start):
         prev_by_chunk[entry.chunk_num] = ranges_by_start[idx - 1] if idx > 0 else None
-    total_rows = worklist.num_rows
-    rows_done = 0
-    chunks_done = 0
-    per_worker_rows: dict[str, int] = {}
-    start = time.time()
     # Collect per-taxon updates; merged after chunk parallelism
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     updates_lock = threading.Lock()
-
-    groups_done = 0
 
     def _open_chunk_reader(entry: ChunkRange) -> OmFileReader:
         if entry.source == "year":
@@ -1036,8 +1022,11 @@ def _process_worklist(
         correction = None
 
         order = np.lexsort((lon, lat))
-        lat = lat[order]; lon = lon[order]; time_idx = time_idx[order]
-        taxon_path = taxon_path[order]; row_idx = row_idx[order]
+        lat = lat[order]
+        lon = lon[order]
+        time_idx = time_idx[order]
+        taxon_path = taxon_path[order]
+        row_idx = row_idx[order]
         target_elev = target_elev[order]
 
         if do_elev:
@@ -1062,7 +1051,6 @@ def _process_worklist(
 
         reader = _open_chunk_reader(chunk_entry)
         ny, nx, _ = reader.shape
-        axis_info = _axis_info(reader, model, variable)
 
         local_updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
 
@@ -1071,7 +1059,8 @@ def _process_worklist(
         prev_reader: OmFileReader | None = None
 
         for s, e in zip(group_starts, group_ends):
-            li = int(lat[s]); lo = int(lon[s])
+            li = int(lat[s])
+            lo = int(lon[s])
             if li >= ny or lo >= nx:
                 continue
             try:
@@ -1200,8 +1189,11 @@ def _process_vpd_worklist(
         correction = None
 
         order = np.lexsort((lon, lat))
-        lat = lat[order]; lon = lon[order]; time_idx = time_idx[order]
-        taxon_path = taxon_path[order]; row_idx = row_idx[order]
+        lat = lat[order]
+        lon = lon[order]
+        time_idx = time_idx[order]
+        taxon_path = taxon_path[order]
+        row_idx = row_idx[order]
         target_elev = target_elev[order]
 
         if do_elev:
@@ -1215,7 +1207,6 @@ def _process_vpd_worklist(
                 model_elev = _read_model_elevation(model, lat, lon)
                 model_elev = np.where(model_elev <= -900, np.nan, model_elev)
                 correction = (model_elev - target_elev) * 0.0065
-                correction_mask = np.isfinite(correction)
 
         change = np.empty_like(lat, dtype=bool)
         change[0] = True
@@ -1235,7 +1226,8 @@ def _process_vpd_worklist(
         local_updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
 
         for s, e in zip(group_starts, group_ends):
-            li = int(lat[s]); lo = int(lon[s])
+            li = int(lat[s])
+            lo = int(lon[s])
             if li >= ny or lo >= nx:
                 continue
             try:
@@ -1483,7 +1475,7 @@ def _process_taxon(taxon: taxa_navigation.TaxonRecord, chunk_index: ChunkIndex) 
         if series.size:
             time_indices_group = np.clip(time_indices_group, 0, series.size - 1)
 
-        window_sums = _window_sums_batch(series, time_indices_group, steps)
+        window_sums, _ = _window_stats_batch(series, time_indices_group, steps)
         for hours, values in window_sums.items():
             col = f"{VARIABLE}_sum_{hours}h"
             target_arrays[col][row_positions_group] = values
