@@ -34,7 +34,7 @@ DEFAULT_CACHE_DIR = "/tmp/wherewild_temporal_cache"
 REMOTE_BLOCK_SIZE = 64 * 1024 * 1024
 YEAR_REMOTE_BLOCK_SIZE = 8 * 1024 * 1024
 # Cap per-variable chunk workers; 12 pushes harder on 8c/16t boxes without going too wide.
-MAX_CHUNK_WORKERS = min(12, os.cpu_count() or 1)
+MAX_CHUNK_WORKERS = 1
 PROGRESS_TOTAL_ROWS = 0
 PROGRESS_DONE_ROWS = 0
 PROGRESS_LOCK = threading.Lock()
@@ -1826,7 +1826,7 @@ def main() -> None:
 
     if work_plan:
         # Allow more variables in flight; inner pools still capped to avoid runaway threads
-        max_workers = min(4, os.cpu_count() or 1, len(work_plan))
+        max_workers = 1
         progress_thread = threading.Thread(target=_global_progress_printer, daemon=True)
         progress_thread.start()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
