@@ -521,3 +521,13 @@ def get_cog_path(layer_id: str, latitude: float, longitude: float) -> Optional[P
     tile_id = get_region_name(latitude, longitude)
 
     return CONFIG.gis_root / region_root / tile_id / filename
+
+
+def get_cog_path_for_region(layer_id: str, region_id: str) -> Optional[Path]:
+    """Gets the path to the COG of a given layer inside a specific region folder."""
+    layer = _get_layer(layer_id)
+    if layer is None:
+        return None
+    region_root = layer["region_root"]
+    filename = layer["filename_template"].format(id=layer_id)
+    return CONFIG.gis_root / region_root / region_id / filename

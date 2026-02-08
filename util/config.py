@@ -66,7 +66,7 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = "2519"
+    root_taxon_id: str = "6"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
@@ -110,6 +110,10 @@ class GlobalConfig:
     occurrence_list_columns: tuple[str, ...] = ("dp", "rcs", "gall")
 
     # API + aggregation behavior
+    sdm_tile_size: int = 256
+    sdm_tile_max_size: int = 512
+    sdm_tile_cache_seconds: int = 60
+    sdm_tile_reproject: bool = True
 
     # Enrichment
 

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from util.config import load_config
-from util import gis_lookup, indexing, summary_stats, taxa_navigation
+from util import gis_lookup, indexing, summary_stats, taxa_navigation, tiles, models
 
 CONFIG = load_config("global")
 
@@ -62,6 +63,59 @@ def list_environment_variables() -> List[dict[str, Any]]:
         A list of variable metadata entries.
     """
     return gis_lookup.load_variable_metadata()[0]
+
+
+@app.get("/sdm/tiles/{taxon_id}/{z}/{x}/{y}.png")
+def habitat_tile(
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id to use for inference."),
+    layers: Optional[str] = Query(
+        None,
+        description="Comma-separated layer ids to use as model features.",
+    ),
+    tile_size: int = Query(CONFIG.sdm_tile_size, ge=32, le=CONFIG.sdm_tile_max_size),
+    reproject: bool = Query(
+        CONFIG.sdm_tile_reproject,
+        description="If true, warp to Web Mercator; if false, keep WGS84.",
+    ),
+) -> Response:
+    """Renders a habitat suitability raster tile for a taxon."""
+    start_time = time.time()
+    layer_list = None
+    if layers:
+        layer_list = [entry.strip() for entry in layers.split(",") if entry.strip()]
+    print(
+        f"[sdm_tile] start taxon={taxon_id} z={z} x={x} y={y} "
+        f"model={model_id} layers={layer_list or 'default'} tile_size={tile_size} "
+        f"reproject={reproject}",
+        flush=True,
+    )
+    try:
+        payload = tiles.render_tile_bytes(
+            taxon_id=taxon_id,
+            z=z,
+            x=x,
+            y=y,
+            model_id=model_id,
+            layers=layer_list,
+            tile_size=tile_size,
+            reproject=reproject,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elapsed = time.time() - start_time
+    print(
+        f"[sdm_tile] done taxon={taxon_id} z={z} x={x} y={y} "
+        f"bytes={len(payload)} elapsed={elapsed:.2f}s",
+        flush=True,
+    )
+    headers = {
+        "Cache-Control": f"public, max-age={CONFIG.sdm_tile_cache_seconds}",
+    }
+    return Response(content=payload, media_type="image/png", headers=headers)
 
 
 @app.get("/api/species")
