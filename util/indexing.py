@@ -693,6 +693,142 @@ def build_rank_indexes_for_ancestor(ancestor_taxon_id: str) -> None:
     for rank in targets:
         _build_rank_index_parquet(ancestor, rank)
 
+
+def build_relative_rank_positions_for_taxon(taxon: taxa_navigation.TaxonRecord) -> None:
+    """Builds a consolidated relative-rank positions file for a taxon node.
+
+    The output is stored at <taxon_path>/relative_ranks_positions.parquet and
+    contains rows for every variable/metric/context pair that can be resolved
+    from existing rank indexes.
+    """
+    taxon_key = str(taxon.get("taxon_key") or "").strip()
+    if not taxon_key:
+        return
+    taxon_path = Path(taxon["path"])
+    contexts = _ancestor_contexts(taxon_path)
+    out_path = taxon_path / "relative_ranks_positions.parquet"
+    if not contexts:
+        out_path.unlink(missing_ok=True)
+        return
+
+    target_rank = taxa_navigation.canonical_rank(taxon["rank"]) or "SPECIES"
+    storage_rank = (
+        "SUBSPECIES"
+        if target_rank in CONFIG.subspecies_equivalents
+        else target_rank
+    )
+    stats = _load_summary_stats(str(taxon_path)) or {}
+    categorical_stats = _load_categorical_stats(str(taxon_path)) or {}
+    metrics_by_variable: dict[str, dict[str, Any]] = {}
+    for variable, values in stats.items():
+        if values:
+            metrics_by_variable[str(variable)] = dict(values)
+    for variable, values in categorical_stats.items():
+        if not values:
+            continue
+        bucket = metrics_by_variable.setdefault(str(variable), {})
+        bucket.update(values)
+    if not metrics_by_variable:
+        out_path.unlink(missing_ok=True)
+        return
+
+    rows: list[dict[str, Any]] = []
+    for ancestor in contexts:
+        ancestor_rank = taxa_navigation.canonical_rank(ancestor["rank"]) or ""
+        column_rank = (
+            storage_rank
+            if not (storage_rank == "SUBSPECIES" and ancestor_rank != "SPECIES")
+            else "SPECIES"
+        )
+        index_path = Path(ancestor["path"]) / f"{column_rank.lower()}_index.parquet"
+        if not index_path.exists():
+            continue
+        column_lengths = _load_column_lengths(index_path)
+        if not column_lengths:
+            continue
+        ancestor_label = (
+            ancestor.get("scientific_name")
+            or ancestor.get("common_name")
+            or ancestor.get("taxon_key")
+        )
+        context_taxon_id = str(ancestor.get("taxon_key") or "")
+        column_cache: dict[str, dict[str, Any]] = {}
+
+        for variable_id, metrics in metrics_by_variable.items():
+            for metric_name in relative_rank_metrics:
+                raw_value = metrics.get(metric_name)
+                if raw_value is None:
+                    continue
+                try:
+                    column_name = _resolve_column_name(
+                        index_path, variable_id, metric_name
+                    )
+                except ValueError:
+                    continue
+                column_length = column_lengths.get(column_name)
+                if not column_length:
+                    continue
+                try:
+                    target_value = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(target_value):
+                    continue
+                cached = column_cache.get(column_name)
+                if cached is None:
+                    column = _load_struct_column(index_path, column_name, column_length)
+                    cached = {
+                        "taxon_keys": column.field("taxonKey").to_pylist(),
+                        "values": column.field("value").to_pylist(),
+                        "samples": column.field("sampleCount").to_pylist(),
+                    }
+                    column_cache[column_name] = cached
+                taxon_keys = cached["taxon_keys"]
+                values = cached["values"]
+                samples = cached["samples"]
+                left = bisect.bisect_left(values, target_value)
+                right = bisect.bisect_right(values, target_value)
+                if left == right:
+                    continue
+                block = taxon_keys[left:right]
+                try:
+                    block_idx = block.index(str(taxon_key))
+                except ValueError:
+                    continue
+                zero_based = left + block_idx
+                sample_count = samples[zero_based]
+                rows.append(
+                    {
+                        "taxonKey": str(taxon_key),
+                        "contextTaxonId": context_taxon_id,
+                        "contextLabel": ancestor_label,
+                        "variable": variable_id,
+                        "metric": metric_name,
+                        "position": int(zero_based),
+                        "count": int(column_length),
+                        "sampleCount": int(sample_count) if sample_count is not None else None,
+                    }
+                )
+
+    if not rows:
+        out_path.unlink(missing_ok=True)
+        return
+
+    table = pa.Table.from_pylist(rows)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=out_path.parent,
+        suffix=".parquet",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        pq.write_table(table, tmp_path)
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
 def build_density_curve(
     values: Sequence[float],
     *,
@@ -814,6 +950,62 @@ def load_relative_ranks(
             return []
         if target_taxon_id is not None and target_taxon_id not in allowed_taxa:
             return []
+    if allowed_taxa is None:
+        positions_path = taxon_dir / "relative_ranks_positions.parquet"
+        if positions_path.exists():
+            try:
+                table = pq.read_table(
+                    positions_path,
+                    columns=[
+                        "variable",
+                        "metric",
+                        "position",
+                        "count",
+                        "sampleCount",
+                        "contextTaxonId",
+                        "contextLabel",
+                    ],
+                )
+            except (OSError, ValueError):
+                table = None
+            if table is not None and table.num_rows:
+                try:
+                    variable_col = pc.cast(table["variable"], pa.string())
+                except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError):
+                    variable_col = table["variable"]
+                variable_mask = pc.equal(variable_col, variable_id)
+                filtered = table.filter(variable_mask).combine_chunks()
+                if filtered.num_rows:
+                    results: list[dict[str, Any]] = []
+                    for entry in filtered.to_pylist():
+                        metric_name = str(entry.get("metric") or "")
+                        if metric_name not in relative_rank_metrics:
+                            continue
+                        count = entry.get("count")
+                        position = entry.get("position")
+                        if count is None or count <= 0 or position is None:
+                            continue
+                        percentile = position / max(count - 1, 1) if count > 1 else 0.0
+                        ancestor_label = entry.get("contextLabel")
+                        ancestor_taxon_id = entry.get("contextTaxonId")
+                        results.append(
+                            {
+                                "metric": metric_name,
+                                "context": ancestor_label,
+                                "label": ancestor_label,
+                                "rank": target_rank,
+                                "ancestorTaxonId": ancestor_taxon_id,
+                                "count": int(count),
+                                "position": int(position) + 1,
+                                "percentile": percentile,
+                                "sampleCount": (
+                                    int(entry.get("sampleCount"))
+                                    if entry.get("sampleCount") is not None
+                                    else None
+                                ),
+                            }
+                        )
+                    return results
     results: list[dict[str, Any]] = []
     for ancestor in contexts:
         ancestor_rank = taxa_navigation.canonical_rank(ancestor["rank"]) or ""
@@ -1082,11 +1274,13 @@ def child_relative_rankings(
         return [], None
 
     allowed_taxa: Optional[frozenset[int]] = None
+    allowed_counts: Optional[dict[int, int]] = None
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        membership = gis_lookup.location_taxa_membership()
-        allowed_taxa = membership.get((scope, target))
+        counts_map = gis_lookup.location_taxa_counts()
+        allowed_counts = counts_map.get((scope, target))
+        allowed_taxa = frozenset(allowed_counts.keys()) if allowed_counts else None
         if not allowed_taxa:
             return [], None
 
@@ -1163,6 +1357,15 @@ def child_relative_rankings(
             "metric": metric,
             "variable": layer,
         }
+        if allowed_counts is not None and taxon_id is not None:
+            location_count = allowed_counts.get(taxon_id)
+            if location_count is not None:
+                record["locationSampleCount"] = int(location_count)
+                record["location_sample_count"] = int(location_count)
+                record["overallSampleCount"] = record.get("sampleCount")
+                record["overall_sample_count"] = record.get("sampleCount")
+                record["sampleCount"] = int(location_count)
+                record["sample_count"] = int(location_count)
         if media_record:
             record["image_url"] = media_record.get("url")
             record["image_license"] = media_record.get("license")

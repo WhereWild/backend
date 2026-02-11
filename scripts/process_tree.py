@@ -168,6 +168,7 @@ def compute_relative_ranks(root_taxon_id: str) -> None:
         try:
             indexing.build_descendant_catalogs_for_ancestor(node["taxon_key"])
             indexing.build_rank_indexes_for_ancestor(node["taxon_key"])
+            indexing.build_relative_rank_positions_for_taxon(node)
             print(
                 "built descendant catalogs and rank indexes for "
                 f"{node['scientific_name']}"

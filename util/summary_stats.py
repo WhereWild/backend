@@ -722,11 +722,17 @@ def load_categorical_distribution(
                 except (ValueError, IndexError):
                     class_id = None
         class_name = legend_entry.get("name") if legend_entry else _format_category_label(key)
+        short_name = legend_entry.get("short_name") if legend_entry else None
+        group = legend_entry.get("group") if legend_entry else None
+        group_label = legend_entry.get("group_label") if legend_entry else None
         description = legend_entry.get("description") if legend_entry else None
         distribution.append(
             {
                 "value": class_id if class_id is not None else key,
                 "class_name": class_name,
+                "short_name": short_name,
+                "group": group,
+                "group_label": group_label,
                 "description": description,
                 "fraction": numeric_value,
                 "slug": slug,

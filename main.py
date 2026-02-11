@@ -117,6 +117,12 @@ def get_species_detail(taxon_id: int) -> dict[str, Any]:
             status_code=404,
             detail=f"Species with taxon_id {taxon_id} not found",
         )
+    try:
+        from util import descriptions
+
+        payload["description"] = descriptions.build_taxon_description(taxon)
+    except Exception:
+        pass
     return payload
 
 
@@ -204,6 +210,16 @@ def species_environment_stats(
     if not taxon_dir.exists():
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     location_gid = location.strip() if location else None
+    location_sample_count: int | None = None
+    if location_gid:
+        try:
+            _column, scope, target = gis_lookup.location_lookup_for_gid(location_gid)
+            counts_map = gis_lookup.location_taxa_counts()
+            per_taxon = counts_map.get((scope, target))
+            if per_taxon:
+                location_sample_count = per_taxon.get(int(taxon_id)) if taxon_id is not None else None
+        except Exception:
+            location_sample_count = None
     value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
     forced_categorical = variable_id.lower() in forced_categorical_variables
     categorical_payload = None
@@ -301,6 +317,9 @@ def species_environment_stats(
             "relativeRanks": ranks,
             "relative_ranks": ranks,
         }
+        if location_sample_count is not None:
+            response["locationSampleCount"] = location_sample_count
+            response["location_sample_count"] = location_sample_count
         return response
 
     samples = summary_stats.gather_numeric_records(
@@ -363,6 +382,9 @@ def species_environment_stats(
         "relativeRanks": ranks,
         "relative_ranks": ranks,
     }
+    if location_sample_count is not None:
+        response["locationSampleCount"] = location_sample_count
+        response["location_sample_count"] = location_sample_count
     return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
 

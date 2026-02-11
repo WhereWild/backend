@@ -141,6 +141,9 @@ def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
         data = {
             "id": class_id,
             "name": name,
+            "short_name": entry.get("short_name"),
+            "group": entry.get("group"),
+            "group_label": entry.get("group_label"),
             "description": entry.get("description"),
         }
         mapping[str(class_id)] = data
@@ -257,6 +260,47 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
             continue
         mapping[(str(scope), str(gid))].add(numeric_id)
     return {key: frozenset(value) for key, value in mapping.items()}
+
+
+@lru_cache(maxsize=1)
+def location_taxa_counts() -> Dict[tuple[str, str], dict[int, int]]:
+    """Returns a dict mapping gids at certain scopes to counts of occurrences per taxon.
+
+    If the count column is missing in the location catalog, each row defaults to 1.
+    """
+    if not CONFIG.location_catalog_path.exists():
+        return {}
+    try:
+        schema = pq.read_schema(CONFIG.location_catalog_path)
+    except Exception:
+        return {}
+    column_names = ["scope", "gid", "taxon_id"]
+    has_count = "count" in schema.names
+    if has_count:
+        column_names.append("count")
+    try:
+        table = pq.read_table(CONFIG.location_catalog_path, columns=column_names).combine_chunks()
+    except Exception:
+        return {}
+    scopes = table.column("scope").to_pylist()
+    gids = table.column("gid").to_pylist()
+    taxon_ids = table.column("taxon_id").to_pylist()
+    counts = table.column("count").to_pylist() if has_count else [1] * len(scopes)
+    mapping: dict[tuple[str, str], dict[int, int]] = defaultdict(dict)
+    for scope, gid, taxon_id, count in zip(scopes, gids, taxon_ids, counts):
+        if not scope or not gid:
+            continue
+        try:
+            numeric_id = int(taxon_id)
+            numeric_count = int(count) if count is not None else 1
+        except (TypeError, ValueError):
+            continue
+        if numeric_count <= 0:
+            continue
+        key = (str(scope), str(gid))
+        per_taxon = mapping[key]
+        per_taxon[numeric_id] = per_taxon.get(numeric_id, 0) + numeric_count
+    return mapping
 
 
 def resolve_location_context(

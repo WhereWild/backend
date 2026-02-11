@@ -173,13 +173,13 @@ def _iter_taxa_with_occurrences() -> Iterable[tuple[int, Path]]:
             yield taxon_id, parquet_path
 
 
-def _collect_gids(parquet_path: Path) -> dict[str, set[str]]:
+def _collect_gids(parquet_path: Path) -> dict[str, dict[str, int]]:
     location_columns = list(CONFIG.location_columns)
     gbif_column = (gbif_column_name, gbif_scope_name)
-    per_scope: dict[str, set[str]] = {
-        scope: set() for _, scope in location_columns
+    per_scope: dict[str, dict[str, int]] = {
+        scope: {} for _, scope in location_columns
     }
-    per_scope[gbif_column[1]] = set()
+    per_scope[gbif_column[1]] = {}
     column_defs = location_columns + [gbif_column]
     column_names = [name for name, _ in column_defs]
     pf = pq.ParquetFile(parquet_path)
@@ -192,22 +192,25 @@ def _collect_gids(parquet_path: Path) -> dict[str, set[str]]:
                 continue
             for value in column.to_pylist():
                 if value and isinstance(value, str):
-                    per_scope[scope].add(value)
+                    per_scope[scope][value] = per_scope[scope].get(value, 0) + 1
     return per_scope
 
 
 def _build_location_catalog() -> None:
     output_path = CONFIG.location_catalog_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    location_membership: dict[tuple[str, str], set[int]] = defaultdict(set)
+    location_membership: dict[tuple[str, str], dict[int, int]] = defaultdict(dict)
 
     for idx, (taxon_id, parquet_path) in enumerate(
         _iter_taxa_with_occurrences(), start=1
     ):
         per_scope = _collect_gids(parquet_path)
         for scope, gids in per_scope.items():
-            for gid in gids:
-                location_membership[(scope, gid)].add(taxon_id)
+            for gid, count in gids.items():
+                if count <= 0:
+                    continue
+                taxon_counts = location_membership[(scope, gid)]
+                taxon_counts[taxon_id] = taxon_counts.get(taxon_id, 0) + count
         if idx % location_progress_interval == 0:
             print(f"Processed {idx} taxa…")
 
@@ -218,17 +221,20 @@ def _build_location_catalog() -> None:
     rows_scope: list[str] = []
     rows_gid: list[str] = []
     rows_taxon: list[int] = []
+    rows_count: list[int] = []
     for (scope, gid), taxa in location_membership.items():
         for taxon_id in sorted(taxa):
             rows_scope.append(scope)
             rows_gid.append(gid)
             rows_taxon.append(taxon_id)
+            rows_count.append(int(taxa[taxon_id]))
 
     table = pa.Table.from_pydict(
         {
             "scope": pa.array(rows_scope, type=pa.string()),
             "gid": pa.array(rows_gid, type=pa.string()),
             "taxon_id": pa.array(rows_taxon, type=pa.int64()),
+            "count": pa.array(rows_count, type=pa.int64()),
         }
     )
     pq.write_table(table, output_path)
