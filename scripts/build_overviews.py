@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Iterable
 import os
 import subprocess
+import math
 
 import rasterio
-from rasterio.enums import Resampling
 
 from util.config import load_config
 from util import gis_lookup
@@ -23,6 +23,9 @@ CONFIG = load_config("global")
 
 FORCE_REBUILD_CATEGORICAL = True
 FORCED_CATEGORICAL = {"landcover", "koppen_geiger"}
+TARGET_MIN_ZOOM = 3
+TARGET_TILE_SIZE = CONFIG.sdm_tile_size
+MAX_OVERVIEW_FACTOR = 2048
 
 
 def _iter_tifs(root: Path) -> Iterable[Path]:
@@ -63,23 +66,86 @@ def _build_cog(
     dst_path: Path,
     *,
     categorical: bool,
+    overview_factors: list[int],
 ) -> None:
-    resampling = "NEAREST" if categorical else "AVERAGE"
-    cmd = [
-        "gdal_translate",
-        "-of",
-        "COG",
-        "-co",
-        "COMPRESS=DEFLATE",
-        "-co",
-        "BIGTIFF=IF_SAFER",
-        "-co",
-        "OVERVIEWS=AUTO",
-        "-co",
-        f"OVERVIEW_RESAMPLING={resampling}",
-    ]
-    cmd.extend([str(src_path), str(dst_path)])
-    subprocess.run(cmd, check=True)
+    resampling = "nearest" if categorical else "average"
+    base_tif = dst_path.with_suffix(dst_path.suffix + ".base.tif")
+    try:
+        # Build a regular tiled GTiff first so gdaladdo can safely write overviews.
+        base_cmd = [
+            "gdal_translate",
+            "-of",
+            "GTiff",
+            "-co",
+            "TILED=YES",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "BIGTIFF=IF_SAFER",
+            str(src_path),
+            str(base_tif),
+        ]
+        subprocess.run(base_cmd, check=True)
+
+        if overview_factors:
+            addo_cmd = [
+                "gdaladdo",
+                "-r",
+                resampling,
+                str(base_tif),
+                *[str(value) for value in overview_factors],
+            ]
+            subprocess.run(addo_cmd, check=True)
+
+        # Convert to final COG and force using existing overviews from base GTiff.
+        cog_cmd = [
+            "gdal_translate",
+            "-of",
+            "COG",
+            "-co",
+            "COMPRESS=DEFLATE",
+            "-co",
+            "BIGTIFF=IF_SAFER",
+            "-co",
+            "OVERVIEWS=FORCE_USE_EXISTING",
+            "-co",
+            f"OVERVIEW_RESAMPLING={resampling.upper()}",
+            str(base_tif),
+            str(dst_path),
+        ]
+        subprocess.run(cog_cmd, check=True)
+    finally:
+        if base_tif.exists():
+            base_tif.unlink()
+
+
+def _target_dst_res_degrees() -> float:
+    return 360.0 / ((2**TARGET_MIN_ZOOM) * TARGET_TILE_SIZE)
+
+
+def _next_power_of_two(value: float) -> int:
+    if value <= 1:
+        return 1
+    return 1 << math.ceil(math.log2(value))
+
+
+def _overview_factors_for_dataset(ds: rasterio.DatasetReader) -> list[int]:
+    src_res_x = abs(ds.transform.a) if ds.transform else 0.0
+    src_res_y = abs(ds.transform.e) if ds.transform else 0.0
+    if not src_res_x or not src_res_y or not math.isfinite(src_res_x) or not math.isfinite(src_res_y):
+        return []
+    dst_res = _target_dst_res_degrees()
+    desired = max(dst_res / src_res_x, dst_res / src_res_y)
+    if not math.isfinite(desired) or desired <= 1:
+        return []
+    target = min(_next_power_of_two(desired), MAX_OVERVIEW_FACTOR)
+    min_dim = int(min(ds.width, ds.height))
+    factors: list[int] = []
+    factor = 2
+    while factor <= target and factor < min_dim:
+        factors.append(factor)
+        factor *= 2
+    return factors
 
 
 def main() -> None:
@@ -100,16 +166,33 @@ def main() -> None:
             categorical = _is_categorical(layer_id, meta)
             with rasterio.open(path) as ds:
                 existing = ds.overviews(1) or []
-                if existing and not (categorical and FORCE_REBUILD_CATEGORICAL):
+                desired_factors = _overview_factors_for_dataset(ds)
+                needs_more = bool(desired_factors) and (
+                    not existing or max(existing) < max(desired_factors)
+                )
+                if (
+                    existing
+                    and not needs_more
+                    and not (categorical and FORCE_REBUILD_CATEGORICAL)
+                ):
                     skipped += 1
                     if skipped % 500 == 0:
                         print(f"[overview] skipped {skipped} files (already have overviews)")
                     continue
                 if existing and categorical and FORCE_REBUILD_CATEGORICAL:
                     print(f"[overview] forcing categorical rebuild for {path.name}")
+                if needs_more:
+                    print(
+                        f"[overview] upgrading {path.name} existing={existing} target={desired_factors}",
+                    )
 
             tmp_path = path.with_suffix(path.suffix + ".tmp")
-            _build_cog(path, tmp_path, categorical=categorical)
+            _build_cog(
+                path,
+                tmp_path,
+                categorical=categorical,
+                overview_factors=desired_factors,
+            )
             os.replace(tmp_path, path)
             updated += 1
             if updated % 100 == 0:
