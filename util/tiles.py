@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from collections import OrderedDict
 from contextlib import nullcontext
+import logging
 import math
+import os
 import threading
 import time
 from typing import Iterable, Sequence
@@ -22,6 +24,54 @@ from util import gis_lookup, models
 
 CONFIG = load_config("global")
 
+# --- Debug logging setup ---
+_TILE_DEBUG_LOG_PATH = os.environ.get("TILE_DEBUG_LOG", "/workspace/logs/tile_debug.log")
+os.makedirs(os.path.dirname(_TILE_DEBUG_LOG_PATH), exist_ok=True)
+_tile_logger = logging.getLogger("tile_debug")
+_tile_logger.setLevel(logging.DEBUG)
+_tile_logger.propagate = False
+if not _tile_logger.handlers:
+    _fh = logging.FileHandler(_TILE_DEBUG_LOG_PATH, mode="a")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    _tile_logger.addHandler(_fh)
+    # Also print to stdout
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(logging.Formatter("%(message)s"))
+    _tile_logger.addHandler(_sh)
+
+
+def _debug(msg: str) -> None:
+    """Log debug message to file and stdout."""
+    _tile_logger.debug(msg)
+
+
+# Set to a layer name to only log that layer's details (reduces noise)
+# Set to None or "" to log all layers
+_DEBUG_LAYER_FILTER = os.environ.get("TILE_DEBUG_LAYER", "elevation")
+
+# Set to "verbose" for full detail, "summary" for just per-tile summaries, "off" to disable
+_DEBUG_VERBOSITY = os.environ.get("TILE_DEBUG_VERBOSITY", "summary")
+
+
+def clear_tile_debug_log() -> None:
+    """Clear the tile debug log file. Call at the start of a session."""
+    with open(_TILE_DEBUG_LOG_PATH, "w") as f:
+        f.write(f"=== Tile Debug Log Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        f.write(f"Log path: {_TILE_DEBUG_LOG_PATH}\n")
+        f.write(f"Layer filter: {_DEBUG_LAYER_FILTER or 'ALL LAYERS'}\n")
+        f.write(f"Verbosity: {_DEBUG_VERBOSITY}\n")
+        f.write("=" * 80 + "\n\n")
+
+
+def _is_verbose() -> bool:
+    return _DEBUG_VERBOSITY == "verbose"
+
+
+# Log startup info
+if _DEBUG_VERBOSITY != "off":
+    _debug(f"Tile debug logging initialized. Log file: {_TILE_DEBUG_LOG_PATH}")
+    _debug(f"Layer filter: {_DEBUG_LAYER_FILTER or 'ALL LAYERS'}, Verbosity: {_DEBUG_VERBOSITY}")
+
 WEB_MERCATOR = "EPSG:3857"
 DEFAULT_TILE_SIZE = CONFIG.sdm_tile_size
 DEFAULT_MAX_OPEN_DATASETS = 16
@@ -38,23 +88,23 @@ class TileSpec:
 
 
 class DatasetCache:
+    """Thread-safe cache for rasterio datasets.
+
+    NOTE: Rasterio DatasetReader objects are NOT thread-safe for concurrent reads.
+    This cache now opens a NEW dataset for each call to avoid corruption.
+    Caching is disabled for thread safety - each thread gets its own handle.
+    """
     def __init__(self, max_open: int = DEFAULT_MAX_OPEN_DATASETS) -> None:
         self._max_open = max_open
         self._lock = threading.Lock()
+        # For now, disable caching to ensure thread safety
+        # Each call opens a fresh dataset
         self._cache: OrderedDict[str, rasterio.DatasetReader] = OrderedDict()
 
     def open(self, path: str) -> rasterio.DatasetReader:
-        with self._lock:
-            existing = self._cache.get(path)
-            if existing is not None:
-                self._cache.move_to_end(path)
-                return existing
-            ds = rasterio.open(path)
-            self._cache[path] = ds
-            if len(self._cache) > self._max_open:
-                old_path, old_ds = self._cache.popitem(last=False)
-                old_ds.close()
-            return ds
+        # THREAD SAFETY: Always open a new dataset to avoid concurrent read issues
+        # The caller is responsible for closing it (or use context manager)
+        return rasterio.open(path)
 
     def close_all(self) -> None:
         with self._lock:
@@ -222,6 +272,7 @@ def _render_layer(
 ) -> np.ndarray:
     layer_start = time.perf_counter()
     bounds_wgs84 = tile_bounds_wgs84(spec)
+    bounds_mercator = tile_bounds_mercator(spec)
     region_size = float(layer_meta.get("region_size") or 10.0) if layer_meta else 10.0
     if reproject_to_mercator:
         transform = tile_transform(spec)
@@ -230,6 +281,19 @@ def _render_layer(
         min_lon, min_lat, max_lon, max_lat = bounds_wgs84
         transform = from_bounds(min_lon, min_lat, max_lon, max_lat, spec.tile_size, spec.tile_size)
         dst_crs = "EPSG:4326"
+
+    # Only log detailed info for filtered layer (or all if filter is None/empty)
+    should_log = (not _DEBUG_LAYER_FILTER or layer_id == _DEBUG_LAYER_FILTER) and _DEBUG_VERBOSITY != "off"
+    verbose = should_log and _is_verbose()
+
+    if verbose:
+        _debug(f"[tile_debug] layer={layer_id} z={spec.z} x={spec.x} y={spec.y} tile_size={spec.tile_size}")
+        _debug(f"[tile_debug] bounds_wgs84=({bounds_wgs84[0]:.6f}, {bounds_wgs84[1]:.6f}, {bounds_wgs84[2]:.6f}, {bounds_wgs84[3]:.6f})")
+        _debug(f"[tile_debug] bounds_mercator=({bounds_mercator[0]:.2f}, {bounds_mercator[1]:.2f}, {bounds_mercator[2]:.2f}, {bounds_mercator[3]:.2f})")
+        _debug(f"[tile_debug] dst_transform={transform} dst_crs={dst_crs} reproject_to_mercator={reproject_to_mercator}")
+
+    # Track overview factors used across regions for summary
+    overview_factors_used: set[int] = set()
     resampling = Resampling.nearest if _is_layer_categorical(layer_id, layer_meta) else Resampling.bilinear
     dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
     logged_overview = False
@@ -249,7 +313,8 @@ def _render_layer(
         if cog_path is None or not cog_path.exists():
             continue
         regions_with_data += 1
-        ds = _DATASET_CACHE.open(cog_path.as_posix())
+        # Note: Opening fresh each time for thread safety (no caching)
+        ds = rasterio.open(cog_path.as_posix())
         overviews, src_res_x, src_res_y, desired, dst_res = _estimate_overview_factor(
             ds, bounds_wgs84, spec.tile_size
         )
@@ -289,28 +354,39 @@ def _render_layer(
         if src_h <= 0 or src_w <= 0:
             continue
         overview_factor = max(1, int(chosen_factor or 1))
+        overview_factors_used.add(overview_factor)
         if (
             not reproject_to_mercator
             and ds.crs
             and str(ds.crs) in ("EPSG:4326", "OGC:CRS84")
         ):
             # Fast path: avoid warp when output remains WGS84.
-            dst_window = _clamp_window(
-                window_from_bounds(
-                    *overlap,
-                    transform=transform,
-                ),
-                spec.tile_size,
-                spec.tile_size,
-            )
+            raw_dst_window = window_from_bounds(*overlap, transform=transform)
+            dst_window = _clamp_window(raw_dst_window, spec.tile_size, spec.tile_size)
             dst_h, dst_w = _window_shape(dst_window)
+
+            # Debug: log window geometry
+            if verbose:
+                _debug(f"[tile_debug] FAST_PATH region={region_id} overlap=({overlap[0]:.6f}, {overlap[1]:.6f}, {overlap[2]:.6f}, {overlap[3]:.6f})")
+                _debug(f"[tile_debug] FAST_PATH src_window: col_off={src_window.col_off:.2f} row_off={src_window.row_off:.2f} width={src_window.width:.2f} height={src_window.height:.2f} -> src_w={src_w} src_h={src_h}")
+                _debug(f"[tile_debug] FAST_PATH raw_dst_window: col_off={raw_dst_window.col_off:.2f} row_off={raw_dst_window.row_off:.2f} width={raw_dst_window.width:.2f} height={raw_dst_window.height:.2f}")
+                _debug(f"[tile_debug] FAST_PATH clamped_dst_window: col_off={dst_window.col_off} row_off={dst_window.row_off} width={dst_window.width} height={dst_window.height} -> dst_w={dst_w} dst_h={dst_h}")
+
             if dst_h <= 0 or dst_w <= 0:
+                if verbose:
+                    _debug(f"[tile_debug] FAST_PATH SKIPPING region={region_id} - zero dst dimensions")
                 continue
             read_h = max(1, int(math.ceil(src_h / overview_factor)))
             read_w = max(1, int(math.ceil(src_w / overview_factor)))
             dst_pixels_requested += dst_h * dst_w
             env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
             read_start = time.perf_counter()
+
+            # BUG: Reading twice - coarse_tile is never used except for counting!
+            # The second read ignores overview_factor and reads at dst_h x dst_w directly
+            if verbose:
+                _debug(f"[tile_debug] FAST_PATH reading: overview_factor={overview_factor} read_h={read_h} read_w={read_w} BUT ALSO reading at dst_h={dst_h} dst_w={dst_w}")
+
             with env_ctx:
                 coarse_tile = ds.read(
                     1,
@@ -326,20 +402,42 @@ def _render_layer(
                 ).astype(np.float32, copy=False)
             read_seconds += time.perf_counter() - read_start
             src_pixels_read += coarse_tile.shape[0] * coarse_tile.shape[1]
+
+            # Log actual data stats
+            if verbose:
+                _debug(f"[tile_debug] FAST_PATH tile_stats: shape={tile.shape} min={np.nanmin(tile):.2f} max={np.nanmax(tile):.2f} nan_count={np.isnan(tile).sum()} nodata={ds.nodata}")
+
             if ds.nodata is not None:
                 tile[tile == ds.nodata] = np.nan
             row0 = int(dst_window.row_off)
             col0 = int(dst_window.col_off)
             row1 = row0 + dst_h
             col1 = col0 + dst_w
+
+            if verbose:
+                _debug(f"[tile_debug] FAST_PATH placement: row0={row0} row1={row1} col0={col0} col1={col1} dest_section_shape=({row1-row0}, {col1-col0}) tile_shape={tile.shape}")
+
+            # Check for shape mismatch - always log this as it's an error
+            if (row1 - row0) != tile.shape[0] or (col1 - col0) != tile.shape[1]:
+                _debug(f"[tile_debug] FAST_PATH WARNING: SHAPE MISMATCH! layer={layer_id} dest_section=({row1-row0}, {col1-col0}) vs tile={tile.shape}")
+
             section = dest[row0:row1, col0:col1]
             mask = np.isfinite(tile)
             section[mask] = tile[mask]
             pixels_written += int(mask.sum())
             regions_rendered += 1
         else:
+            # Warp path: reproject to mercator or handle non-WGS84 source
+            if verbose:
+                _debug(f"[tile_debug] WARP_PATH region={region_id} overlap=({overlap[0]:.6f}, {overlap[1]:.6f}, {overlap[2]:.6f}, {overlap[3]:.6f})")
+                _debug(f"[tile_debug] WARP_PATH src_window: col_off={src_window.col_off:.2f} row_off={src_window.row_off:.2f} width={src_window.width:.2f} height={src_window.height:.2f}")
+                _debug(f"[tile_debug] WARP_PATH ds.crs={ds.crs} ds.transform={ds.transform}")
+
             read_h = max(1, int(math.ceil(src_h / overview_factor)))
             read_w = max(1, int(math.ceil(src_w / overview_factor)))
+            if verbose:
+                _debug(f"[tile_debug] WARP_PATH reading: overview_factor={overview_factor} src_h={src_h} src_w={src_w} -> read_h={read_h} read_w={read_w}")
+
             env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
             read_start = time.perf_counter()
             with env_ctx:
@@ -351,12 +449,19 @@ def _render_layer(
                 ).astype(np.float32, copy=False)
             read_seconds += time.perf_counter() - read_start
             src_pixels_read += source_tile.shape[0] * source_tile.shape[1]
+
+            if verbose:
+                _debug(f"[tile_debug] WARP_PATH source_tile_stats: shape={source_tile.shape} min={np.nanmin(source_tile):.2f} max={np.nanmax(source_tile):.2f} nan_count={np.isnan(source_tile).sum()}")
+
             if ds.nodata is not None:
                 source_tile[source_tile == ds.nodata] = np.nan
             src_transform = window_transform(src_window, ds.transform) * rasterio.Affine.scale(
                 src_w / read_w,
                 src_h / read_h,
             )
+            if verbose:
+                _debug(f"[tile_debug] WARP_PATH src_transform={src_transform} dst_transform={transform}")
+
             temp = np.full_like(dest, np.nan)
             warp_start = time.perf_counter()
             reproject(
@@ -371,6 +476,10 @@ def _render_layer(
                 resampling=resampling,
             )
             warp_seconds += time.perf_counter() - warp_start
+
+            if verbose:
+                _debug(f"[tile_debug] WARP_PATH warped_stats: min={np.nanmin(temp):.2f} max={np.nanmax(temp):.2f} nan_count={np.isnan(temp).sum()} finite_count={np.isfinite(temp).sum()}")
+
             dst_pixels_requested += spec.tile_size * spec.tile_size
             mask = np.isfinite(temp)
             dest[mask] = temp[mask]
@@ -378,42 +487,190 @@ def _render_layer(
             regions_rendered += 1
         region_render_seconds += time.perf_counter() - region_start
     total_seconds = time.perf_counter() - layer_start
-    print(
-        f"[sdm_tile] layer={layer_id} timings total={total_seconds:.2f}s render={region_render_seconds:.2f}s "
-        f"read={read_seconds:.2f}s warp={warp_seconds:.2f}s "
-        f"regions={regions_rendered}/{regions_with_data}/{total_regions} "
-        f"src_px_read={src_pixels_read:,} dst_px={dst_pixels_requested:,} written_px={pixels_written:,} "
-        f"mode={'warp' if reproject_to_mercator else 'wgs84_direct'}",
-        flush=True,
-    )
+
+    # Final dest stats - always log summary line for filtered layer
+    if should_log:
+        finite_mask = np.isfinite(dest)
+        overview_factors_str = ",".join(str(f) for f in sorted(overview_factors_used))
+        finite_count = int(finite_mask.sum())
+
+        # Compact summary line - easy to grep
+        _debug(
+            f"[LAYER_SUMMARY] layer={layer_id} z={spec.z} x={spec.x} y={spec.y} "
+            f"regions={regions_rendered}/{total_regions} overview_factors=[{overview_factors_str}] "
+            f"finite_px={finite_count}/{spec.tile_size**2} "
+            f"mode={'warp' if reproject_to_mercator else 'direct'}"
+        )
+
+        # Flag potential issues
+        if len(overview_factors_used) > 1:
+            _debug(f"[WARNING] MIXED_OVERVIEW_FACTORS layer={layer_id} z={spec.z} x={spec.x} y={spec.y} factors={overview_factors_str}")
+
+        if finite_count == 0:
+            _debug(f"[WARNING] NO_DATA layer={layer_id} z={spec.z} x={spec.x} y={spec.y} - tile has no finite values")
+
+        if verbose:
+            if finite_mask.any():
+                _debug(f"[tile_debug] FINAL dest_values: min={np.nanmin(dest):.4f} max={np.nanmax(dest):.4f} mean={np.nanmean(dest):.4f}")
+            _debug(
+                f"[sdm_tile] layer={layer_id} timings total={total_seconds:.2f}s render={region_render_seconds:.2f}s "
+                f"read={read_seconds:.2f}s warp={warp_seconds:.2f}s "
+                f"src_px_read={src_pixels_read:,} dst_px={dst_pixels_requested:,} written_px={pixels_written:,}"
+            )
     return dest
 
 
-def _colorize(values: np.ndarray, *, alpha_scale: float = 0.85) -> np.ndarray:
+def _colorize(
+    values: np.ndarray,
+    *,
+    alpha_min: float = 0.7,
+    alpha_max: float = 0.95,
+    colormap: str = "terrain",
+) -> np.ndarray:
+    """Colorize normalized [0,1] values to RGBA.
+
+    Args:
+        values: Array of values in [0, 1] range
+        alpha_min: Minimum alpha (for lowest values)
+        alpha_max: Maximum alpha (for highest values)
+        colormap: "terrain" for elevation, "heat" for predictions
+    """
     v = np.clip(values, 0.0, 1.0)
-    stops = np.array(
-        [
-            [28, 38, 102],
-            [34, 94, 168],
-            [59, 170, 165],
-            [246, 190, 0],
-            [230, 57, 70],
-        ],
-        dtype=np.float32,
-    )
+
+    if colormap == "terrain":
+        # Terrain colormap: green lowlands → yellow/tan hills → brown mountains → white peaks
+        stops = np.array(
+            [
+                [34, 139, 34],    # Forest green (low elevation)
+                [144, 238, 144],  # Light green
+                [238, 214, 175],  # Tan/wheat
+                [139, 90, 43],    # Brown (mountains)
+                [255, 255, 255],  # White (peaks/snow)
+            ],
+            dtype=np.float32,
+        )
+    else:
+        # Original heat colormap for predictions
+        stops = np.array(
+            [
+                [28, 38, 102],    # Dark blue
+                [34, 94, 168],    # Blue
+                [59, 170, 165],   # Cyan
+                [246, 190, 0],    # Yellow
+                [230, 57, 70],    # Red
+            ],
+            dtype=np.float32,
+        )
+
+    # Track NaN pixels before clipping (they should be transparent)
+    nan_mask = ~np.isfinite(values)
+
     idx = (v * (len(stops) - 1)).astype(np.int32)
     frac = (v * (len(stops) - 1)) - idx
     idx = np.clip(idx, 0, len(stops) - 2)
     frac = frac[..., None]
     rgb = stops[idx] * (1.0 - frac) + stops[idx + 1] * frac
-    alpha = (v * 255.0 * alpha_scale).astype(np.uint8)
+
     rgba = np.zeros((*v.shape, 4), dtype=np.uint8)
     rgba[..., :3] = np.clip(rgb, 0, 255).astype(np.uint8)
-    rgba[..., 3] = alpha
+    rgba[..., 3] = 255  # Fully opaque
+    # Make NaN pixels transparent
+    rgba[nan_mask, 3] = 0
     return rgba
 
 
-@lru_cache(maxsize=256)
+_tile_request_counter = 0
+_tile_request_lock = threading.Lock()
+
+
+# TEMPORARILY DISABLED for debugging - uncomment to re-enable caching
+# @lru_cache(maxsize=256)
+def _render_tile_png_impl(
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str,
+    layers_key: tuple[str, ...],
+    tile_size: int,
+    reproject_to_mercator: bool,
+) -> bytes:
+    global _tile_request_counter
+    with _tile_request_lock:
+        _tile_request_counter += 1
+        request_id = _tile_request_counter
+
+    if _DEBUG_VERBOSITY != "off":
+        _debug(f"[TILE_REQUEST #{request_id}] z={z} x={x} y={y} reproject={reproject_to_mercator}")
+
+    try:
+        return _render_tile_png_impl_inner(
+            taxon_id, z, x, y, model_id, layers_key, tile_size, reproject_to_mercator, request_id
+        )
+    except Exception as e:
+        _debug(f"[ERROR] TILE_REQUEST #{request_id} z={z} x={x} y={y} FAILED: {type(e).__name__}: {e}")
+        import traceback
+        _debug(f"[ERROR] Traceback:\n{traceback.format_exc()}")
+        raise
+
+
+def _render_tile_png_impl_inner(
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str,
+    layers_key: tuple[str, ...],
+    tile_size: int,
+    reproject_to_mercator: bool,
+    request_id: int,
+) -> bytes:
+
+    # Log adjacent tile bounds for shearing diagnosis (only in verbose mode)
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    if _is_verbose():
+        spec_left = TileSpec(z=z, x=x-1, y=y, tile_size=tile_size) if x > 0 else None
+        spec_up = TileSpec(z=z, x=x, y=y-1, tile_size=tile_size) if y > 0 else None
+
+        bounds = tile_bounds_wgs84(spec)
+        _debug(f"[TILE_REQUEST #{request_id}] bounds: W={bounds[0]:.6f} S={bounds[1]:.6f} E={bounds[2]:.6f} N={bounds[3]:.6f}")
+
+        if spec_left:
+            left_bounds = tile_bounds_wgs84(spec_left)
+            edge_match = abs(left_bounds[2] - bounds[0]) < 1e-9
+            if not edge_match:
+                _debug(f"[WARNING] EDGE_MISMATCH left tile x={x-1} E={left_bounds[2]:.6f} vs this W={bounds[0]:.6f}")
+
+        if spec_up:
+            up_bounds = tile_bounds_wgs84(spec_up)
+            edge_match = abs(up_bounds[1] - bounds[3]) < 1e-9
+            if not edge_match:
+                _debug(f"[WARNING] EDGE_MISMATCH up tile y={y-1} S={up_bounds[1]:.6f} vs this N={bounds[3]:.6f}")
+
+    layer_lookup = gis_lookup.load_layer_metadata()
+    stack = np.empty((tile_size, tile_size, len(layers_key)), dtype=np.float32)
+    for idx, layer_id in enumerate(layers_key):
+        if _is_verbose() and (idx == 0 or idx == len(layers_key) - 1 or idx % 5 == 0):
+            _debug(f"[sdm_tile] rendering layer {idx + 1}/{len(layers_key)} {layer_id}")
+        stack[:, :, idx] = _render_layer(
+            layer_id,
+            spec,
+            layer_lookup.get(layer_id),
+            reproject_to_mercator=reproject_to_mercator,
+        )
+    preds = models.predict(model_id, stack)
+    if _is_verbose():
+        _debug(f"[TILE_REQUEST #{request_id}] predictions: min={np.nanmin(preds):.4f} max={np.nanmax(preds):.4f} nan_count={np.isnan(preds).sum()}")
+    rgba = _colorize(preds)
+    from PIL import Image
+    import io
+
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def render_tile_png(
     taxon_id: int,
     z: int,
@@ -424,30 +681,27 @@ def render_tile_png(
     tile_size: int,
     reproject_to_mercator: bool,
 ) -> bytes:
-    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
-    layer_lookup = gis_lookup.load_layer_metadata()
-    stack = np.empty((tile_size, tile_size, len(layers_key)), dtype=np.float32)
-    for idx, layer_id in enumerate(layers_key):
-        if idx == 0 or idx == len(layers_key) - 1 or idx % 5 == 0:
-            print(
-                f"[sdm_tile] rendering layer {idx + 1}/{len(layers_key)} {layer_id}",
-                flush=True,
-            )
-        stack[:, :, idx] = _render_layer(
-            layer_id,
-            spec,
-            layer_lookup.get(layer_id),
-            reproject_to_mercator=reproject_to_mercator,
+    """Wrapper to track cache hits/misses."""
+    # Cache tracking disabled while lru_cache is commented out
+    cache_info_fn = getattr(_render_tile_png_impl, "cache_info", None)
+    if cache_info_fn:
+        cache_info_before = cache_info_fn()
+        result = _render_tile_png_impl(
+            taxon_id, z, x, y, model_id, layers_key, tile_size, reproject_to_mercator
         )
-    preds = models.predict(model_id, stack)
-    rgba = _colorize(preds)
-    from PIL import Image
-    import io
+        cache_info_after = cache_info_fn()
+        if cache_info_after.hits > cache_info_before.hits:
+            _debug(f"[CACHE_HIT] z={z} x={x} y={y} (cache size={cache_info_after.currsize})")
+        else:
+            _debug(f"[CACHE_MISS] z={z} x={x} y={y} - rendered fresh (cache size={cache_info_after.currsize})")
+    else:
+        # Cache disabled
+        result = _render_tile_png_impl(
+            taxon_id, z, x, y, model_id, layers_key, tile_size, reproject_to_mercator
+        )
+        _debug(f"[NO_CACHE] z={z} x={x} y={y} - cache disabled")
 
-    image = Image.fromarray(rgba, mode="RGBA")
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    return result
 
 
 def render_tile_bytes(
