@@ -25,6 +25,8 @@ FORCED_CATEGORICAL = {"landcover", "koppen_geiger"}
 TARGET_MIN_ZOOM = 3
 TARGET_TILE_SIZE = CONFIG.sdm_tile_size
 MAX_OVERVIEW_FACTOR = 2048
+OVERVIEW_FACTOR_TOLERANCE_RATIO = 0.03
+OVERVIEW_FACTOR_TOLERANCE_MIN = 2
 
 
 def _iter_tifs(root: Path) -> Iterable[Path]:
@@ -147,6 +149,26 @@ def _overview_factors_for_dataset(ds: rasterio.DatasetReader) -> list[int]:
     return factors
 
 
+def _overview_factor_close(actual: int, target: int) -> bool:
+    tolerance = max(
+        OVERVIEW_FACTOR_TOLERANCE_MIN,
+        int(round(target * OVERVIEW_FACTOR_TOLERANCE_RATIO)),
+    )
+    return abs(actual - target) <= tolerance
+
+
+def _has_required_overviews(existing: list[int], desired: list[int]) -> bool:
+    """Return True when existing overview factors sufficiently match desired factors."""
+    if not desired:
+        return True
+    if not existing:
+        return False
+    for target in desired:
+        if not any(_overview_factor_close(actual, target) for actual in existing):
+            return False
+    return True
+
+
 def main() -> None:
     regions_root = CONFIG.gis_regions_root
     if not regions_root.exists():
@@ -166,9 +188,7 @@ def main() -> None:
             with rasterio.open(path) as ds:
                 existing = ds.overviews(1) or []
                 desired_factors = _overview_factors_for_dataset(ds)
-                needs_more = bool(desired_factors) and (
-                    not existing or max(existing) < max(desired_factors)
-                )
+                needs_more = not _has_required_overviews(existing, desired_factors)
                 if existing and not needs_more:
                     skipped += 1
                     if skipped % 500 == 0:

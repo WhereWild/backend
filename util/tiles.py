@@ -3,14 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from collections import OrderedDict
+from contextlib import nullcontext
 import math
 import threading
+import time
 from typing import Iterable, Sequence
 
 import numpy as np
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject
+from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
 import rasterio
 
 from util.config import load_config
@@ -163,6 +166,53 @@ def _estimate_overview_factor(
     return overviews, src_res_x, src_res_y, desired, max(dst_res_x, dst_res_y)
 
 
+def _choose_overview_level(overviews: list[int], desired: float) -> tuple[int | None, int | None]:
+    """Choose a GDAL overview level index using a performance-first (ceil) strategy."""
+    if not overviews:
+        return None, None
+    # Prefer the first overview that is at least as coarse as desired.
+    for idx, factor in enumerate(overviews):
+        if factor >= desired:
+            return idx, factor
+    # If desired is coarser than every available overview, use the coarsest one.
+    return len(overviews) - 1, overviews[-1]
+
+
+def _intersect_bounds(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    *,
+    ds: rasterio.DatasetReader,
+) -> tuple[float, float, float, float] | None:
+    ds_left, ds_bottom, ds_right, ds_top = ds.bounds
+    x0 = max(left, ds_left)
+    y0 = max(bottom, ds_bottom)
+    x1 = min(right, ds_right)
+    y1 = min(top, ds_top)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _clamp_window(window: Window, width: int, height: int) -> Window:
+    col_off = max(0, int(math.floor(window.col_off)))
+    row_off = max(0, int(math.floor(window.row_off)))
+    col_end = min(width, int(math.ceil(window.col_off + window.width)))
+    row_end = min(height, int(math.ceil(window.row_off + window.height)))
+    return Window(
+        col_off=col_off,
+        row_off=row_off,
+        width=max(0, col_end - col_off),
+        height=max(0, row_end - row_off),
+    )
+
+
+def _window_shape(window: Window) -> tuple[int, int]:
+    return int(window.height), int(window.width)
+
+
 def _render_layer(
     layer_id: str,
     spec: TileSpec,
@@ -170,6 +220,7 @@ def _render_layer(
     *,
     reproject_to_mercator: bool,
 ) -> np.ndarray:
+    layer_start = time.perf_counter()
     bounds_wgs84 = tile_bounds_wgs84(spec)
     region_size = float(layer_meta.get("region_size") or 10.0) if layer_meta else 10.0
     if reproject_to_mercator:
@@ -182,22 +233,33 @@ def _render_layer(
     resampling = Resampling.nearest if _is_layer_categorical(layer_id, layer_meta) else Resampling.bilinear
     dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
     logged_overview = False
+    total_regions = 0
+    regions_with_data = 0
+    regions_rendered = 0
+    region_render_seconds = 0.0
+    read_seconds = 0.0
+    warp_seconds = 0.0
+    src_pixels_read = 0
+    dst_pixels_requested = 0
+    pixels_written = 0
     for lat0, lon0 in _iter_region_origins(bounds_wgs84, region_size):
+        total_regions += 1
         region_id = _region_id_from_origin(lat0, lon0)
         cog_path = gis_lookup.get_cog_path_for_region(layer_id, region_id)
         if cog_path is None or not cog_path.exists():
             continue
+        regions_with_data += 1
         ds = _DATASET_CACHE.open(cog_path.as_posix())
+        overviews, src_res_x, src_res_y, desired, dst_res = _estimate_overview_factor(
+            ds, bounds_wgs84, spec.tile_size
+        )
+        chosen_level, chosen_factor = _choose_overview_level(overviews, desired)
         if not logged_overview:
-            overviews, src_res_x, src_res_y, desired, dst_res = _estimate_overview_factor(
-                ds, bounds_wgs84, spec.tile_size
-            )
             if overviews:
-                chosen = min(overviews, key=lambda factor: abs(factor - desired))
                 print(
                     f"[sdm_tile] layer={layer_id} src_res=({src_res_x:.6f},{src_res_y:.6f})deg "
                     f"dst_res≈{dst_res:.6f}deg overviews={overviews} desired≈{desired:.2f} "
-                    f"chosen≈{chosen}",
+                    f"chosen≈{chosen_factor} requested_level={chosen_level} strategy=ceil",
                     flush=True,
                 )
             else:
@@ -213,20 +275,117 @@ def _render_layer(
                     flush=True,
                 )
             logged_overview = True
-        temp = np.full_like(dest, np.nan)
-        reproject(
-            source=rasterio.band(ds, 1),
-            destination=temp,
-            src_transform=ds.transform,
-            src_crs=ds.crs,
-            src_nodata=ds.nodata,
-            dst_transform=transform,
-            dst_crs=dst_crs,
-            dst_nodata=np.nan,
-            resampling=resampling,
+        region_start = time.perf_counter()
+        min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+        overlap = _intersect_bounds(min_lon, min_lat, max_lon, max_lat, ds=ds)
+        if overlap is None:
+            continue
+        src_window = _clamp_window(
+            window_from_bounds(*overlap, transform=ds.transform),
+            ds.width,
+            ds.height,
         )
-        mask = np.isfinite(temp)
-        dest[mask] = temp[mask]
+        src_h, src_w = _window_shape(src_window)
+        if src_h <= 0 or src_w <= 0:
+            continue
+        overview_factor = max(1, int(chosen_factor or 1))
+        if (
+            not reproject_to_mercator
+            and ds.crs
+            and str(ds.crs) in ("EPSG:4326", "OGC:CRS84")
+        ):
+            # Fast path: avoid warp when output remains WGS84.
+            dst_window = _clamp_window(
+                window_from_bounds(
+                    *overlap,
+                    transform=transform,
+                ),
+                spec.tile_size,
+                spec.tile_size,
+            )
+            dst_h, dst_w = _window_shape(dst_window)
+            if dst_h <= 0 or dst_w <= 0:
+                continue
+            read_h = max(1, int(math.ceil(src_h / overview_factor)))
+            read_w = max(1, int(math.ceil(src_w / overview_factor)))
+            dst_pixels_requested += dst_h * dst_w
+            env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
+            read_start = time.perf_counter()
+            with env_ctx:
+                coarse_tile = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(read_h, read_w),
+                    resampling=resampling,
+                ).astype(np.float32, copy=False)
+                tile = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(dst_h, dst_w),
+                    resampling=resampling,
+                ).astype(np.float32, copy=False)
+            read_seconds += time.perf_counter() - read_start
+            src_pixels_read += coarse_tile.shape[0] * coarse_tile.shape[1]
+            if ds.nodata is not None:
+                tile[tile == ds.nodata] = np.nan
+            row0 = int(dst_window.row_off)
+            col0 = int(dst_window.col_off)
+            row1 = row0 + dst_h
+            col1 = col0 + dst_w
+            section = dest[row0:row1, col0:col1]
+            mask = np.isfinite(tile)
+            section[mask] = tile[mask]
+            pixels_written += int(mask.sum())
+            regions_rendered += 1
+        else:
+            read_h = max(1, int(math.ceil(src_h / overview_factor)))
+            read_w = max(1, int(math.ceil(src_w / overview_factor)))
+            env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
+            read_start = time.perf_counter()
+            with env_ctx:
+                source_tile = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(read_h, read_w),
+                    resampling=resampling,
+                ).astype(np.float32, copy=False)
+            read_seconds += time.perf_counter() - read_start
+            src_pixels_read += source_tile.shape[0] * source_tile.shape[1]
+            if ds.nodata is not None:
+                source_tile[source_tile == ds.nodata] = np.nan
+            src_transform = window_transform(src_window, ds.transform) * rasterio.Affine.scale(
+                src_w / read_w,
+                src_h / read_h,
+            )
+            temp = np.full_like(dest, np.nan)
+            warp_start = time.perf_counter()
+            reproject(
+                source=source_tile,
+                destination=temp,
+                src_transform=src_transform,
+                src_crs=ds.crs,
+                src_nodata=np.nan,
+                dst_transform=transform,
+                dst_crs=dst_crs,
+                dst_nodata=np.nan,
+                resampling=resampling,
+            )
+            warp_seconds += time.perf_counter() - warp_start
+            dst_pixels_requested += spec.tile_size * spec.tile_size
+            mask = np.isfinite(temp)
+            dest[mask] = temp[mask]
+            pixels_written += int(mask.sum())
+            regions_rendered += 1
+        region_render_seconds += time.perf_counter() - region_start
+    total_seconds = time.perf_counter() - layer_start
+    print(
+        f"[sdm_tile] layer={layer_id} timings total={total_seconds:.2f}s render={region_render_seconds:.2f}s "
+        f"read={read_seconds:.2f}s warp={warp_seconds:.2f}s "
+        f"regions={regions_rendered}/{regions_with_data}/{total_regions} "
+        f"src_px_read={src_pixels_read:,} dst_px={dst_pixels_requested:,} written_px={pixels_written:,} "
+        f"mode={'warp' if reproject_to_mercator else 'wgs84_direct'}",
+        flush=True,
+    )
     return dest
 
 

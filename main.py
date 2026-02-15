@@ -84,13 +84,15 @@ def habitat_tile(
 ) -> Response:
     """Renders a habitat suitability raster tile for a taxon."""
     start_time = time.time()
+    synthetic_taxon = taxon_id <= 0
+    resolved_model_id = (model_id or "").strip() or models.DEFAULT_MODEL_ID
     layer_list = None
     if layers:
         layer_list = [entry.strip() for entry in layers.split(",") if entry.strip()]
     print(
         f"[sdm_tile] start taxon={taxon_id} z={z} x={x} y={y} "
-        f"model={model_id} layers={layer_list or 'default'} tile_size={tile_size} "
-        f"reproject={reproject}",
+        f"model={resolved_model_id} layers={layer_list or 'default'} tile_size={tile_size} "
+        f"reproject={reproject} synthetic_taxon={synthetic_taxon}",
         flush=True,
     )
     try:
@@ -99,7 +101,7 @@ def habitat_tile(
             z=z,
             x=x,
             y=y,
-            model_id=model_id,
+            model_id=resolved_model_id,
             layers=layer_list,
             tile_size=tile_size,
             reproject=reproject,
