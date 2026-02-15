@@ -21,7 +21,6 @@ from util import gis_lookup
 
 CONFIG = load_config("global")
 
-FORCE_REBUILD_CATEGORICAL = True
 FORCED_CATEGORICAL = {"landcover", "koppen_geiger"}
 TARGET_MIN_ZOOM = 3
 TARGET_TILE_SIZE = CONFIG.sdm_tile_size
@@ -170,17 +169,11 @@ def main() -> None:
                 needs_more = bool(desired_factors) and (
                     not existing or max(existing) < max(desired_factors)
                 )
-                if (
-                    existing
-                    and not needs_more
-                    and not (categorical and FORCE_REBUILD_CATEGORICAL)
-                ):
+                if existing and not needs_more:
                     skipped += 1
                     if skipped % 500 == 0:
                         print(f"[overview] skipped {skipped} files (already have overviews)")
                     continue
-                if existing and categorical and FORCE_REBUILD_CATEGORICAL:
-                    print(f"[overview] forcing categorical rebuild for {path.name}")
                 if needs_more:
                     print(
                         f"[overview] upgrading {path.name} existing={existing} target={desired_factors}",
