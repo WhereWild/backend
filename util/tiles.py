@@ -79,7 +79,7 @@ DEFAULT_MAX_OPEN_DATASETS = 16
 FORCED_CATEGORICAL_LAYERS = frozenset({"landcover"})
 
 # Derived layers that are computed from other layers rather than read directly
-DERIVED_LAYERS = frozenset({"slope"})
+DERIVED_LAYERS = frozenset({"slope", "aspect"})
 
 
 def _compute_slope(elevation: np.ndarray, meters_per_px: float, pad: int = 0) -> np.ndarray:
@@ -118,6 +118,49 @@ def _compute_slope(elevation: np.ndarray, meters_per_px: float, pad: int = 0) ->
     slope_degrees = np.where(np.isfinite(elevation_trimmed), slope_degrees, np.nan)
 
     return slope_degrees.astype(np.float32)
+
+
+def _compute_aspect(elevation: np.ndarray, pad: int = 0) -> np.ndarray:
+    """Compute aspect (slope direction) in degrees from elevation data.
+
+    Args:
+        elevation: 2D array of elevation values in meters (may include padding)
+        pad: If > 0, elevation includes this many pixels of padding that will be trimmed
+
+    Returns:
+        2D array of aspect in degrees (0-360), where:
+        - 0/360 = North (uphill is to the north)
+        - 90 = East
+        - 180 = South
+        - 270 = West
+    """
+    if elevation.size == 0:
+        return elevation.copy()
+
+    # np.gradient: dy is change along rows (south to north), dx is change along columns (west to east)
+    dy, dx = np.gradient(elevation)
+
+    # Aspect is the direction the slope faces (downhill direction)
+    # arctan2(-dy, -dx) gives the downhill direction
+    # We negate both because gradient points uphill
+    aspect_radians = np.arctan2(-dy, -dx)
+    aspect_degrees = np.degrees(aspect_radians)
+
+    # Convert from (-180, 180) to (0, 360) with 0 = North
+    # arctan2 gives 0 = East, so rotate by 90 degrees
+    aspect_degrees = (90.0 - aspect_degrees) % 360.0
+
+    # Trim padding if provided
+    if pad > 0:
+        aspect_degrees = aspect_degrees[pad:-pad, pad:-pad]
+        elevation_trimmed = elevation[pad:-pad, pad:-pad]
+    else:
+        elevation_trimmed = elevation
+
+    # Preserve NaN from elevation
+    aspect_degrees = np.where(np.isfinite(elevation_trimmed), aspect_degrees, np.nan)
+
+    return aspect_degrees.astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -626,8 +669,8 @@ def _render_derived_layer(
     Returns:
         2D array of computed values (spec.tile_size x spec.tile_size)
     """
-    if layer_id == "slope":
-        # Slope is derived from elevation
+    if layer_id in ("slope", "aspect"):
+        # Both slope and aspect are derived from elevation
         # Fetch elevation with padding so gradient at edges uses real neighbor data
         pad = 2  # pixels of extra data on each side
         layer_lookup = gis_lookup.load_layer_metadata()
@@ -638,9 +681,11 @@ def _render_derived_layer(
             reproject_to_mercator=reproject_to_mercator,
             pad_pixels=pad,
         )
-        mpp = meters_per_pixel(spec)
-        # Compute slope on padded data, then trim to tile size
-        return _compute_slope(elevation_padded, mpp, pad=pad)
+        if layer_id == "slope":
+            mpp = meters_per_pixel(spec)
+            return _compute_slope(elevation_padded, mpp, pad=pad)
+        else:  # aspect
+            return _compute_aspect(elevation_padded, pad=pad)
     else:
         raise ValueError(f"Unknown derived layer: {layer_id}")
 
@@ -683,6 +728,19 @@ def _colorize(
                 [255, 200, 100],  # Orange-yellow (moderate)
                 [255, 100, 50],   # Orange-red (steep)
                 [180, 0, 0],      # Dark red (very steep, ~45°+)
+            ],
+            dtype=np.float32,
+        )
+    elif colormap == "aspect":
+        # Aspect colormap: circular hue for compass directions
+        # 0=N (blue), 0.25=E (green), 0.5=S (yellow), 0.75=W (red), 1.0=N (blue)
+        stops = np.array(
+            [
+                [65, 105, 225],   # Royal blue (North, 0°)
+                [50, 205, 50],    # Lime green (East, 90°)
+                [255, 215, 0],    # Gold (South, 180°)
+                [220, 20, 60],    # Crimson (West, 270°)
+                [65, 105, 225],   # Royal blue (North, 360° wraps to 0°)
             ],
             dtype=np.float32,
         )
@@ -805,7 +863,7 @@ def _render_tile_png_impl_inner(
             )
 
     # Determine colormap based on layers
-    # If single layer and it's slope, use slope colormap
+    # If single layer and it's slope/aspect, use appropriate colormap
     # If single layer and it's elevation, use terrain colormap
     # Otherwise use heat (for model predictions)
     if len(layers_key) == 1 and layers_key[0] == "slope":
@@ -813,6 +871,11 @@ def _render_tile_png_impl_inner(
         preds = np.clip(stack[:, :, 0] / 45.0, 0.0, 1.0)
         preds = np.where(np.isfinite(stack[:, :, 0]), preds, np.nan)
         colormap = "slope"
+    elif len(layers_key) == 1 and layers_key[0] == "aspect":
+        # For aspect: normalize 0-360° to 0-1 range (circular)
+        preds = stack[:, :, 0] / 360.0
+        preds = np.where(np.isfinite(stack[:, :, 0]), preds, np.nan)
+        colormap = "aspect"
     elif len(layers_key) == 1 and layers_key[0] == "elevation":
         # Single elevation layer - use terrain colormap
         preds = models.predict(model_id, stack)
