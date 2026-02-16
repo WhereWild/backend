@@ -43,30 +43,43 @@ def predict(model_id: str, features: np.ndarray) -> np.ndarray:
 def _predict_stub_sum(features: np.ndarray) -> np.ndarray:
     """Stub model that sums features and normalizes to [0, 1].
 
-    Uses fixed global bounds for consistent cross-tile coloring.
-    These bounds are approximate and should be tuned based on actual data range.
+    For multi-layer input, normalizes each layer to [0,1] using fixed global
+    bounds so tiles have consistent coloring across boundaries.
     """
     if features.size == 0:
         return np.zeros(features.shape[:-1], dtype=np.float32)
 
-    # Track which pixels have ANY valid (non-NaN) data
-    # np.nansum returns 0 for all-NaN, which is misleading
-    valid_mask = np.any(np.isfinite(features), axis=-1)
-    scores = np.nansum(features, axis=-1)
-    # Keep NaN for pixels that had no valid data
-    scores = np.where(valid_mask, scores, np.nan)
-
-    # For single-layer elevation: use global elevation range
-    # For multi-layer: these bounds are approximate - adjust as needed
     n_features = features.shape[-1] if features.ndim > 2 else 1
+
     if n_features == 1:
         # Single layer (likely elevation): use global elevation bounds
-        # Elevation typically ranges from -500m to 8850m globally
+        valid_mask = np.any(np.isfinite(features), axis=-1)
+        scores = np.nansum(features, axis=-1)
+        scores = np.where(valid_mask, scores, np.nan)
         return _normalize_scores(scores, global_min=-500.0, global_max=5000.0)
-    else:
-        # Multi-layer: estimate bounds based on number of features
-        # This is a rough heuristic - real models should have proper bounds
-        return _normalize_scores(scores, global_min=0.0, global_max=n_features * 2000.0)
+
+    # Multi-layer: normalize each layer to [0,1] using fixed bounds, then average
+    # Use a generic 0-255 range as fallback (works for most categorical/scaled data)
+    # For a real model, this wouldn't matter since it outputs proper probabilities
+    normalized_layers = np.empty_like(features)
+    for i in range(n_features):
+        layer = features[..., i]
+        # Use fixed bounds - assume most layers are either:
+        # - Elevation-like: -500 to 5000
+        # - Categorical/index: 0 to 255
+        # We'll use a wide range that captures both reasonably
+        lo, hi = -500.0, 5000.0
+        normalized_layers[..., i] = (layer - lo) / (hi - lo)
+
+    # Track which pixels have ANY valid data
+    valid_mask = np.any(np.isfinite(features), axis=-1)
+
+    # Average the normalized layers (mean instead of sum for consistent 0-1 range)
+    scores = np.nanmean(normalized_layers, axis=-1)
+    scores = np.where(valid_mask, scores, np.nan)
+
+    # Clip to [0,1]
+    return np.clip(scores, 0.0, 1.0).astype(np.float32)
 
 
 def _normalize_scores(
