@@ -76,7 +76,7 @@ WEB_MERCATOR = "EPSG:3857"
 DEFAULT_TILE_SIZE = CONFIG.sdm_tile_size
 DEFAULT_MAX_OPEN_DATASETS = 16
 
-FORCED_CATEGORICAL_LAYERS = frozenset({"landcover"})
+FORCED_CATEGORICAL_LAYERS = frozenset({"landcover", "koppen_geiger"})
 
 # Derived layers that are computed from other layers rather than read directly
 DERIVED_LAYERS = frozenset({"slope", "aspect"})
@@ -690,6 +690,75 @@ def _render_derived_layer(
         raise ValueError(f"Unknown derived layer: {layer_id}")
 
 
+def _colorize_koppen(class_ids: np.ndarray) -> np.ndarray:
+    """Colorize Köppen-Geiger climate class IDs to RGBA.
+
+    Uses standard Beck et al. (2018) encoding and colors.
+    """
+    # Köppen-Geiger class ID -> RGB color mapping
+    # Based on standard encoding: 1=Af, 2=Am, 3=Aw/As, 4=BWh, etc.
+    KOPPEN_COLORS = {
+        # A - Tropical
+        1: (0x00, 0x00, 0xFE),    # Af  - Tropical rainforest
+        2: (0x00, 0x77, 0xFF),    # Am  - Tropical monsoon
+        3: (0x46, 0xA9, 0xFA),    # Aw  - Tropical savanna (dry winter)
+        4: (0x46, 0xA9, 0xFA),    # As  - Tropical savanna (dry summer)
+        # B - Arid
+        5: (0xFF, 0x00, 0x00),    # BWh - Hot desert
+        6: (0xFF, 0x96, 0x96),    # BWk - Cold desert
+        7: (0xF5, 0xA5, 0x00),    # BSh - Hot semi-arid
+        8: (0xFF, 0xDB, 0x63),    # BSk - Cold semi-arid
+        # C - Temperate
+        9: (0xFF, 0xFF, 0x00),    # Csa - Hot-summer Mediterranean
+        10: (0xC8, 0xC8, 0x00),   # Csb - Warm-summer Mediterranean
+        11: (0x96, 0x96, 0x00),   # Csc - Cold-summer Mediterranean
+        12: (0x96, 0xFF, 0x96),   # Cwa - Subtropical highland (dry winter)
+        13: (0x63, 0xC7, 0x64),   # Cwb - Temperate highland (dry winter)
+        14: (0x32, 0x96, 0x33),   # Cwc - Cold highland (dry winter)
+        15: (0xC8, 0xFF, 0x50),   # Cfa - Humid subtropical
+        16: (0x64, 0xFF, 0x32),   # Cfb - Oceanic
+        17: (0x32, 0xC8, 0x00),   # Cfc - Subpolar oceanic
+        # D - Continental
+        18: (0xFF, 0x00, 0xFF),   # Dsa - Mediterranean hot-summer continental
+        19: (0xC8, 0x00, 0xC8),   # Dsb - Mediterranean warm-summer continental
+        20: (0x96, 0x32, 0x96),   # Dsc - Mediterranean subarctic
+        21: (0x96, 0x64, 0x96),   # Dsd - Mediterranean extremely cold subarctic
+        22: (0xAB, 0xB1, 0xFF),   # Dwa - Monsoon hot-summer continental
+        23: (0x5A, 0x77, 0xDB),   # Dwb - Monsoon warm-summer continental
+        24: (0x4C, 0x51, 0xB5),   # Dwc - Monsoon subarctic
+        25: (0x32, 0x00, 0x87),   # Dwd - Monsoon extremely cold subarctic
+        26: (0x00, 0xFF, 0xFF),   # Dfa - Hot-summer humid continental
+        27: (0x37, 0xC8, 0xFF),   # Dfb - Warm-summer humid continental
+        28: (0x00, 0x7E, 0x7E),   # Dfc - Subarctic
+        29: (0x00, 0x46, 0x5F),   # Dfd - Extremely cold subarctic
+        # E - Polar
+        30: (0xB2, 0xB2, 0xB2),   # ET  - Tundra
+        31: (0x68, 0x68, 0x68),   # EF  - Ice cap
+    }
+
+    nan_mask = ~np.isfinite(class_ids)
+    rgba = np.zeros((*class_ids.shape, 4), dtype=np.uint8)
+    int_ids = np.round(class_ids).astype(np.int32)
+
+    for class_id, color in KOPPEN_COLORS.items():
+        mask = int_ids == class_id
+        rgba[mask, 0] = color[0]
+        rgba[mask, 1] = color[1]
+        rgba[mask, 2] = color[2]
+        rgba[mask, 3] = 255
+
+    # Unknown classes get gray
+    known_mask = np.isin(int_ids, list(KOPPEN_COLORS.keys()))
+    unknown_mask = ~known_mask & ~nan_mask
+    rgba[unknown_mask, 0] = 128
+    rgba[unknown_mask, 1] = 128
+    rgba[unknown_mask, 2] = 128
+    rgba[unknown_mask, 3] = 255
+
+    rgba[nan_mask, 3] = 0
+    return rgba
+
+
 def _colorize_landcover(class_ids: np.ndarray) -> np.ndarray:
     """Colorize landcover class IDs to RGBA using categorical lookup.
 
@@ -780,6 +849,8 @@ def _colorize(
     # Handle categorical colormaps separately
     if colormap == "landcover":
         return _colorize_landcover(values)
+    if colormap == "koppen":
+        return _colorize_koppen(values)
 
     v = np.clip(values, 0.0, 1.0)
 
@@ -956,6 +1027,10 @@ def _render_tile_png_impl_inner(
         # For landcover: pass raw class IDs (categorical)
         preds = stack[:, :, 0]
         colormap = "landcover"
+    elif len(layers_key) == 1 and layers_key[0] == "koppen_geiger":
+        # For Köppen-Geiger: pass raw class IDs (categorical)
+        preds = stack[:, :, 0]
+        colormap = "koppen"
     elif len(layers_key) == 1 and layers_key[0] == "elevation":
         # Single elevation layer - use terrain colormap
         preds = models.predict(model_id, stack)
