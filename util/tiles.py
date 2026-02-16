@@ -690,6 +690,78 @@ def _render_derived_layer(
         raise ValueError(f"Unknown derived layer: {layer_id}")
 
 
+def _colorize_landcover(class_ids: np.ndarray) -> np.ndarray:
+    """Colorize landcover class IDs to RGBA using categorical lookup.
+
+    Args:
+        class_ids: 2D array of landcover class IDs
+
+    Returns:
+        RGBA array with shape (*class_ids.shape, 4)
+    """
+    # Landcover class -> RGB color mapping
+    LANDCOVER_COLORS = {
+        10: (255, 255, 100),   # Rainfed cropland
+        11: (255, 255, 100),   # Herbaceous cover
+        12: (255, 255, 0),     # Tree or shrub cover (Orchard)
+        20: (170, 240, 240),   # Irrigated cropland
+        51: (76, 115, 0),      # Open evergreen broadleaved forest
+        52: (0, 100, 0),       # Closed evergreen broadleaved forest
+        61: (170, 200, 0),     # Open deciduous broadleaved forest
+        62: (0, 160, 0),       # Closed deciduous broadleaved forest
+        71: (0, 80, 0),        # Open evergreen needle-leaved forest
+        72: (0, 60, 0),        # Closed evergreen needle-leaved forest
+        81: (40, 100, 0),      # Open deciduous needle-leaved forest
+        82: (40, 80, 0),       # Closed deciduous needle-leaved forest
+        91: (160, 180, 50),    # Open mixed leaf forest
+        92: (120, 130, 0),     # Closed mixed leaf forest
+        120: (150, 100, 0),    # Shrubland
+        121: (150, 75, 0),     # Evergreen shrubland
+        122: (150, 100, 0),    # Deciduous shrubland
+        130: (255, 180, 50),   # Grassland
+        140: (255, 220, 210),  # Lichens and mosses
+        150: (255, 235, 175),  # Sparse vegetation
+        152: (255, 210, 120),  # Sparse shrubland
+        153: (255, 235, 175),  # Sparse herbaceous
+        180: (0, 220, 130),    # Wetlands
+        190: (195, 20, 0),     # Impervious surfaces
+        200: (255, 245, 215),  # Bare areas
+        201: (220, 220, 220),  # Consolidated bare areas
+        202: (255, 245, 215),  # Unconsolidated bare areas
+        210: (0, 70, 200),     # Water body
+        220: (255, 255, 255),  # Permanent ice and snow
+        250: (255, 255, 255),  # Filled value
+    }
+
+    # Track NaN/invalid pixels
+    nan_mask = ~np.isfinite(class_ids)
+
+    # Create output RGBA array
+    rgba = np.zeros((*class_ids.shape, 4), dtype=np.uint8)
+
+    # Apply colors for each class
+    int_ids = np.round(class_ids).astype(np.int32)
+    for class_id, color in LANDCOVER_COLORS.items():
+        mask = int_ids == class_id
+        rgba[mask, 0] = color[0]
+        rgba[mask, 1] = color[1]
+        rgba[mask, 2] = color[2]
+        rgba[mask, 3] = 255
+
+    # Unknown classes get gray
+    known_mask = np.isin(int_ids, list(LANDCOVER_COLORS.keys()))
+    unknown_mask = ~known_mask & ~nan_mask
+    rgba[unknown_mask, 0] = 128
+    rgba[unknown_mask, 1] = 128
+    rgba[unknown_mask, 2] = 128
+    rgba[unknown_mask, 3] = 255
+
+    # NaN pixels are transparent
+    rgba[nan_mask, 3] = 0
+
+    return rgba
+
+
 def _colorize(
     values: np.ndarray,
     *,
@@ -705,6 +777,10 @@ def _colorize(
         alpha_max: Maximum alpha (for highest values)
         colormap: "terrain" for elevation, "slope" for slope, "heat" for predictions
     """
+    # Handle categorical colormaps separately
+    if colormap == "landcover":
+        return _colorize_landcover(values)
+
     v = np.clip(values, 0.0, 1.0)
 
     if colormap == "terrain":
@@ -863,7 +939,7 @@ def _render_tile_png_impl_inner(
             )
 
     # Determine colormap based on layers
-    # If single layer and it's slope/aspect, use appropriate colormap
+    # If single layer and it's slope/aspect/landcover, use appropriate colormap
     # If single layer and it's elevation, use terrain colormap
     # Otherwise use heat (for model predictions)
     if len(layers_key) == 1 and layers_key[0] == "slope":
@@ -876,6 +952,10 @@ def _render_tile_png_impl_inner(
         preds = stack[:, :, 0] / 360.0
         preds = np.where(np.isfinite(stack[:, :, 0]), preds, np.nan)
         colormap = "aspect"
+    elif len(layers_key) == 1 and layers_key[0] == "landcover":
+        # For landcover: pass raw class IDs (categorical)
+        preds = stack[:, :, 0]
+        colormap = "landcover"
     elif len(layers_key) == 1 and layers_key[0] == "elevation":
         # Single elevation layer - use terrain colormap
         preds = models.predict(model_id, stack)
