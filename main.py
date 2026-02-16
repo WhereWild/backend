@@ -81,6 +81,12 @@ def habitat_tile(
         CONFIG.sdm_tile_reproject,
         description="If true, warp to Web Mercator; if false, keep WGS84.",
     ),
+    max_native_zoom: int = Query(
+        10,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
 ) -> Response:
     """Renders a habitat suitability raster tile for a taxon."""
     start_time = time.time()
@@ -89,25 +95,72 @@ def habitat_tile(
     layer_list = None
     if layers:
         layer_list = [entry.strip() for entry in layers.split(",") if entry.strip()]
-    print(
-        f"[sdm_tile] start taxon={taxon_id} z={z} x={x} y={y} "
-        f"model={resolved_model_id} layers={layer_list or 'default'} tile_size={tile_size} "
-        f"reproject={reproject} synthetic_taxon={synthetic_taxon}",
-        flush=True,
-    )
-    try:
-        payload = tiles.render_tile_bytes(
-            taxon_id=taxon_id,
-            z=z,
-            x=x,
-            y=y,
-            model_id=resolved_model_id,
-            layers=layer_list,
-            tile_size=tile_size,
-            reproject=reproject,
+
+    # When z > max_native_zoom, render parent tile at higher res and extract subtile
+    if z > max_native_zoom:
+        zoom_diff = z - max_native_zoom
+        scale = 2 ** zoom_diff
+        parent_x = x // scale
+        parent_y = y // scale
+        subtile_x = x % scale
+        subtile_y = y % scale
+        # Render parent at higher resolution
+        parent_tile_size = min(tile_size * scale, CONFIG.sdm_tile_max_size)
+        print(
+            f"[sdm_tile] start taxon={taxon_id} z={z} x={x} y={y} "
+            f"-> parent z={max_native_zoom} x={parent_x} y={parent_y} "
+            f"subtile=({subtile_x},{subtile_y}) parent_size={parent_tile_size} "
+            f"model={resolved_model_id} layers={layer_list or 'default'} "
+            f"reproject={reproject} synthetic_taxon={synthetic_taxon}",
+            flush=True,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            parent_payload = tiles.render_tile_bytes(
+                taxon_id=taxon_id,
+                z=max_native_zoom,
+                x=parent_x,
+                y=parent_y,
+                model_id=resolved_model_id,
+                layers=layer_list,
+                tile_size=parent_tile_size,
+                reproject=reproject,
+            )
+            # Extract subtile from parent
+            from PIL import Image
+            import io
+            parent_img = Image.open(io.BytesIO(parent_payload))
+            subtile_size = parent_tile_size // scale
+            left = subtile_x * subtile_size
+            top = subtile_y * subtile_size
+            subtile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+            # Resize to requested tile_size if needed
+            if subtile_size != tile_size:
+                subtile_img = subtile_img.resize((tile_size, tile_size), Image.LANCZOS)
+            buffer = io.BytesIO()
+            subtile_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        print(
+            f"[sdm_tile] start taxon={taxon_id} z={z} x={x} y={y} "
+            f"model={resolved_model_id} layers={layer_list or 'default'} tile_size={tile_size} "
+            f"reproject={reproject} synthetic_taxon={synthetic_taxon}",
+            flush=True,
+        )
+        try:
+            payload = tiles.render_tile_bytes(
+                taxon_id=taxon_id,
+                z=z,
+                x=x,
+                y=y,
+                model_id=resolved_model_id,
+                layers=layer_list,
+                tile_size=tile_size,
+                reproject=reproject,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     elapsed = time.time() - start_time
     print(
         f"[sdm_tile] done taxon={taxon_id} z={z} x={x} y={y} "

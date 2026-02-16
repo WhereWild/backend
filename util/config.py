@@ -111,7 +111,7 @@ class GlobalConfig:
 
     # API + aggregation behavior
     sdm_tile_size: int = 256
-    sdm_tile_max_size: int = 512
+    sdm_tile_max_size: int = 2048
     sdm_tile_cache_seconds: int = 60
     sdm_tile_reproject: bool = True
 

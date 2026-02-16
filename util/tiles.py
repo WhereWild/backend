@@ -78,6 +78,47 @@ DEFAULT_MAX_OPEN_DATASETS = 16
 
 FORCED_CATEGORICAL_LAYERS = frozenset({"landcover"})
 
+# Derived layers that are computed from other layers rather than read directly
+DERIVED_LAYERS = frozenset({"slope"})
+
+
+def _compute_slope(elevation: np.ndarray, meters_per_px: float, pad: int = 0) -> np.ndarray:
+    """Compute slope in degrees from elevation data.
+
+    Args:
+        elevation: 2D array of elevation values in meters (may include padding)
+        meters_per_px: Approximate meters per pixel at the tile center
+        pad: If > 0, elevation includes this many pixels of padding that will be trimmed
+
+    Returns:
+        2D array of slope in degrees (0-90), trimmed to remove padding
+    """
+    if elevation.size == 0:
+        return elevation.copy()
+
+    # np.gradient computes rise per pixel
+    dy, dx = np.gradient(elevation)
+
+    # Convert from rise/pixel to rise/meter
+    dy = dy / meters_per_px
+    dx = dx / meters_per_px
+
+    # Compute slope magnitude (rise/run) and convert to degrees
+    slope_radians = np.arctan(np.sqrt(dx**2 + dy**2))
+    slope_degrees = np.degrees(slope_radians)
+
+    # Trim padding if provided
+    if pad > 0:
+        slope_degrees = slope_degrees[pad:-pad, pad:-pad]
+        elevation_trimmed = elevation[pad:-pad, pad:-pad]
+    else:
+        elevation_trimmed = elevation
+
+    # Preserve NaN from elevation
+    slope_degrees = np.where(np.isfinite(elevation_trimmed), slope_degrees, np.nan)
+
+    return slope_degrees.astype(np.float32)
+
 
 @dataclass(frozen=True)
 class TileSpec:
@@ -153,6 +194,28 @@ def tile_transform(spec: TileSpec) -> rasterio.Affine:
 def meters_per_pixel(spec: TileSpec) -> float:
     minx, _miny, maxx, _maxy = tile_bounds_mercator(spec)
     return abs(maxx - minx) / spec.tile_size
+
+
+def _extend_bounds_mercator(
+    bounds: tuple[float, float, float, float],
+    pad_pixels: int,
+    mpp: float,
+) -> tuple[float, float, float, float]:
+    """Extend mercator bounds by pad_pixels in each direction."""
+    minx, miny, maxx, maxy = bounds
+    pad_meters = pad_pixels * mpp
+    return (minx - pad_meters, miny - pad_meters, maxx + pad_meters, maxy + pad_meters)
+
+
+def _extend_bounds_wgs84(
+    bounds: tuple[float, float, float, float],
+    pad_pixels: int,
+    degrees_per_pixel: float,
+) -> tuple[float, float, float, float]:
+    """Extend WGS84 bounds by pad_pixels in each direction."""
+    min_lon, min_lat, max_lon, max_lat = bounds
+    pad_deg = pad_pixels * degrees_per_pixel
+    return (min_lon - pad_deg, min_lat - pad_deg, max_lon + pad_deg, max_lat + pad_deg)
 
 
 def _iter_region_origins(
@@ -269,17 +332,44 @@ def _render_layer(
     layer_meta: dict[str, object] | None,
     *,
     reproject_to_mercator: bool,
+    pad_pixels: int = 0,
 ) -> np.ndarray:
+    """Render a single layer for a tile.
+
+    Args:
+        layer_id: The layer to render
+        spec: Tile specification
+        layer_meta: Layer metadata dict
+        reproject_to_mercator: Whether to reproject to web mercator
+        pad_pixels: Extra pixels to render around the tile (for derivative calculations)
+
+    Returns:
+        2D array of shape (tile_size + 2*pad_pixels, tile_size + 2*pad_pixels)
+    """
     layer_start = time.perf_counter()
     bounds_wgs84 = tile_bounds_wgs84(spec)
     bounds_mercator = tile_bounds_mercator(spec)
+
+    # Calculate output size (with padding if requested)
+    output_size = spec.tile_size + 2 * pad_pixels
+
+    # Extend bounds if padding requested
+    if pad_pixels > 0:
+        mpp = meters_per_pixel(spec)
+        bounds_mercator = _extend_bounds_mercator(bounds_mercator, pad_pixels, mpp)
+        # For WGS84, approximate degrees per pixel
+        min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+        deg_per_px = (max_lon - min_lon) / spec.tile_size
+        bounds_wgs84 = _extend_bounds_wgs84(bounds_wgs84, pad_pixels, deg_per_px)
+
     region_size = float(layer_meta.get("region_size") or 10.0) if layer_meta else 10.0
     if reproject_to_mercator:
-        transform = tile_transform(spec)
+        minx, miny, maxx, maxy = bounds_mercator
+        transform = from_bounds(minx, miny, maxx, maxy, output_size, output_size)
         dst_crs = WEB_MERCATOR
     else:
         min_lon, min_lat, max_lon, max_lat = bounds_wgs84
-        transform = from_bounds(min_lon, min_lat, max_lon, max_lat, spec.tile_size, spec.tile_size)
+        transform = from_bounds(min_lon, min_lat, max_lon, max_lat, output_size, output_size)
         dst_crs = "EPSG:4326"
 
     # Only log detailed info for filtered layer (or all if filter is None/empty)
@@ -295,7 +385,7 @@ def _render_layer(
     # Track overview factors used across regions for summary
     overview_factors_used: set[int] = set()
     resampling = Resampling.nearest if _is_layer_categorical(layer_id, layer_meta) else Resampling.bilinear
-    dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    dest = np.full((output_size, output_size), np.nan, dtype=np.float32)
     logged_overview = False
     total_regions = 0
     regions_with_data = 0
@@ -316,7 +406,7 @@ def _render_layer(
         # Note: Opening fresh each time for thread safety (no caching)
         ds = rasterio.open(cog_path.as_posix())
         overviews, src_res_x, src_res_y, desired, dst_res = _estimate_overview_factor(
-            ds, bounds_wgs84, spec.tile_size
+            ds, bounds_wgs84, output_size
         )
         chosen_level, chosen_factor = _choose_overview_level(overviews, desired)
         if not logged_overview:
@@ -362,7 +452,7 @@ def _render_layer(
         ):
             # Fast path: avoid warp when output remains WGS84.
             raw_dst_window = window_from_bounds(*overlap, transform=transform)
-            dst_window = _clamp_window(raw_dst_window, spec.tile_size, spec.tile_size)
+            dst_window = _clamp_window(raw_dst_window, output_size, output_size)
             dst_h, dst_w = _window_shape(dst_window)
 
             # Debug: log window geometry
@@ -480,7 +570,7 @@ def _render_layer(
             if verbose:
                 _debug(f"[tile_debug] WARP_PATH warped_stats: min={np.nanmin(temp):.2f} max={np.nanmax(temp):.2f} nan_count={np.isnan(temp).sum()} finite_count={np.isfinite(temp).sum()}")
 
-            dst_pixels_requested += spec.tile_size * spec.tile_size
+            dst_pixels_requested += output_size * output_size
             mask = np.isfinite(temp)
             dest[mask] = temp[mask]
             pixels_written += int(mask.sum())
@@ -498,7 +588,7 @@ def _render_layer(
         _debug(
             f"[LAYER_SUMMARY] layer={layer_id} z={spec.z} x={spec.x} y={spec.y} "
             f"regions={regions_rendered}/{total_regions} overview_factors=[{overview_factors_str}] "
-            f"finite_px={finite_count}/{spec.tile_size**2} "
+            f"finite_px={finite_count}/{output_size**2} "
             f"mode={'warp' if reproject_to_mercator else 'direct'}"
         )
 
@@ -520,6 +610,41 @@ def _render_layer(
     return dest
 
 
+def _render_derived_layer(
+    layer_id: str,
+    spec: TileSpec,
+    *,
+    reproject_to_mercator: bool,
+) -> np.ndarray:
+    """Render a derived layer (computed from other layers).
+
+    Args:
+        layer_id: The derived layer ID (e.g., "slope")
+        spec: Tile specification
+        reproject_to_mercator: Whether to reproject to web mercator
+
+    Returns:
+        2D array of computed values (spec.tile_size x spec.tile_size)
+    """
+    if layer_id == "slope":
+        # Slope is derived from elevation
+        # Fetch elevation with padding so gradient at edges uses real neighbor data
+        pad = 2  # pixels of extra data on each side
+        layer_lookup = gis_lookup.load_layer_metadata()
+        elevation_padded = _render_layer(
+            "elevation",
+            spec,
+            layer_lookup.get("elevation"),
+            reproject_to_mercator=reproject_to_mercator,
+            pad_pixels=pad,
+        )
+        mpp = meters_per_pixel(spec)
+        # Compute slope on padded data, then trim to tile size
+        return _compute_slope(elevation_padded, mpp, pad=pad)
+    else:
+        raise ValueError(f"Unknown derived layer: {layer_id}")
+
+
 def _colorize(
     values: np.ndarray,
     *,
@@ -533,7 +658,7 @@ def _colorize(
         values: Array of values in [0, 1] range
         alpha_min: Minimum alpha (for lowest values)
         alpha_max: Maximum alpha (for highest values)
-        colormap: "terrain" for elevation, "heat" for predictions
+        colormap: "terrain" for elevation, "slope" for slope, "heat" for predictions
     """
     v = np.clip(values, 0.0, 1.0)
 
@@ -546,6 +671,18 @@ def _colorize(
                 [238, 214, 175],  # Tan/wheat
                 [139, 90, 43],    # Brown (mountains)
                 [255, 255, 255],  # White (peaks/snow)
+            ],
+            dtype=np.float32,
+        )
+    elif colormap == "slope":
+        # Slope colormap: flat (green) → gentle (yellow) → moderate (orange) → steep (red)
+        stops = np.array(
+            [
+                [144, 238, 144],  # Light green (flat, 0°)
+                [255, 255, 150],  # Light yellow (gentle slopes)
+                [255, 200, 100],  # Orange-yellow (moderate)
+                [255, 100, 50],   # Orange-red (steep)
+                [180, 0, 0],      # Dark red (very steep, ~45°+)
             ],
             dtype=np.float32,
         )
@@ -652,16 +789,42 @@ def _render_tile_png_impl_inner(
     for idx, layer_id in enumerate(layers_key):
         if _is_verbose() and (idx == 0 or idx == len(layers_key) - 1 or idx % 5 == 0):
             _debug(f"[sdm_tile] rendering layer {idx + 1}/{len(layers_key)} {layer_id}")
-        stack[:, :, idx] = _render_layer(
-            layer_id,
-            spec,
-            layer_lookup.get(layer_id),
-            reproject_to_mercator=reproject_to_mercator,
-        )
-    preds = models.predict(model_id, stack)
+        # Check if this is a derived layer
+        if layer_id in DERIVED_LAYERS:
+            stack[:, :, idx] = _render_derived_layer(
+                layer_id,
+                spec,
+                reproject_to_mercator=reproject_to_mercator,
+            )
+        else:
+            stack[:, :, idx] = _render_layer(
+                layer_id,
+                spec,
+                layer_lookup.get(layer_id),
+                reproject_to_mercator=reproject_to_mercator,
+            )
+
+    # Determine colormap based on layers
+    # If single layer and it's slope, use slope colormap
+    # If single layer and it's elevation, use terrain colormap
+    # Otherwise use heat (for model predictions)
+    if len(layers_key) == 1 and layers_key[0] == "slope":
+        # For slope: normalize 0-45° to 0-1 range
+        preds = np.clip(stack[:, :, 0] / 45.0, 0.0, 1.0)
+        preds = np.where(np.isfinite(stack[:, :, 0]), preds, np.nan)
+        colormap = "slope"
+    elif len(layers_key) == 1 and layers_key[0] == "elevation":
+        # Single elevation layer - use terrain colormap
+        preds = models.predict(model_id, stack)
+        colormap = "terrain"
+    else:
+        # Multiple layers or other - use model prediction with heat colormap
+        preds = models.predict(model_id, stack)
+        colormap = "heat"
+
     if _is_verbose():
-        _debug(f"[TILE_REQUEST #{request_id}] predictions: min={np.nanmin(preds):.4f} max={np.nanmax(preds):.4f} nan_count={np.isnan(preds).sum()}")
-    rgba = _colorize(preds)
+        _debug(f"[TILE_REQUEST #{request_id}] predictions: min={np.nanmin(preds):.4f} max={np.nanmax(preds):.4f} nan_count={np.isnan(preds).sum()} colormap={colormap}")
+    rgba = _colorize(preds, colormap=colormap)
     from PIL import Image
     import io
 
@@ -718,7 +881,8 @@ def render_tile_bytes(
     layer_list = _load_layer_list(layers)
     if layers:
         meta = gis_lookup.load_layer_metadata()
-        unknown = [layer for layer in layer_list if layer not in meta]
+        # Accept both metadata layers AND derived layers (like "slope")
+        unknown = [layer for layer in layer_list if layer not in meta and layer not in DERIVED_LAYERS]
         if unknown:
             raise ValueError(f"Unknown layer ids: {', '.join(unknown)}")
     if not layer_list:
