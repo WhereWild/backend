@@ -181,6 +181,52 @@ Then tail `logs/rclone/clone.log` and tune:
 - If you see throttling/retries (for example HTTP `429`), back off to `CHECKERS=64` and `TRANSFERS=32`.
 - If there is no throttling and your disk/network still has headroom, increase gradually (`CHECKERS` by `+16`, `TRANSFERS` by `+8`).
 
+### Export Compact Dataset Structure for ML Planning
+
+If you want to view dataset structure without creating a massive manifest file:
+
+```sh
+python scripts/export_b2_schema.py \
+  --remote wherewild-localdev-reader:wherewild-data \
+  --filter-prefix processed/species \
+  --json-out b2_schema_summary.json \
+  --md-out b2_schema_summary.md
+```
+
+This streams metadata from rclone and writes compact summaries (`.json` and `.md`) that are small enough to read.
+
+To infer column schemas/profiles from sampled tabular files referenced by that
+summary:
+
+```sh
+python scripts/sample_b2_tabular_schema.py \
+  --remote wherewild-localdev-reader:wherewild-data \
+  --summary-json b2_schema_summary.json \
+  --max-files 20 \
+  --json-out b2_tabular_schema.json \
+  --md-out b2_tabular_schema.md
+```
+
+This keeps downloads bounded (`--max-download-bytes`) and produces a compact schema profile.
+
+### Regenerate Markdown Only (No rclone)
+
+If you already have the JSON outputs, you can regenerate markdown without any
+remote listing, downloads, or rclone checks:
+
+```sh
+python scripts/export_b2_schema.py \
+  --markdown-from-json b2_schema_summary.json \
+  --md-out b2_schema_summary.md
+
+python scripts/sample_b2_tabular_schema.py \
+  --markdown-from-json b2_tabular_schema.json \
+  --md-out b2_tabular_schema.md
+```
+
+This is useful when you only changed markdown formatting and want a fast local
+refresh of `.md` files.
+
 Finally, it's a great idea to install the [parquet viewer](https://marketplace.visualstudio.com/items?itemName=dvirtz.parquet-viewer) extension on VSCode which allows the viewing of parquet files as simple csvs which really helps quick manual inspection. It will likely require you install pyarrow or fastparquet OUTSIDE of Docker or something similar so it can convert the parquets to CSVs. [Rainbow CSV](https://marketplace.visualstudio.com/items?itemName=mechatroner.rainbow-csv) is also a great addition with this that makes it easy to tell which values are part of which columns.
 
 ## More
