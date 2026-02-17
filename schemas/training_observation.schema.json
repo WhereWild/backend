@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "training_observation",
+  "version": "1.0.0",
+  "description": "Canonical contract for SDM training rows used by encoder + PU head training.",
+  "storage": {
+    "format": "parquet",
+    "partition_by": [
+      "split",
+      "year_month",
+      "region_id"
+    ],
+    "compression": "zstd"
+  },
+  "notes": {
+    "presence_label": "1 = known occurrence, 0 = unlabeled/background pseudo-absence",
+    "feature_vectors": "Feature vectors are dense and fixed-order per feature_version.",
+    "feature_role": "input columns are allowed in model tensors; metadata columns are retained for joins, splits, auditing, and calibration only.",
+    "partitioning": "Primary partitions are split/year_month/region_id for efficient spatiotemporal slicing and leakage-safe evaluation. Species partitioning is optional for derived head-training datasets (e.g., species_bucket) but not recommended as the base layout due to high cardinality and small-file risk."
+  },
+  "columns": [
+    {
+      "name": "sample_id",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Globally unique row id (observation or background sample)."
+    },
+    {
+      "name": "observation_id",
+      "parquet_type": "string",
+      "required": false,
+      "feature_role": "metadata",
+      "description": "Original occurrence id; null for generated background rows."
+    },
+    {
+      "name": "species_key",
+      "parquet_type": "int64",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Species identifier used by per-species heads."
+    },
+    {
+      "name": "presence_label",
+      "parquet_type": "int8",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "1 for positive, 0 for unlabeled/background sample."
+    },
+    {
+      "name": "sample_weight",
+      "parquet_type": "float32",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Row weight for PU learning / sampling correction."
+    },
+    {
+      "name": "cell_id",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Spatial index cell id used to join environmental context."
+    },
+    {
+      "name": "region_id",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Region/biome partition id for stratified splits and sampling."
+    },
+    {
+      "name": "lat",
+      "parquet_type": "float64",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Latitude in WGS84 decimal degrees."
+    },
+    {
+      "name": "lon",
+      "parquet_type": "float64",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Longitude in WGS84 decimal degrees."
+    },
+    {
+      "name": "event_time_utc",
+      "parquet_type": "timestamp_ms_utc",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Observation/background timestamp in UTC used for weather alignment."
+    },
+    {
+      "name": "year_month",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "YYYY-MM partition key derived from event_time_utc."
+    },
+    {
+      "name": "split",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Dataset split label (train/val/test) from spatiotemporal splitter."
+    },
+    {
+      "name": "source",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Data source tag (e.g., gbif, inat, generated_background)."
+    },
+    {
+      "name": "feature_version",
+      "parquet_type": "string",
+      "required": true,
+      "feature_role": "metadata",
+      "description": "Version of feature engineering order and normalization."
+    },
+    {
+      "name": "env_features",
+      "parquet_type": "list<float32>",
+      "required": true,
+      "feature_role": "input",
+      "description": "Dense static environmental feature vector (BIO, elevation, etc.)."
+    },
+    {
+      "name": "habitat_features",
+      "parquet_type": "list<float32>",
+      "required": false,
+      "feature_role": "input",
+      "description": "Dense habitat/landcover neighborhood feature vector."
+    },
+    {
+      "name": "weather_features",
+      "parquet_type": "list<float32>",
+      "required": false,
+      "feature_role": "input",
+      "description": "Dense recent weather feature vector aligned to event_time_utc."
+    }
+  ]
+}
