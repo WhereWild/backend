@@ -50,7 +50,7 @@
         { "id": "cfvo", "code": "CFVO_0_5CM", "display_name": "Coarse Fragments (0-5cm)", "units": "cm³/dm³", "region_root": "regions", "region_size": 10, "filename_template": "cfvo.tif", "value_type": "numeric" },
         { "id": "nitrogen", "code": "NITROGEN_0_5CM", "display_name": "Nitrogen (0-5cm)", "units": "cg/kg", "region_root": "regions", "region_size": 10, "filename_template": "nitrogen.tif", "value_type": "numeric" },
         { "id": "soc", "code": "SOC_0_5CM", "display_name": "Soil Organic Carbon (0-5cm)", "units": "dg/kg", "region_root": "regions", "region_size": 10, "filename_template": "soc.tif", "value_type": "numeric" },
-        { "id": "phh2o", "code": "PHH2O_0_5CM", "display_name": "pH (Water, 0-5cm)", "units": "pH*10", "region_root": "regions", "region_size": 10, "filename_template": "phh2o.tif", "value_type": "numeric" },
+        { "id": "phh2o", "code": "PHH2O_0_5CM", "display_name": "pH (Water, 0-5cm)", "units": "pH*10", "region_root": "regions", "region_size": 10, "filename_template": "phh20.tif", "value_type": "numeric" },
         { "id": "wrb", "code": "WRB_2006", "display_name": "World Reference Base (2006) Soil Groups", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "wrb.tif", "value_type": "categorical" }
       ]
     },
