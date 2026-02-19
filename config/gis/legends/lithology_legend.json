@@ -5,100 +5,100 @@
     {
       "id": 1,
       "name": "Acid Plutonics",
-      "description": "Coarse-grained intrusive igneous rocks with high silica content, such as granite and granodiorite, which form the cores of many mountain ranges.",
+      "description": "Felsic intrusive igneous rocks (for example granite and granodiorite) formed by slow cooling at depth. These terrains are typically hard, fractured, and nutrient-poor, with sandy to coarse weathering products.",
       "group": "igneous_plutonic",
-      "group_label": "Plutonic"
+      "group_label": "Plutonic Igneous"
     },
     {
       "id": 2,
       "name": "Acid Volcanics",
-      "description": "Fine-grained to glassy extrusive igneous rocks rich in silica, including rhyolite and obsidian, often associated with explosive volcanic eruptions.",
+      "description": "Felsic extrusive rocks (for example rhyolite and obsidian) produced by silica-rich volcanism. They are commonly tied to explosive eruptions and often weather into stony, shallow, and patchy soils.",
       "group": "igneous_volcanic",
-      "group_label": "Volcanic"
+      "group_label": "Volcanic Igneous"
     },
     {
       "id": 3,
       "name": "Basic Plutonics",
-      "description": "Coarse-grained intrusive rocks low in silica and rich in iron and magnesium, such as gabbro and norite, common in oceanic crust and mafic intrusions.",
+      "description": "Mafic intrusive rocks (for example gabbro and norite) crystallized slowly below the surface. Their weathering tends to produce darker, base-rich materials and comparatively fertile substrates.",
       "group": "igneous_plutonic",
-      "group_label": "Plutonic"
+      "group_label": "Plutonic Igneous"
     },
     {
       "id": 4,
       "name": "Basic Volcanics",
-      "description": "Dark, fine-grained extrusive rocks such as basalt and andesite that form ocean floors, flood basalt plateaus, and many island chains.",
+      "description": "Mafic volcanic rocks (mainly basaltic to andesitic) erupted at the surface. They are widespread in lava plateaus and oceanic settings, and can weather into clay-rich, relatively nutrient-rich soils.",
       "group": "igneous_volcanic",
-      "group_label": "Volcanic"
+      "group_label": "Volcanic Igneous"
     },
     {
       "id": 5,
       "name": "Carbonate Sedimentary Rock",
-      "description": "Limestone, dolomite, and chalk formed from the accumulation of marine organisms or chemical precipitation, often hosting karst landscapes.",
+      "description": "Carbonate strata (limestone, dolostone, chalk) formed by biogenic accumulation or chemical precipitation. Commonly linked to karst, sinkholes, caves, and alkaline groundwater chemistry.",
       "group": "sedimentary",
       "group_label": "Sedimentary"
     },
     {
       "id": 6,
       "name": "Evaporite",
-      "description": "Salt, gypsum, and anhydrite deposits left behind by the evaporation of ancient seas or saline lakes, found in arid basins and subsurface strata.",
+      "description": "Highly soluble chemical sediments (halite, gypsum, anhydrite) precipitated from evaporating saline waters. Typical of arid basins and often associated with salinity stress and unstable ground conditions.",
       "group": "sedimentary",
       "group_label": "Sedimentary"
     },
     {
       "id": 7,
       "name": "Ice and Glaciers",
-      "description": "Perennial ice sheets and glaciers covering bedrock, including Greenland, Antarctica, and high-altitude glacier complexes.",
+      "description": "Permanent or long-lived glacial ice cover where bedrock is largely obscured. Surface processes are cryogenic, with sparse soil development and strong controls from freeze-thaw and meltwater routing.",
       "group": "ice",
-      "group_label": "Ice"
+      "group_label": "Ice and Glacier"
     },
     {
       "id": 8,
       "name": "Intermediate Plutonics",
-      "description": "Intrusive igneous rocks with silica content between mafic and felsic extremes, such as diorite and tonalite.",
+      "description": "Intermediate-composition intrusive rocks (for example diorite and tonalite) bridging felsic and mafic endmembers. They generally weather to mixed mineral soils with moderate fertility and variable texture.",
       "group": "igneous_plutonic",
-      "group_label": "Plutonic"
+      "group_label": "Plutonic Igneous"
     },
     {
       "id": 9,
       "name": "Intermediate Volcanics",
-      "description": "Extrusive igneous rocks of intermediate composition including andesite and trachyte, common in subduction zone volcanoes.",
+      "description": "Intermediate volcanic rocks (notably andesite-dacite suites) common along convergent margins. They are often associated with stratovolcanoes, tephra deposits, and steep erosive terrain.",
       "group": "igneous_volcanic",
-      "group_label": "Volcanic"
+      "group_label": "Volcanic Igneous"
     },
     {
       "id": 10,
       "name": "Metamorphics",
-      "description": "Rocks recrystallized under heat and pressure, including schist, gneiss, and quartzite, forming the basement of ancient cratons and orogenic belts.",
+      "description": "Rocks transformed by heat, pressure, and deformation (for example schist, gneiss, quartzite, marble). These areas often show strong structural fabric, variable permeability, and rugged topography.",
       "group": "metamorphic",
       "group_label": "Metamorphic"
     },
     {
       "id": 11,
       "name": "Mixed Sedimentary Rock",
-      "description": "Interbedded or transitional sequences that combine multiple sedimentary rock types and cannot be assigned to a single dominant class.",
+      "description": "Heterogeneous sedimentary successions with interbedded carbonate, clastic, or chemical units where no single lithology dominates. Hydrology and soil properties can change sharply over short distances.",
       "group": "sedimentary",
       "group_label": "Sedimentary"
     },
     {
       "id": 12,
       "name": "Pyroclastics",
-      "description": "Fragmental volcanic material such as tuff, breccia, and ignimbrite deposited by explosive eruptions or pyroclastic flows.",
+      "description": "Fragmental volcanic deposits (for example ash tuff, lapilli tuff, ignimbrite, volcanic breccia) emplaced by explosive eruptions. They commonly produce porous, erosion-prone substrates and complex stratigraphy.",
       "group": "igneous_volcanic",
-      "group_label": "Volcanic"
+      "group_label": "Volcanic Igneous"
     },
     {
       "id": 13,
       "name": "Siliciclastic Sedimentary",
-      "description": "Clastic sedimentary rocks composed primarily of silicate mineral grains, including sandstone, siltstone, mudstone, and shale.",
+      "description": "Detrital sedimentary rocks composed of silicate grains (sandstone, siltstone, mudstone, shale). They dominate many basins and plains, with permeability and erosion behavior controlled by grain size and cementation.",
       "group": "sedimentary",
       "group_label": "Sedimentary"
     },
     {
       "id": 14,
       "name": "Unconsolidated Sediment",
-      "description": "Loose, uncemented deposits of sand, gravel, silt, and clay such as river alluvium, coastal dunes, glacial till, and loess sheets.",
+      "description": "Loose surficial deposits that are not lithified (alluvium, colluvium, dune sand, till, loess). These materials are highly dynamic and strongly influence drainage, rooting depth, and disturbance sensitivity.",
       "group": "unconsolidated",
-      "group_label": "Unconsolidated"
+      "group_label": "Unconsolidated Deposits"
     },
     {
       "id": 15,
