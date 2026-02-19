@@ -19,6 +19,11 @@ gis_global_inputs = [
             ("koppen_geiger.tif", "koppen_geiger.tif"),
             ("landform.tif", "landform.tif"),
             ("lithology.tif", "lithology.tif"),
+            ("clay.tif", "clay.tif"),
+            ("sand.tif", "sand.tif"),
+            ("silt.tif", "silt.tif"),
+            ("cfvo.tif", "cfvo.tif"),
+            ("wrb.tif", "wrb.tif"),
             # CHELSA variables
             ("clt.tif", "clt.tif"),
             ("rsds.tif", "rsds.tif"),
@@ -26,6 +31,9 @@ gis_global_inputs = [
             ("sfc.tif", "sfc.tif"),
             ("swe.tif", "swe.tif"),
             ("vpd.tif", "vpd.tif"),
+            ("soc.tif", "soc.tif"),
+            ("phh20.tif", "phh20.tif"),
+            ("nitrogen.tif", "nitrogen.tif"),            
         ]
 
 slice_region_lat_end = 90

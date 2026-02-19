@@ -38,12 +38,20 @@
     {
       "name": "landclass",
       "display_name": "Earth Surface",
-      "description": "Global land cover and lithology classifications.",
-      "source": "GLC_FCS30 2020 (https://www.globallandcover.com/); Hengl, T. (2018). Global Landform and Lithology (https://zenodo.org/records/1464846)",
+      "description": "Global land cover, lithology, and static soil property/classification layers.",
+      "source": "GLC_FCS30 2020 (https://www.globallandcover.com/); Hengl, T. (2018). Global Landform and Lithology (https://zenodo.org/records/1464846); SoilGrids v2.0 (https://www.isric.org/explore/soilgrids)",
       "license": "Creative Commons Attribution 4.0",
       "layers": [
         { "id": "landcover", "code": "GLC_FCS30_2020", "display_name": "Land Cover Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "landcover.tif", "value_type": "categorical" },
-        { "id": "lithology", "code": "LITHOLOGY", "display_name": "Lithology Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "lithology.tif", "value_type": "categorical" }
+        { "id": "lithology", "code": "LITHOLOGY", "display_name": "Lithology Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "lithology.tif", "value_type": "categorical" },
+        { "id": "clay", "code": "CLAY_0_5CM", "display_name": "Clay (0-5cm)", "units": "g/kg", "region_root": "regions", "region_size": 10, "filename_template": "clay.tif", "value_type": "numeric" },
+        { "id": "sand", "code": "SAND_0_5CM", "display_name": "Sand (0-5cm)", "units": "g/kg", "region_root": "regions", "region_size": 10, "filename_template": "sand.tif", "value_type": "numeric" },
+        { "id": "silt", "code": "SILT_0_5CM", "display_name": "Silt (0-5cm)", "units": "g/kg", "region_root": "regions", "region_size": 10, "filename_template": "silt.tif", "value_type": "numeric" },
+        { "id": "cfvo", "code": "CFVO_0_5CM", "display_name": "Coarse Fragments (0-5cm)", "units": "cm³/dm³", "region_root": "regions", "region_size": 10, "filename_template": "cfvo.tif", "value_type": "numeric" },
+        { "id": "nitrogen", "code": "NITROGEN_0_5CM", "display_name": "Nitrogen (0-5cm)", "units": "cg/kg", "region_root": "regions", "region_size": 10, "filename_template": "nitrogen.tif", "value_type": "numeric" },
+        { "id": "soc", "code": "SOC_0_5CM", "display_name": "Soil Organic Carbon (0-5cm)", "units": "dg/kg", "region_root": "regions", "region_size": 10, "filename_template": "soc.tif", "value_type": "numeric" },
+        { "id": "phh2o", "code": "PHH2O_0_5CM", "display_name": "pH (Water, 0-5cm)", "units": "pH*10", "region_root": "regions", "region_size": 10, "filename_template": "phh2o.tif", "value_type": "numeric" },
+        { "id": "wrb", "code": "WRB_2006", "display_name": "World Reference Base (2006) Soil Groups", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "wrb.tif", "value_type": "categorical" }
       ]
     },
     {
