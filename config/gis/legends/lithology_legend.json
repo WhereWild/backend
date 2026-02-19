@@ -1,0 +1,111 @@
+{
+  "layer_id": "lithology",
+  "source": "Hengl, T. (2018). Global Landform and Lithology / USGS EcoTapestry",
+  "classes": [
+    {
+      "id": 1,
+      "name": "Acid Plutonics",
+      "description": "Coarse-grained intrusive igneous rocks with high silica content, such as granite and granodiorite, which form the cores of many mountain ranges.",
+      "group": "igneous_plutonic",
+      "group_label": "Plutonic"
+    },
+    {
+      "id": 2,
+      "name": "Acid Volcanics",
+      "description": "Fine-grained to glassy extrusive igneous rocks rich in silica, including rhyolite and obsidian, often associated with explosive volcanic eruptions.",
+      "group": "igneous_volcanic",
+      "group_label": "Volcanic"
+    },
+    {
+      "id": 3,
+      "name": "Basic Plutonics",
+      "description": "Coarse-grained intrusive rocks low in silica and rich in iron and magnesium, such as gabbro and norite, common in oceanic crust and mafic intrusions.",
+      "group": "igneous_plutonic",
+      "group_label": "Plutonic"
+    },
+    {
+      "id": 4,
+      "name": "Basic Volcanics",
+      "description": "Dark, fine-grained extrusive rocks such as basalt and andesite that form ocean floors, flood basalt plateaus, and many island chains.",
+      "group": "igneous_volcanic",
+      "group_label": "Volcanic"
+    },
+    {
+      "id": 5,
+      "name": "Carbonate Sedimentary Rock",
+      "description": "Limestone, dolomite, and chalk formed from the accumulation of marine organisms or chemical precipitation, often hosting karst landscapes.",
+      "group": "sedimentary",
+      "group_label": "Sedimentary"
+    },
+    {
+      "id": 6,
+      "name": "Evaporite",
+      "description": "Salt, gypsum, and anhydrite deposits left behind by the evaporation of ancient seas or saline lakes, found in arid basins and subsurface strata.",
+      "group": "sedimentary",
+      "group_label": "Sedimentary"
+    },
+    {
+      "id": 7,
+      "name": "Ice and Glaciers",
+      "description": "Perennial ice sheets and glaciers covering bedrock, including Greenland, Antarctica, and high-altitude glacier complexes.",
+      "group": "ice",
+      "group_label": "Ice"
+    },
+    {
+      "id": 8,
+      "name": "Intermediate Plutonics",
+      "description": "Intrusive igneous rocks with silica content between mafic and felsic extremes, such as diorite and tonalite.",
+      "group": "igneous_plutonic",
+      "group_label": "Plutonic"
+    },
+    {
+      "id": 9,
+      "name": "Intermediate Volcanics",
+      "description": "Extrusive igneous rocks of intermediate composition including andesite and trachyte, common in subduction zone volcanoes.",
+      "group": "igneous_volcanic",
+      "group_label": "Volcanic"
+    },
+    {
+      "id": 10,
+      "name": "Metamorphics",
+      "description": "Rocks recrystallized under heat and pressure, including schist, gneiss, and quartzite, forming the basement of ancient cratons and orogenic belts.",
+      "group": "metamorphic",
+      "group_label": "Metamorphic"
+    },
+    {
+      "id": 11,
+      "name": "Mixed Sedimentary Rock",
+      "description": "Interbedded or transitional sequences that combine multiple sedimentary rock types and cannot be assigned to a single dominant class.",
+      "group": "sedimentary",
+      "group_label": "Sedimentary"
+    },
+    {
+      "id": 12,
+      "name": "Pyroclastics",
+      "description": "Fragmental volcanic material such as tuff, breccia, and ignimbrite deposited by explosive eruptions or pyroclastic flows.",
+      "group": "igneous_volcanic",
+      "group_label": "Volcanic"
+    },
+    {
+      "id": 13,
+      "name": "Siliciclastic Sedimentary",
+      "description": "Clastic sedimentary rocks composed primarily of silicate mineral grains, including sandstone, siltstone, mudstone, and shale.",
+      "group": "sedimentary",
+      "group_label": "Sedimentary"
+    },
+    {
+      "id": 14,
+      "name": "Unconsolidated Sediment",
+      "description": "Loose, uncemented deposits of sand, gravel, silt, and clay such as river alluvium, coastal dunes, glacial till, and loess sheets.",
+      "group": "unconsolidated",
+      "group_label": "Unconsolidated"
+    },
+    {
+      "id": 15,
+      "name": "Undefined",
+      "description": "Lithology data not available or not classified for this area.",
+      "group": "undefined",
+      "group_label": "Undefined"
+    }
+  ]
+}
