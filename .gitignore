@@ -21,6 +21,9 @@ dist/
 pip-wheel-metadata/
 python_packages/
 
+b2_tabular_schema.json
+b2_schema_summary.json
+
 # Test and coverage output
 .pytest_cache/
 .mypy_cache/
