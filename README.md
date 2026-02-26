@@ -196,7 +196,7 @@ python scripts/export_b2_schema.py \
 This streams metadata from rclone and writes compact summaries (`.json` and `.md`) that are small enough to read.
 
 To infer column schemas/profiles from sampled tabular files referenced by that
-summary:
+summary (that is, from `b2_schema_summary.json` generated above):
 
 ```sh
 python scripts/sample_b2_tabular_schema.py \
@@ -205,9 +205,17 @@ python scripts/sample_b2_tabular_schema.py \
   --max-files 20 \
   --json-out b2_tabular_schema.json \
   --md-out b2_tabular_schema.md
+
+# Or profile from already-downloaded local data instead of rclone:
+python scripts/sample_b2_tabular_schema.py \
+  --local-root data \
+  --summary-json b2_schema_summary.json \
+  --max-files 20 \
+  --json-out b2_tabular_schema.json \
+  --md-out b2_tabular_schema.md
 ```
 
-This keeps downloads bounded (`--max-download-bytes`) and produces a compact schema profile.
+This keeps downloads bounded (`--max-download-bytes`) and produces a compact tabular-schema profile in `b2_tabular_schema.json` and `b2_tabular_schema.md`.
 
 ### Regenerate Markdown Only (No rclone)
 
@@ -220,9 +228,18 @@ python scripts/export_b2_schema.py \
   --md-out b2_schema_summary.md
 
 python scripts/sample_b2_tabular_schema.py \
-  --markdown-from-json b2_tabular_schema.json \
+  --markdown-only \
+  --markdown-input b2_tabular_schema.json \
   --md-out b2_tabular_schema.md
 ```
+
+`sample_b2_tabular_schema.py` has two modes:
+
+- **Profile mode** (default): requires `--remote` and reads candidate files from `--summary-json` (export output).
+- **Profile mode** (default): requires one source flag, either `--remote` or `--local-root`, and reads candidate files from `--summary-json` (export output).
+- **Markdown-only mode**: pass `--markdown-only` and optionally `--markdown-input`.
+  - If `--markdown-input` is omitted, it defaults to `--json-out`.
+  - `--markdown-input` must point to a tabular-schema JSON produced by `sample_b2_tabular_schema.py`, not to `b2_schema_summary.json`.
 
 This is useful when you only changed markdown formatting and want a fast local
 refresh of `.md` files.

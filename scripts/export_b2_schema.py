@@ -146,6 +146,26 @@ def _iter_rclone_lsf_lines(
         raise RuntimeError(message)
 
 
+def _iter_local_lsf_lines(local_root: Path) -> Iterable[str]:
+    if not local_root.exists():
+        raise RuntimeError(f"Local path not found: {local_root}")
+    if not local_root.is_dir():
+        raise RuntimeError(f"Local path must be a directory: {local_root}")
+
+    resolved_root = local_root.resolve()
+    for item in resolved_root.rglob("*"):
+        if not item.is_file():
+            continue
+        try:
+            stat = item.stat()
+        except OSError:
+            continue
+
+        rel_path = item.relative_to(resolved_root).as_posix()
+        modified_utc = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        yield f"{rel_path}\t{stat.st_size}\t{modified_utc}"
+
+
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -174,10 +194,11 @@ def _write_markdown(
         return wrapped
 
     lines: list[str] = []
+    source_value = payload.get("source") or payload.get("remote") or ""
     lines.append("# B2 Dataset Structure Summary")
     lines.append("")
     lines.append(f"- Generated UTC: {payload['generated_utc']}")
-    lines.append(f"- Remote: `{payload['remote']}`")
+    lines.append(f"- Source: `{source_value}`")
     lines.append(f"- Matched files: {payload['totals']['files']:,}")
     lines.append(f"- Total size: {payload['totals']['bytes']:,} bytes ({_format_bytes(payload['totals']['bytes'])})")
     lines.append(f"- Distinct extensions: {payload['totals']['distinct_extensions']:,}")
@@ -265,29 +286,34 @@ def _write_markdown(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export compact B2 dataset structure stats for ML planning without creating a massive manifest file."
+            "Export compact dataset structure stats from an rclone remote or a local directory without creating a massive manifest file."
         )
     )
     parser.add_argument(
         "--markdown-from-json",
         default="",
-        help=("Generate only markdown from an existing JSON summary path and skip rclone listing"),
+        help=("Generate only markdown from an existing JSON summary path and skip source scanning"),
     )
     parser.add_argument(
         "--remote",
         default="",
-        help=("rclone remote root, e.g. wherewild-localdev-reader:wherewild-data"),
+        help=("rclone remote root to scan, e.g. wherewild-localdev-reader:wherewild-data (mutually exclusive with --local-root)"),
+    )
+    parser.add_argument(
+        "--local-root",
+        default="",
+        help=("Local directory root to scan recursively (mutually exclusive with --remote)"),
     )
     parser.add_argument(
         "--config",
         default="docker/rclone.conf",
-        help="Path to rclone config file (default: docker/rclone.conf)",
+        help="Path to rclone config file (used only with --remote; default: docker/rclone.conf)",
     )
     parser.add_argument(
         "--filter-prefix",
         action="append",
         default=[],
-        help="Keep only files under this relative prefix (repeatable)",
+        help="Keep only files whose relative path starts with this prefix (repeatable)",
     )
     parser.add_argument(
         "--prefix-depth",
@@ -361,8 +387,13 @@ def main(stdout: IO[str] | None = None) -> int:
         print(f"Wrote {md_path} from {markdown_from_json}.", file=out)
         return 0
 
-    if not args.remote:
-        parser.error("--remote is required unless --markdown-from-json is provided")
+    remote = args.remote.strip()
+    local_root = Path(args.local_root).expanduser() if args.local_root else None
+
+    if not remote and local_root is None:
+        parser.error("Provide either --remote or --local-root unless --markdown-from-json is provided")
+    if remote and local_root is not None:
+        parser.error("Use only one source: either --remote or --local-root")
 
     config_path = Path(args.config) if args.config else None
     filters = [_normalize_path(path) for path in args.filter_prefix if _normalize_path(path)]
@@ -379,13 +410,24 @@ def main(stdout: IO[str] | None = None) -> int:
     start_monotonic = time.monotonic()
     last_progress_time = start_monotonic
 
-    print(
-        f"Listing remote: {args.remote}",
-        file=out,
-        flush=True,
-    )
+    if local_root is not None:
+        source_value = f"local:{local_root.resolve()}"
+        print(
+            f"Listing local directory: {local_root.resolve()}",
+            file=out,
+            flush=True,
+        )
+        line_iter = _iter_local_lsf_lines(local_root)
+    else:
+        source_value = remote
+        print(
+            f"Listing remote: {remote}",
+            file=out,
+            flush=True,
+        )
+        line_iter = _iter_rclone_lsf_lines(remote, config_path)
 
-    for line in _iter_rclone_lsf_lines(args.remote, config_path):
+    for line in line_iter:
         parts = line.split("\t")
         if len(parts) < 3:
             continue
@@ -438,7 +480,8 @@ def main(stdout: IO[str] | None = None) -> int:
     generated_utc = datetime.now(timezone.utc).isoformat()
     payload = {
         "generated_utc": generated_utc,
-        "remote": args.remote,
+        "source": source_value,
+        "remote": remote,
         "filters": filters,
         "prefix_depth": args.prefix_depth,
         "totals": {

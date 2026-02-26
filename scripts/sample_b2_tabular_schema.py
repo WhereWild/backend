@@ -1,8 +1,11 @@
 """Sample tabular files from B2 and infer compact schema/profile metadata.
 
-This script reads candidate tabular paths from ``b2_schema_summary.json``
+Profile mode reads candidate tabular paths from ``b2_schema_summary.json``
 (produced by ``scripts/export_b2_schema.py``), downloads only bounded-size
-files, and outputs ChatGPT-ready schema summaries.
+files, and writes tabular schema reports.
+
+Markdown-only mode regenerates markdown from an existing tabular-schema JSON
+output produced by this script.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import random
 import tempfile
 import subprocess
 import sys
@@ -264,10 +268,11 @@ def _write_markdown(path: Path, payload: dict) -> None:
         return f"{value[: max_len - 1]}…"
 
     lines: list[str] = []
+    source_value = payload.get("source") or payload.get("remote") or ""
     lines.append("# B2 Tabular Schema Sample")
     lines.append("")
     lines.append(f"- Generated UTC: {payload['generated_utc']}")
-    lines.append(f"- Remote: `{payload['remote']}`")
+    lines.append(f"- Source: `{source_value}`")
     lines.append(f"- Candidates considered: {payload['totals']['candidates_considered']:,}")
     lines.append(f"- Profiles generated: {payload['totals']['profiles_generated']:,}")
     lines.append(f"- Skipped files: {payload['totals']['skipped']:,}")
@@ -323,33 +328,68 @@ def _write_markdown(path: Path, payload: dict) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Sample tabular files from B2 and infer lightweight column schemas for ML planning.")
+        description=(
+            "Profile tabular files referenced by b2_schema_summary.json, or regenerate markdown "
+            "from an existing tabular-schema JSON report."
+        )
+    )
+    parser.add_argument(
+        "--markdown-only",
+        action="store_true",
+        help=(
+            "Regenerate markdown only and skip profiling/rclone. Uses --markdown-input if provided, "
+            "otherwise defaults to --json-out"
+        ),
+    )
+    parser.add_argument(
+        "--markdown-input",
+        default="",
+        help=("Path to an existing tabular-schema JSON produced by this script (used in --markdown-only mode)"),
     )
     parser.add_argument(
         "--markdown-from-json",
+        nargs="?",
+        const="__USE_JSON_OUT__",
         default="",
-        help=("Generate only markdown from an existing tabular-schema JSON path and skip profiling/rclone"),
+        help=("Deprecated alias for --markdown-input; retained for compatibility"),
     )
     parser.add_argument(
         "--remote",
         default="",
-        help=("rclone remote root, e.g. wherewild-localdev-reader:wherewild-data"),
+        help=("rclone remote root for profile mode, e.g. wherewild-localdev-reader:wherewild-data"),
+    )
+    parser.add_argument(
+        "--local-root",
+        default="",
+        help=("Local directory root for profile mode (mutually exclusive with --remote)"),
     )
     parser.add_argument(
         "--config",
         default="docker/rclone.conf",
-        help="Path to rclone config file (default: docker/rclone.conf)",
+        help="Path to rclone config file (used in profile mode; default: docker/rclone.conf)",
     )
     parser.add_argument(
         "--summary-json",
         default="b2_schema_summary.json",
-        help="Input summary JSON from export_b2_schema.py",
+        help=("Input summary JSON from export_b2_schema.py (used in profile mode; default: b2_schema_summary.json)"),
     )
     parser.add_argument(
         "--max-files",
         type=int,
         default=20,
         help="Maximum number of files to profile (default: 20)",
+    )
+    parser.add_argument(
+        "--sample-strategy",
+        choices=["head", "random"],
+        default="head",
+        help="How to choose files from candidates: head (default) or random",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=42,
+        help="Random seed used when --sample-strategy=random (default: 42)",
     )
     parser.add_argument(
         "--max-download-bytes",
@@ -388,50 +428,90 @@ def main(stdout: IO[str] | None = None) -> int:
     if args.sample_rows <= 0:
         parser.error("--sample-rows must be >= 1")
 
-    markdown_from_json = Path(args.markdown_from_json) if args.markdown_from_json else None
-    if markdown_from_json is not None:
-        if not markdown_from_json.exists():
-            parser.error(f"--markdown-from-json file not found: {markdown_from_json}")
-        payload = json.loads(markdown_from_json.read_text(encoding="utf-8"))
+    legacy_markdown_input = args.markdown_from_json
+    if legacy_markdown_input == "__USE_JSON_OUT__":
+        legacy_markdown_input = args.json_out
+
+    markdown_input_value = args.markdown_input.strip() or str(legacy_markdown_input).strip()
+    if args.markdown_only and not markdown_input_value:
+        markdown_input_value = args.json_out
+
+    markdown_input = Path(markdown_input_value) if markdown_input_value else None
+    if markdown_input is not None:
+        if not markdown_input.exists():
+            parser.error(f"Markdown input JSON file not found: {markdown_input}")
+        payload = json.loads(markdown_input.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
-            parser.error("--markdown-from-json must point to a JSON object")
+            parser.error("Markdown input must point to a JSON object")
 
         md_out = Path(args.md_out)
         _write_markdown(md_out, payload)
-        print(f"Wrote {md_out} from {markdown_from_json}.", file=out)
+        print(f"Wrote {md_out} from {markdown_input}.", file=out)
         return 0
 
-    if not args.remote:
-        parser.error("--remote is required unless --markdown-from-json is provided")
+    remote = args.remote.strip()
+    local_root = Path(args.local_root).expanduser() if args.local_root else None
+
+    if not remote and local_root is None:
+        parser.error("Provide either --remote or --local-root unless markdown-only mode is used")
+    if remote and local_root is not None:
+        parser.error("Use only one profile source: either --remote or --local-root")
+    if local_root is not None:
+        if not local_root.exists():
+            parser.error(f"--local-root not found: {local_root}")
+        if not local_root.is_dir():
+            parser.error(f"--local-root must be a directory: {local_root}")
 
     summary_path = Path(args.summary_json)
     if not summary_path.exists():
         parser.error(f"summary file not found: {summary_path}")
 
     config_path = Path(args.config) if args.config else None
+    if local_root is not None:
+        source_value = f"local:{local_root.resolve()}"
+    else:
+        source_value = remote
 
     candidate_paths = _load_summary_paths(summary_path)
     filtered = [path for path in candidate_paths if _extension(path) in TABULAR_EXTENSIONS]
-    selected = filtered[: args.max_files]
+    if args.sample_strategy == "random":
+        rng = random.Random(args.random_seed)
+        if len(filtered) <= args.max_files:
+            selected = list(filtered)
+            rng.shuffle(selected)
+        else:
+            selected = rng.sample(filtered, args.max_files)
+    else:
+        selected = filtered[: args.max_files]
 
     results: list[FileSchemaResult] = []
     profiles_generated = 0
     skipped = 0
     failed = 0
 
-    with tempfile.TemporaryDirectory(prefix="ww-b2-schema-") as tmp_dir_name:
-        tmp_dir = Path(tmp_dir_name)
-
+    if local_root is not None:
         for index, rel_path in enumerate(selected, start=1):
             ext = _extension(rel_path)
-            remote_obj = _join_remote(args.remote, rel_path)
             print(
                 f"[{index}/{len(selected)}] Profiling {rel_path}",
                 file=out,
             )
 
-            file_size = _fetch_object_size(remote_obj, config_path)
-            if file_size is not None and file_size > args.max_download_bytes:
+            local_path = local_root / rel_path
+            if not local_path.exists() or not local_path.is_file():
+                results.append(
+                    FileSchemaResult(
+                        path=rel_path,
+                        extension=ext,
+                        status="failed",
+                        error=(f"Local file not found under --local-root: {local_path}"),
+                    )
+                )
+                failed += 1
+                continue
+
+            file_size = local_path.stat().st_size
+            if file_size > args.max_download_bytes:
                 results.append(
                     FileSchemaResult(
                         path=rel_path,
@@ -442,25 +522,6 @@ def main(stdout: IO[str] | None = None) -> int:
                     )
                 )
                 skipped += 1
-                continue
-
-            local_path = tmp_dir / f"sample_{index}_{Path(rel_path).name}"
-            ok, download_error = _download_object(
-                remote_obj,
-                local_path,
-                config_path,
-            )
-            if not ok:
-                results.append(
-                    FileSchemaResult(
-                        path=rel_path,
-                        extension=ext,
-                        status="failed",
-                        size_bytes=file_size,
-                        error=download_error,
-                    )
-                )
-                failed += 1
                 continue
 
             try:
@@ -491,13 +552,89 @@ def main(stdout: IO[str] | None = None) -> int:
                     )
                 )
                 failed += 1
+    else:
+        with tempfile.TemporaryDirectory(prefix="ww-b2-schema-") as tmp_dir_name:
+            tmp_dir = Path(tmp_dir_name)
+
+            for index, rel_path in enumerate(selected, start=1):
+                ext = _extension(rel_path)
+                remote_obj = _join_remote(remote, rel_path)
+                print(
+                    f"[{index}/{len(selected)}] Profiling {rel_path}",
+                    file=out,
+                )
+
+                file_size = _fetch_object_size(remote_obj, config_path)
+                if file_size is not None and file_size > args.max_download_bytes:
+                    results.append(
+                        FileSchemaResult(
+                            path=rel_path,
+                            extension=ext,
+                            status="skipped",
+                            size_bytes=file_size,
+                            notes=("File exceeds --max-download-bytes; increase limit to include"),
+                        )
+                    )
+                    skipped += 1
+                    continue
+
+                local_path = tmp_dir / f"sample_{index}_{Path(rel_path).name}"
+                ok, download_error = _download_object(
+                    remote_obj,
+                    local_path,
+                    config_path,
+                )
+                if not ok:
+                    results.append(
+                        FileSchemaResult(
+                            path=rel_path,
+                            extension=ext,
+                            status="failed",
+                            size_bytes=file_size,
+                            error=download_error,
+                        )
+                    )
+                    failed += 1
+                    continue
+
+                try:
+                    columns, rows_sampled = _infer_schema(
+                        local_path,
+                        extension=ext,
+                        sample_rows=args.sample_rows,
+                    )
+                    results.append(
+                        FileSchemaResult(
+                            path=rel_path,
+                            extension=ext,
+                            status="profiled",
+                            size_bytes=file_size,
+                            rows_sampled=rows_sampled,
+                            columns=columns,
+                        )
+                    )
+                    profiles_generated += 1
+                except Exception as exc:  # noqa: BLE001
+                    results.append(
+                        FileSchemaResult(
+                            path=rel_path,
+                            extension=ext,
+                            status="failed",
+                            size_bytes=file_size,
+                            error=str(exc),
+                        )
+                    )
+                    failed += 1
 
     payload = {
         "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "remote": args.remote,
+        "source": source_value,
+        "remote": remote,
         "source_summary_json": str(summary_path),
         "limits": {
             "max_files": args.max_files,
+            "sample_strategy": args.sample_strategy,
+            "random_seed": args.random_seed,
             "max_download_bytes": args.max_download_bytes,
             "sample_rows": args.sample_rows,
         },
