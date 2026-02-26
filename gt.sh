@@ -2,9 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "${script_dir}/.." && pwd)"
+project_dir="${script_dir}"
+compose_file="${project_dir}/docker-compose.yml"
 
-project_dir="${root}/wherewild"
-
-docker compose --project-directory "$project_dir" up -d gdal
-docker compose --project-directory "$project_dir" exec -it gdal bash -lc ". /etc/wherewild_aliases.sh 2>/dev/null || true; b2-mount; exec /bin/bash"
+docker compose --project-directory "$project_dir" -f "$compose_file" up -d gdal
+docker compose --project-directory "$project_dir" -f "$compose_file" exec -it gdal bash -lc ". /etc/wherewild_aliases.sh 2>/dev/null || true; b2-mount; exec /bin/bash"
