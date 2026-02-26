@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -34,8 +35,6 @@ default_species_limit = 12
 
 max_species_limit = 100
 
-
-
 app = FastAPI(title=api_title, version=api_version)
 app.add_middleware(
     CORSMiddleware,
@@ -55,6 +54,8 @@ def _preload_gis_legends() -> None:
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+
+
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:
@@ -65,7 +66,7 @@ def _path_exists(path: Path) -> bool:
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
     """Returns a simple liveness payload.
-    
+
     Returns:
         A status string and UTC timestamp.
     """
@@ -74,12 +75,10 @@ def health_check() -> dict[str, str]:
 
 @app.get("/variables")
 def list_environment_variables(
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> List[dict[str, Any]]:
     """Lists available environmental variables.
-    
+
     Returns:
         A list of variable metadata entries.
     """
@@ -95,11 +94,11 @@ def list_species(
     limit: int = Query(default_species_limit, ge=1, le=max_species_limit),
 ) -> List[dict[str, Any]]:
     """Searches taxa by name and returns serialized results.
-    
+
     Args:
         q: Search term for scientific or common names.
         limit: Maximum number of matches to return.
-    
+
     Returns:
         A list of serialized taxon payloads.
     """
@@ -122,10 +121,10 @@ def list_species(
 @app.get("/api/species/{taxon_id}")
 def get_species_detail(taxon_id: int) -> dict[str, Any]:
     """Loads a single taxon record by id.
-    
+
     Args:
         taxon_id: Taxon id to look up.
-    
+
     Returns:
         A serialized taxon payload.
     """
@@ -145,16 +144,51 @@ def search_locations_endpoint(
     limit: int = Query(10, ge=1, le=50),
 ) -> dict[str, Any]:
     """Searches locations by name substring.
-    
+
     Args:
         q: Search term for location names.
         limit: Maximum number of matches to return.
-    
+
     Returns:
         A dict containing location match results.
     """
     matches = gis_lookup.search_locations(q, limit)
     return {"results": matches}
+
+
+def _parse_bbox_csv(raw_bbox: str) -> tuple[float, float, float, float]:
+    parts = [part.strip() for part in raw_bbox.split(",") if part.strip()]
+    if len(parts) != 4:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox must be formatted as 'minLon,minLat,maxLon,maxLat'",
+        )
+    try:
+        min_lon, min_lat, max_lon, max_lat = (float(value) for value in parts)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox values must be valid numbers",
+        ) from exc
+
+    if min_lon >= max_lon or min_lat >= max_lat:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox min values must be less than max values",
+        )
+
+    if min_lon < -180 or max_lon > 180 or min_lat < -90 or max_lat > 90:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox must fall within world bounds: lon [-180,180], lat [-90,90]",
+        )
+
+    return min_lon, min_lat, max_lon, max_lat
+
+
+def _heatmap_cell_size_degrees(zoom: int) -> float:
+    cell_size = 360.0 / (2 ** (zoom + 3))
+    return max(0.05, min(15.0, cell_size))
 
 
 @app.get("/species/{taxon_id}/occurrences")
@@ -163,11 +197,11 @@ def species_occurrences(
     location: Optional[str] = Query(None, description="Filter observations by location gid"),
 ) -> dict[str, Any]:
     """Returns occurrence points for a taxon, optionally filtered by location.
-    
+
     Args:
         taxon_id: Taxon id to query.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict with occurrence count and point records.
     """
@@ -192,6 +226,195 @@ def species_occurrences(
         "count": len(rows),
         "occurrences": rows,
     }
+
+
+@app.get("/species/{taxon_id}/heatmap")
+def species_heatmap(
+    taxon_id: int,
+    location: Optional[str] = Query(None, description="Filter observations by location gid"),
+    bbox: Optional[str] = Query(
+        None,
+        description="Optional bounds as minLon,minLat,maxLon,maxLat",
+    ),
+    zoom: int = Query(5, ge=1, le=12, description="Map zoom hint used to size aggregation cells"),
+    max_cells: int = Query(4000, ge=100, le=20000, description="Maximum cells returned (keeps densest cells)"),
+) -> dict[str, Any]:
+    """Returns an aggregated heatmap grid for a taxon.
+
+    This endpoint is designed for map heatmap rendering at scale. It groups
+    occurrence points into fixed-size geographic cells and returns per-cell
+    intensity values.
+    """
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    if not _path_exists(Path(taxon["path"])):
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+
+    normalized_location = location.strip() if location else None
+    if normalized_location and not gis_lookup.is_valid_location_gid(normalized_location):
+        return {
+            "speciesId": taxon_id,
+            "zoom": zoom,
+            "cellSizeDeg": _heatmap_cell_size_degrees(zoom),
+            "totalPoints": 0,
+            "boundedPoints": 0,
+            "maxIntensity": 0.0,
+            "cells": [],
+        }
+
+    bbox_tuple: tuple[float, float, float, float] | None = None
+    if bbox:
+        bbox_tuple = _parse_bbox_csv(bbox)
+
+    rows = taxa_navigation.load_occurrence_points(taxon_id, normalized_location)
+    total_points = len(rows)
+    cell_size = _heatmap_cell_size_degrees(zoom)
+
+    cell_counts: dict[tuple[int, int], int] = {}
+    bounded_points = 0
+
+    for row in rows:
+        lat = row.get("latitude")
+        lon = row.get("longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            continue
+        lat_value = float(lat)
+        lon_value = float(lon)
+
+        if bbox_tuple is not None:
+            min_lon, min_lat, max_lon, max_lat = bbox_tuple
+            if lon_value < min_lon or lon_value > max_lon or lat_value < min_lat or lat_value > max_lat:
+                continue
+
+        bounded_points += 1
+        x_index = int(math.floor((lon_value + 180.0) / cell_size))
+        y_index = int(math.floor((lat_value + 90.0) / cell_size))
+        key = (x_index, y_index)
+        cell_counts[key] = cell_counts.get(key, 0) + 1
+
+    if not cell_counts:
+        payload: dict[str, Any] = {
+            "speciesId": taxon_id,
+            "zoom": zoom,
+            "cellSizeDeg": cell_size,
+            "totalPoints": total_points,
+            "boundedPoints": bounded_points,
+            "maxIntensity": 0.0,
+            "cells": [],
+        }
+        if bbox_tuple is not None:
+            payload["bbox"] = {
+                "minLon": bbox_tuple[0],
+                "minLat": bbox_tuple[1],
+                "maxLon": bbox_tuple[2],
+                "maxLat": bbox_tuple[3],
+            }
+        return payload
+
+    sorted_cells = sorted(
+        cell_counts.items(),
+        key=lambda item: (-item[1], item[0][1], item[0][0]),
+    )
+    if len(sorted_cells) > max_cells:
+        sorted_cells = sorted_cells[:max_cells]
+
+    max_count = max(count for _, count in sorted_cells)
+    cells: list[dict[str, float | int]] = []
+    for (x_index, y_index), count in sorted_cells:
+        center_lon = (x_index * cell_size) - 180.0 + (cell_size / 2.0)
+        center_lat = (y_index * cell_size) - 90.0 + (cell_size / 2.0)
+        intensity = float(count) / float(max_count) if max_count > 0 else 0.0
+        cells.append({
+            "lat": center_lat,
+            "lon": center_lon,
+            "count": int(count),
+            "intensity": intensity,
+        })
+
+    payload = {
+        "speciesId": taxon_id,
+        "zoom": zoom,
+        "cellSizeDeg": cell_size,
+        "totalPoints": total_points,
+        "boundedPoints": bounded_points,
+        "maxIntensity": 1.0 if max_count > 0 else 0.0,
+        "cells": cells,
+    }
+    if bbox_tuple is not None:
+        payload["bbox"] = {
+            "minLon": bbox_tuple[0],
+            "minLat": bbox_tuple[1],
+            "maxLon": bbox_tuple[2],
+            "maxLat": bbox_tuple[3],
+        }
+    return payload
+
+
+@app.get("/species/{taxon_id}/inference-heatmap")
+def species_inference_heatmap(
+    taxon_id: int,
+    location: Optional[str] = Query(None, description="Filter observations by location gid (fallback mode only)"),
+    bbox: Optional[str] = Query(None, description="Optional bounds as minLon,minLat,maxLon,maxLat"),
+    zoom: int = Query(5, ge=1, le=12, description="Map zoom hint used to size aggregation cells"),
+    max_cells: int = Query(4000, ge=100, le=20000, description="Maximum cells returned (keeps densest cells)"),
+    time_slice: Optional[str] = Query("latest", description="Precomputed time slice id (default latest)"),
+) -> dict[str, Any]:
+    """Returns inference heatmap cells for a taxon.
+
+    Primary path: precomputed global surface cells.
+    Fallback path: legacy point-wise model scoring if precomputed slice is absent.
+    """
+    bbox_tuple: tuple[float, float, float, float] | None = None
+    if bbox:
+        bbox_tuple = _parse_bbox_csv(bbox)
+    inference_heatmap = import_module("util.inference_heatmap")
+    return inference_heatmap.get_species_inference_heatmap_payload(
+        taxon_id=taxon_id,
+        location=location,
+        bbox_tuple=bbox_tuple,
+        zoom=zoom,
+        max_cells=max_cells,
+        time_slice=time_slice,
+        path_exists=_path_exists,
+    )
+
+
+@app.get("/species/{taxon_id}/inference-heatmap-dynamic")
+def species_inference_heatmap_dynamic(
+    taxon_id: int,
+    center_lat: float = Query(..., ge=-90.0, le=90.0, description="Viewport center latitude"),
+    center_lon: float = Query(..., ge=-180.0, le=180.0, description="Viewport center longitude"),
+    viewport_width_deg: float = Query(..., gt=0.0, le=360.0, description="Viewport width in degrees"),
+    viewport_height_deg: float = Query(..., gt=0.0, le=180.0, description="Viewport height in degrees"),
+    density: int = Query(64, ge=4, le=300, description="Grid density (points per axis)"),
+    workers: int = Query(4, ge=1, le=16, description="Worker threads for tile sampling"),
+    apply_range_filter: bool = Query(True, description="Filter dynamic points to species occurrence envelope"),
+    apply_ood_penalty: bool = Query(True, description="Apply smooth out-of-envelope score penalty"),
+    ood_penalty_strength: float = Query(0.12, ge=0.0, le=2.0, description="Penalty decay per degree outside envelope"),
+    time_slice: Optional[str] = Query("dynamic", description="Label returned in payload"),
+) -> dict[str, Any]:
+    """Returns dynamic per-point inference for a viewport grid.
+
+    This mode runs model inference on-demand for sampled points derived from
+    center + viewport dimensions + density, rather than reading precomputed cells.
+    """
+    inference_heatmap = import_module("util.inference_heatmap")
+    return inference_heatmap.get_species_inference_heatmap_dynamic_payload(
+        taxon_id=taxon_id,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        viewport_width_deg=viewport_width_deg,
+        viewport_height_deg=viewport_height_deg,
+        density=density,
+        workers=workers,
+        apply_range_filter=apply_range_filter,
+        apply_ood_penalty=apply_ood_penalty,
+        ood_penalty_strength=ood_penalty_strength,
+        path_exists=_path_exists,
+        time_slice=time_slice,
+    )
+
 
 @app.get("/species/{taxon_id}/locations")
 def species_locations(
@@ -222,10 +445,7 @@ def species_locations(
     if not entries:
         return []
 
-    level_by_scope = {
-        str(scope): int(level_idx)
-        for level_idx, scope in CONFIG.location_scope_by_level.items()
-    }
+    level_by_scope = {str(scope): int(level_idx) for level_idx, scope in CONFIG.location_scope_by_level.items()}
     level_by_scope["gbif_region"] = -1
 
     parent_tokens = [token.strip() for token in (parent or "").split("|") if token.strip()]
@@ -280,10 +500,7 @@ def species_locations(
         cand_name = name.lower()
         hierarchy_name_set = {item.lower() for item in hierarchy_names}
         for name_options, gid_options in parent_matchers:
-            name_match = (
-                bool(name_options & hierarchy_name_set)
-                or cand_name in name_options
-            )
+            name_match = bool(name_options & hierarchy_name_set) or cand_name in name_options
             gid_match = cand_gid in gid_options or bool(gid_options & hierarchy_gids)
             if not (name_match or gid_match):
                 return False
@@ -321,15 +538,13 @@ def species_locations(
         if not matches_parent(gid_key, location_name, hierarchy, hierarchy_gids):
             continue
 
-        results.append(
-            {
-                "gid": gid_key,
-                "name": location_name,
-                "level": location_level,
-                "hierarchy": hierarchy,
-                "count": int(count),
-            }
-        )
+        results.append({
+            "gid": gid_key,
+            "name": location_name,
+            "level": location_level,
+            "hierarchy": hierarchy,
+            "count": int(count),
+        })
 
     results.sort(
         key=lambda item: (
@@ -342,11 +557,14 @@ def species_locations(
         return results[:limit]
     return results
 
+
 @app.get("/locations/search_hierarchy")
 def search_locations_by_hierarchy(
     q: str = Query("", description="Location name or partial match (optional if parent provided)"),
     level: Optional[str] = Query(None, description="continent|country|state|county or numeric level code"),
-    parent: Optional[str] = Query(None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."),
+    parent: Optional[str] = Query(
+        None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."
+    ),
     limit: int = Query(50, ge=1, le=1000),
 ) -> dict[str, Any]:
 
@@ -498,6 +716,7 @@ def search_locations_by_hierarchy(
 
     return {"results": results}
 
+
 @app.get("/species/{taxon_id}/environment/{variable_id}")
 def species_environment_stats(
     taxon_id: int,
@@ -505,17 +724,15 @@ def species_environment_stats(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns environment stats for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Environmental variable id.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing summary stats, distributions, and rankings.
     """
@@ -753,14 +970,14 @@ def species_environment_class_samples(
     ),
 ) -> dict[str, Any]:
     """Returns categorical class samples for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Categorical variable id.
         class_value: Class value to match.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing matching observation samples.
     """
@@ -828,12 +1045,10 @@ def species_environment_slice(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns numeric samples within a value range for a taxon/variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Numeric variable id.
@@ -841,7 +1056,7 @@ def species_environment_slice(
         max_value: Maximum value to include.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing range parameters and matching observations.
     """
@@ -904,14 +1119,12 @@ def species_environment_slice(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     observations: list[dict[str, Any]] = []
     for catalog, lat, lon, value in rows:
-        observations.append(
-            {
-                "catalogNumber": catalog,
-                "value": float(value) if isinstance(value, (int, float)) else value,
-                "latitude": lat,
-                "longitude": lon,
-            }
-        )
+        observations.append({
+            "catalogNumber": catalog,
+            "value": float(value) if isinstance(value, (int, float)) else value,
+            "latitude": lat,
+            "longitude": lon,
+        })
     response = {
         "speciesId": taxon_id,
         "variable": variable_id,
@@ -933,9 +1146,7 @@ def get_relative_rankings(
     limit: int = Query(50, ge=1, le=200),
     order: str = Query("asc", description="Sort order: asc or desc"),
     min_samples: int = Query(0, ge=0, description="Minimum samples required to appear"),
-    include_species_like: bool = Query(
-        False, description="When rank=SPECIES, include subspecies/varieties/forms"
-    ),
+    include_species_like: bool = Query(False, description="When rank=SPECIES, include subspecies/varieties/forms"),
     include_distribution: bool = Query(
         False,
         description=(
@@ -947,12 +1158,10 @@ def get_relative_rankings(
         None,
         description="Optional location GID (GADM) or GBIF region to filter descendants by",
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns descendant rankings for a taxon by variable/metric.
-    
+
     Args:
         taxon_id: Ancestor taxon id to rank descendants under.
         rank: Descendant rank to include.
@@ -964,7 +1173,7 @@ def get_relative_rankings(
         include_species_like: Whether to include subspecies-like ranks for species.
         include_distribution: Whether to return raw values for density curves.
         location: Optional location GID to filter descendants by occurrence membership.
-    
+
     Returns:
         A dict containing ranking entries and optional distribution data.
     """
@@ -1018,11 +1227,11 @@ def list_relative_ranking_options(
     rank: str = Query(..., description="Descendant rank to inspect (e.g., SPECIES)"),
 ) -> dict[str, Any]:
     """Lists available ranking metrics for an ancestor/rank.
-    
+
     Args:
         taxon_id: Ancestor taxon id to inspect.
         rank: Descendant rank to inspect.
-    
+
     Returns:
         A dict containing available variable/metric options.
     """

@@ -195,6 +195,21 @@ python scripts/export_b2_schema.py \
 
 This streams metadata from rclone and writes compact summaries (`.json` and `.md`) that are small enough to read.
 
+### Train 4-Species Prototype (Geo Feature Mode)
+
+The 4-species prototype trainer supports coordinate feature strategies to reduce
+raw lat/lon shortcut learning:
+
+```sh
+python scripts/ml/train_four_species_prototype.py --geo-feature-mode cyclic
+```
+
+- `cyclic` (default): uses `sin/cos` harmonics of latitude/longitude and excludes raw `decimalLatitude`/`decimalLongitude` from model features.
+- `both`: uses both raw coordinates and harmonics.
+- `raw`: uses raw coordinates only.
+
+Recommended default is `cyclic` together with `--split-method spatial`.
+
 To infer column schemas/profiles from sampled tabular files referenced by that
 summary (that is, from `b2_schema_summary.json` generated above):
 
@@ -238,8 +253,8 @@ python scripts/sample_b2_tabular_schema.py \
 - **Profile mode** (default): requires `--remote` and reads candidate files from `--summary-json` (export output).
 - **Profile mode** (default): requires one source flag, either `--remote` or `--local-root`, and reads candidate files from `--summary-json` (export output).
 - **Markdown-only mode**: pass `--markdown-only` and optionally `--markdown-input`.
-  - If `--markdown-input` is omitted, it defaults to `--json-out`.
-  - `--markdown-input` must point to a tabular-schema JSON produced by `sample_b2_tabular_schema.py`, not to `b2_schema_summary.json`.
+    - If `--markdown-input` is omitted, it defaults to `--json-out`.
+    - `--markdown-input` must point to a tabular-schema JSON produced by `sample_b2_tabular_schema.py`, not to `b2_schema_summary.json`.
 
 This is useful when you only changed markdown formatting and want a fast local
 refresh of `.md` files.

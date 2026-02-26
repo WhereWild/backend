@@ -1,0 +1,64 @@
+{
+  "name": "four_species_global_surface",
+  "version": "v1",
+  "goal": "Predict continuous global suitability surfaces per species for the current four-species prototype and serve precomputed heatmap tiles.",
+  "species": [
+    "Escobaria vivipara",
+    "Haliaeetus leucocephalus",
+    "Spea intermontana",
+    "Hypaurotis crysalus"
+  ],
+  "training": {
+    "script": "scripts/train_four_species_prototype.py",
+    "model_family": "shared_encoder_species_embedding_pu",
+    "background_ratio": 10,
+    "hard_negative_ratio": 0.5,
+    "latent_dim": 64,
+    "epochs": 15,
+    "batch_size": 2048,
+    "learning_rate": 0.03,
+    "split_method": "spatial",
+    "val_fraction": 0.2,
+    "focal_gamma": 2.0,
+    "mixed_precision": false,
+    "gradient_accumulation": false
+  },
+  "calibration": {
+    "method": "per_species_platt_scaling",
+    "artifact": "artifacts/ml_prototype_4_species/calibration.json"
+  },
+  "inference": {
+    "surface_script": "scripts/build_four_species_global_surface.py",
+    "time_slice": "static",
+    "grid_stride": 6,
+    "input_layers": [
+      "bio_1..bio_19",
+      "dem/elevation",
+      "landcover",
+      "koppen_geiger",
+      "lat/lon harmonics"
+    ],
+    "outputs": {
+      "cells": "artifacts/ml_global_surface_4_species/<time_slice>/cells/*.parquet",
+      "manifest": "artifacts/ml_global_surface_4_species/<time_slice>/manifest.json",
+      "latest_pointer": "artifacts/ml_global_surface_4_species/latest.json",
+      "geotiff": "artifacts/ml_global_surface_4_species/<time_slice>/geotiff/<species_slug>/*.tif"
+    }
+  },
+  "serving": {
+    "endpoint": "/species/{taxon_id}/inference-heatmap",
+    "mode": "precomputed_surface_cells",
+    "fallback": "legacy_point_scoring",
+    "time_slice_query_param": "time_slice"
+  },
+  "schedule": {
+    "full_retrain": "weekly",
+    "surface_rebuild": "weekly",
+    "head_refresh": "daily"
+  },
+  "compute_target": {
+    "target": "single GPU 32GB",
+    "current_repo_status": "numpy_cpu_baseline",
+    "notes": "Current implementation is CPU-first; parameters are kept explicit so a torch migration can retain the same contract."
+  }
+}
