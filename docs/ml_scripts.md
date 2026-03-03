@@ -62,6 +62,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
     --log-slow-read-seconds 10 \
     --schema-log-interval-files 30 \
     --template-scan-max-files 50000 \
+    --partition-mode split/year_month \
     --max-rows-per-file 500000 \
     --keep-staging
 ```
@@ -82,6 +83,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
     --log-slow-file-seconds 10 \
     --log-slow-read-seconds 10 \
     --schema-log-interval-files 30 \
+    --partition-mode split/year_month \
     --max-rows-per-file 500000 \
     --keep-staging
 ```
@@ -107,6 +109,10 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Logs progress during global feature-template schema scan.
 - `--template-scan-max-files`
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).
+- `--partition-mode`
+    - `split`: fewest partitions, usually fewest output files.
+    - `split/year_month`: good training default to reduce file counts while preserving time partitions.
+    - `split/year_month/region_id`: most granular; usually highest file counts.
 
 ## 2) Validate output schema
 
@@ -121,7 +127,7 @@ uv run python scripts/machine_learning/validate_training_schema.py \
 Notes:
 
 - Use `--partitioning hive` for partitioned datasets written as
-  `split=.../year_month=.../region_id=...`.
+    `split=...`, `split=.../year_month=...`, or `split=.../year_month=.../region_id=...`.
 - `fixed_size_list<float>` vectors are accepted as compatible with schema `list<float>`.
 
 ## 3) Regenerate schema docs

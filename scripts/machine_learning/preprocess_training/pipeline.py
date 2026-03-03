@@ -82,6 +82,7 @@ def run_preprocess(args) -> int:
     print(f"Output dir: {output_root}")
     print(f"Fallback time policy: {args.fallback_time_policy}")
     print(f"Background ratio: {args.background_ratio:.3f}")
+    print(f"Partition mode: {args.partition_mode}")
     if float(args.background_ratio) <= 0.0:
         print("Warning: background ratio is 0.0; output will contain positives only (no unlabeled/background rows).")
 
@@ -206,18 +207,20 @@ def run_preprocess(args) -> int:
         staged_dataset = ds.dataset(staging_dir, format="parquet")
         output_root.mkdir(parents=True, exist_ok=True)
 
+        partition_field_map = {
+            "split": ["split"],
+            "split/year_month": ["split", "year_month"],
+            "split/year_month/region_id": ["split", "year_month", "region_id"],
+        }
+        partition_fields = partition_field_map[args.partition_mode]
+        partition_schema = pa.schema([pa.field(field_name, pa.string()) for field_name in partition_fields])
+
         ds.write_dataset(
             data=staged_dataset,
             base_dir=output_root,
             format="parquet",
             partitioning=ds.partitioning(
-                pa.schema(
-                    [
-                        pa.field("split", pa.string()),
-                        pa.field("year_month", pa.string()),
-                        pa.field("region_id", pa.string()),
-                    ]
-                ),
+                partition_schema,
                 flavor="hive",
             ),
             max_rows_per_file=args.max_rows_per_file,
