@@ -79,6 +79,8 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 ### Stage B - Train global encoder once
 
+This stage can be run without species labels (self-supervised/unsupervised pretraining on all rows).
+
 Multi-task objective (recommended):
 
 - self-supervised contrastive term on nearby vs far cells,
@@ -93,6 +95,8 @@ Default settings:
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads
+
+After Stage B, use the pretrained encoder embedding as the fixed representation for species-level training.
 
 - freeze encoder,
 - train PU logistic head per species (parallelized CPU/GPU mini-jobs),
