@@ -254,7 +254,7 @@ Quick commands:
 
 ```sh
 # Build training dataset shards (smoke run)
-uv run python scripts/machine_learning/preprocess_training_observations.py \
+uv run python scripts/machine_learning/preprocess_training/cli.py \
   --input-root ./data \
   --output-root ./data/training_observation_smoke \
   --max-files 100 \

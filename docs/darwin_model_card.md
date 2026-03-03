@@ -173,7 +173,7 @@ This matches all requirements: modular per-species updates, mobile inference, si
 Reference implementation script:
 
 ```bash
-uv run python scripts/machine-learning/preprocess_training_observations.py \
+uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root /data \
     --output-root /data/training_observation \
     --threads 16 \
