@@ -16,6 +16,7 @@ import pyarrow.dataset as ds
 
 
 def _parse_type(type_name: str) -> pa.DataType:
+    """Parse a contract type string into a PyArrow data type."""
     normalized = type_name.strip().lower()
 
     scalar_types: dict[str, pa.DataType] = {
@@ -40,6 +41,7 @@ def _parse_type(type_name: str) -> pa.DataType:
 
 
 def _load_contract(schema_path: Path) -> tuple[dict[str, pa.DataType], set[str]]:
+    """Load expected column types and required field names from schema JSON."""
     payload = json.loads(schema_path.read_text(encoding="utf-8"))
 
     expected: dict[str, pa.DataType] = {}
@@ -55,12 +57,14 @@ def _load_contract(schema_path: Path) -> tuple[dict[str, pa.DataType], set[str]]
     return expected, required
 
 
-def _read_data_schema(data_path: Path) -> pa.Schema:
-    dataset = ds.dataset(data_path, format="parquet")
+def _read_data_schema(data_path: Path, partitioning: str | None = "hive") -> pa.Schema:
+    """Read dataset schema from a parquet file or directory."""
+    dataset = ds.dataset(data_path, format="parquet", partitioning=partitioning)
     return dataset.schema
 
 
 def _type_matches(actual: pa.DataType, expected: pa.DataType) -> bool:
+    """Return True when actual arrow type is compatible with expected contract type."""
     if actual == expected:
         return True
 
@@ -68,6 +72,9 @@ def _type_matches(actual: pa.DataType, expected: pa.DataType) -> bool:
         return actual.unit == expected.unit and actual.tz == expected.tz
 
     if pa.types.is_list(actual) and pa.types.is_list(expected):
+        return _type_matches(actual.value_type, expected.value_type)
+
+    if pa.types.is_fixed_size_list(actual) and pa.types.is_list(expected):
         return _type_matches(actual.value_type, expected.value_type)
 
     return False
@@ -78,6 +85,7 @@ def _validate_with_loaded(
     required: set[str],
     actual_schema: pa.Schema,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Validate loaded schema objects and return missing, mismatched, and extra columns."""
     actual_fields = {field.name: field.type for field in actual_schema}
 
     missing_required = sorted(name for name in required if name not in actual_fields)
@@ -96,14 +104,21 @@ def _validate_with_loaded(
     return missing_required, missing_optional, type_mismatches, extras
 
 
-def validate(schema_path: Path, data_path: Path) -> tuple[list[str], list[str], list[str], list[str]]:
+def validate(
+    schema_path: Path,
+    data_path: Path,
+    *,
+    partitioning: str | None = "hive",
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Convenience wrapper that loads schema/data before validation."""
     expected, required = _load_contract(schema_path)
-    actual_schema = _read_data_schema(data_path)
+    actual_schema = _read_data_schema(data_path, partitioning=partitioning)
 
     return _validate_with_loaded(expected=expected, required=required, actual_schema=actual_schema)
 
 
 def main() -> int:
+    """CLI entrypoint for dataset/schema validation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema",
@@ -122,46 +137,52 @@ def main() -> int:
         action="store_true",
         help="If set, do not fail when data contains columns absent from schema.",
     )
+    parser.add_argument(
+        "--partitioning",
+        type=str,
+        default="hive",
+        choices=["hive", "none"],
+        help="Dataset partitioning mode. Use 'hive' for split/year_month/region_id directory partitions.",
+    )
 
     args = parser.parse_args()
 
+    partitioning_mode: str | None = None if args.partitioning == "none" else args.partitioning
+
     expected, required = _load_contract(args.schema)
-    actual_schema = _read_data_schema(args.data)
+    actual_schema = _read_data_schema(args.data, partitioning=partitioning_mode)
     missing_required, missing_optional, type_mismatches, extras = _validate_with_loaded(
         expected=expected,
         required=required,
         actual_schema=actual_schema,
     )
 
+    def _print_items(title: str, items: list[str]) -> None:
+        if not items:
+            return
+        print(title)
+        for item in items:
+            print(f"  - {item}")
+
     has_error = False
 
     if missing_required:
         has_error = True
-        print("Missing required columns:")
-        for name in missing_required:
-            print(f"  - {name}")
+        _print_items("Missing required columns:", missing_required)
 
     if type_mismatches:
         has_error = True
-        print("Type mismatches:")
-        for mismatch in type_mismatches:
-            print(f"  - {mismatch}")
+        _print_items("Type mismatches:", type_mismatches)
 
     if extras and not args.allow_extra_columns:
         has_error = True
-        print("Extra columns (not in schema):")
-        for name in extras:
-            print(f"  - {name}")
+        _print_items("Extra columns (not in schema):", extras)
 
     if missing_optional:
-        print("Missing optional columns:")
-        for name in missing_optional:
-            print(f"  - {name}")
+        _print_items("Missing optional columns:", missing_optional)
 
     if extras and args.allow_extra_columns:
-        print("Extra columns (allowed):")
-        for name in extras:
-            print(f"  - {name}")
+        _print_items("Extra columns (allowed):", extras)
 
     if has_error:
         print("Validation failed.")

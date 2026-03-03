@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def _render_markdown(schema: dict) -> str:
+    """Render the schema contract payload as project Markdown documentation."""
     storage = schema.get("storage", {})
     notes = schema.get("notes", {})
     columns = schema.get("columns", [])
@@ -78,6 +79,7 @@ def _render_markdown(schema: dict) -> str:
 
 
 def main() -> int:
+    """CLI entrypoint for generating schema documentation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema",
