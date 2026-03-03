@@ -37,9 +37,12 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 | `split` | `string` | yes | `metadata` | Dataset split label (train/val/test) from spatiotemporal splitter. |
 | `source` | `string` | yes | `metadata` | Data source tag (e.g., gbif, inat, generated_background). |
 | `feature_version` | `string` | yes | `metadata` | Version of feature engineering order and normalization. |
-| `env_features` | `list<float32>` | yes | `input` | Dense static environmental feature vector (BIO, elevation, etc.). |
+| `env_features` | `list<float32>` | no | `input` | Dense static environmental feature vector (BIO, elevation, etc.). |
+| `env_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to env_features (1=missing, 0=observed). |
 | `habitat_features` | `list<float32>` | no | `input` | Dense habitat/landcover neighborhood feature vector. |
+| `habitat_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to habitat_features (1=missing, 0=observed). |
 | `weather_features` | `list<float32>` | no | `input` | Dense recent weather feature vector aligned to event_time_utc. |
+| `weather_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to weather_features (1=missing, 0=observed). |
 
 ## Validation
 

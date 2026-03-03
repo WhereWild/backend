@@ -43,6 +43,8 @@ def _parse_type(type_name: str) -> pa.DataType:
 def _load_contract(schema_path: Path) -> tuple[dict[str, pa.DataType], set[str]]:
     """Load expected column types and required field names from schema JSON."""
     payload = json.loads(schema_path.read_text(encoding="utf-8"))
+    # This contract uses a custom schema format keyed by `columns`; we intentionally
+    # do not validate generic JSON Schema meta-fields (including `$schema`) here.
 
     expected: dict[str, pa.DataType] = {}
     required: set[str] = set()

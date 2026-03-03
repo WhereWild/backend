@@ -79,6 +79,8 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 ### Stage B - Train global encoder once
 
+This stage can be run without species labels (self-supervised/unsupervised pretraining on all rows).
+
 Multi-task objective (recommended):
 
 - self-supervised contrastive term on nearby vs far cells,
@@ -93,6 +95,8 @@ Default settings:
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads
+
+After Stage B, use the pretrained encoder embedding as the fixed representation for species-level training.
 
 - freeze encoder,
 - train PU logistic head per species (parallelized CPU/GPU mini-jobs),
@@ -173,10 +177,11 @@ This matches all requirements: modular per-species updates, mobile inference, si
 Reference implementation script:
 
 ```bash
-uv run python scripts/machine-learning/preprocess_training_observations.py \
+uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root /data \
     --output-root /data/training_observation \
     --threads 16 \
+    --background-ratio 1.0 \
     --overwrite-output
 ```
 
@@ -184,6 +189,8 @@ Notes:
 
 - The script performs file-level multithreading for faster NVMe throughput.
 - It keeps `lat/lon/time/source` as metadata fields and excludes them from model input vectors.
+- Static and temporal context can be joined during this preprocessing step via configured context inputs, or pre-joined upstream into occurrence files; whichever path is used should be kept consistent per `feature_version`.
+- Known issue: current background sampling is not yet spatially stratified over an explicit accessible-area `M` definition; treat this as a temporary approximation until stratified/background-area sampling is implemented.
 
 ## 10) Partition Strategy: Time vs Species
 

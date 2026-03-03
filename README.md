@@ -283,13 +283,39 @@ python scripts/sample_b2_tabular_schema.py \
 - **Profile mode** (default): requires `--remote` and reads candidate files from `--summary-json` (export output).
 - **Profile mode** (default): requires one source flag, either `--remote` or `--local-root`, and reads candidate files from `--summary-json` (export output).
 - **Markdown-only mode**: pass `--markdown-only` and optionally `--markdown-input`.
-  - If `--markdown-input` is omitted, it defaults to `--json-out`.
-  - `--markdown-input` must point to a tabular-schema JSON produced by `sample_b2_tabular_schema.py`, not to `b2_schema_summary.json`.
+    - If `--markdown-input` is omitted, it defaults to `--json-out`.
+    - `--markdown-input` must point to a tabular-schema JSON produced by `sample_b2_tabular_schema.py`, not to `b2_schema_summary.json`.
 
 This is useful when you only changed markdown formatting and want a fast local
 refresh of `.md` files.
 
 Finally, it's a great idea to install the [parquet viewer](https://marketplace.visualstudio.com/items?itemName=dvirtz.parquet-viewer) extension on VSCode which allows the viewing of parquet files as simple csvs which really helps quick manual inspection. It will likely require you install pyarrow or fastparquet OUTSIDE of Docker or something similar so it can convert the parquets to CSVs. [Rainbow CSV](https://marketplace.visualstudio.com/items?itemName=mechatroner.rainbow-csv) is also a great addition with this that makes it easy to tell which values are part of which columns.
+
+## ML Data Scripts
+
+For ML preprocessing and schema workflow, see [docs/ml_scripts.md](docs/ml_scripts.md).
+
+Quick commands:
+
+```sh
+# Build training dataset shards (smoke run)
+uv run python scripts/machine_learning/preprocess_training/cli.py \
+  --input-root ./data \
+  --output-root ./data/training_observation_smoke \
+  --max-files 100 \
+  --threads 8 \
+  --overwrite-output
+
+# Validate output schema contract
+uv run python scripts/machine_learning/validate_training_schema.py \
+  --schema schemas/training_observation.schema.json \
+  --data ./data/training_observation_smoke \
+  --partitioning hive \
+  --allow-extra-columns
+
+# Regenerate schema docs from JSON contract
+uv run python scripts/machine_learning/generate_training_schema_docs.py
+```
 
 ## More
 

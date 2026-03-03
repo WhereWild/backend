@@ -120,9 +120,16 @@
     {
       "name": "env_features",
       "parquet_type": "list<float32>",
-      "required": true,
+      "required": false,
       "feature_role": "input",
       "description": "Dense static environmental feature vector (BIO, elevation, etc.)."
+    },
+    {
+      "name": "env_missing_mask",
+      "parquet_type": "list<int8>",
+      "required": false,
+      "feature_role": "metadata",
+      "description": "Missingness mask aligned to env_features (1=missing, 0=observed)."
     },
     {
       "name": "habitat_features",
@@ -132,11 +139,25 @@
       "description": "Dense habitat/landcover neighborhood feature vector."
     },
     {
+      "name": "habitat_missing_mask",
+      "parquet_type": "list<int8>",
+      "required": false,
+      "feature_role": "metadata",
+      "description": "Missingness mask aligned to habitat_features (1=missing, 0=observed)."
+    },
+    {
       "name": "weather_features",
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
       "description": "Dense recent weather feature vector aligned to event_time_utc."
+    },
+    {
+      "name": "weather_missing_mask",
+      "parquet_type": "list<int8>",
+      "required": false,
+      "feature_role": "metadata",
+      "description": "Missingness mask aligned to weather_features (1=missing, 0=observed)."
     }
   ]
 }
