@@ -14,6 +14,16 @@ import pyarrow.dataset as ds
 from transform import build_feature_template, transform_file
 
 
+FEATURE_CELL_SIZE_DEG = 0.25
+FEATURE_REGION_SIZE_DEG = 10.0
+MISSING_FEATURE_SENTINEL = -9999.0
+PROGRESS_INTERVAL_SECONDS = 30.0
+LOG_SLOW_FILE_SECONDS = 20.0
+LOG_SLOW_READ_SECONDS = 8.0
+SCHEMA_LOG_INTERVAL_FILES = 500
+FINAL_WRITE_USE_THREADS = False
+
+
 def discover_files(input_root: Path, glob_pattern: str, max_files: int) -> list[Path]:
     """Discover input parquet files under root using glob and optional file cap."""
     files = [path for path in input_root.glob(glob_pattern) if path.is_file()]
@@ -76,13 +86,29 @@ def run_preprocess(args) -> int:
     if not files:
         raise SystemExit(f"No parquet files found in {input_root} with glob '{args.glob}'.")
 
+    fallback_time_policy = "drop" if bool(args.drop_missing_time) else "keep"
+
     print(f"Discovered {len(files):,} parquet files.")
     print(f"Using {args.threads} worker threads.")
     print(f"Staging dir: {staging_dir}")
     print(f"Output dir: {output_root}")
-    print(f"Fallback time policy: {args.fallback_time_policy}")
+    print(f"Fallback time policy: {fallback_time_policy}")
+    print(f"Missing feature sentinel: {MISSING_FEATURE_SENTINEL:.3f}")
+    print("Include missing masks: True")
     print(f"Background ratio: {args.background_ratio:.3f}")
+    print(f"Warn min cells/species: {int(args.warn_min_cells_per_species)}")
     print(f"Partition mode: {args.partition_mode}")
+    print(f"Final write batch size (files): {int(args.final_write_batch_files)}")
+    print(f"Final write use threads: {FINAL_WRITE_USE_THREADS}")
+    if args.static_context_template:
+        print(f"Static context template: {args.static_context_template}")
+    if args.static_context_path is not None:
+        print(f"Static context path: {args.static_context_path}")
+    if args.temporal_context_template:
+        print(f"Temporal context template: {args.temporal_context_template}")
+    if args.temporal_context_path is not None:
+        print(f"Temporal context path: {args.temporal_context_path}")
+    print("Auto context discovery: True")
     if float(args.background_ratio) <= 0.0:
         print("Warning: background ratio is 0.0; output will contain positives only (no unlabeled/background rows).")
 
@@ -92,8 +118,8 @@ def run_preprocess(args) -> int:
     template_start = time.perf_counter()
     feature_template = build_feature_template(
         files,
-        schema_log_interval_files=args.schema_log_interval_files,
-        log_slow_read_seconds=float(args.log_slow_read_seconds),
+        schema_log_interval_files=SCHEMA_LOG_INTERVAL_FILES,
+        log_slow_read_seconds=LOG_SLOW_READ_SECONDS,
         template_scan_max_files=int(args.template_scan_max_files),
     )
     template_seconds = time.perf_counter() - template_start
@@ -110,6 +136,9 @@ def run_preprocess(args) -> int:
     written = 0
     staged_paths: list[Path] = []
     failures: list[tuple[Path, str]] = []
+    low_cell_warnings: list[str] = []
+    static_join_rows_total = 0
+    temporal_join_rows_total = 0
 
     run_start = time.perf_counter()
 
@@ -120,11 +149,19 @@ def run_preprocess(args) -> int:
                 path,
                 staging_dir,
                 feature_version=args.feature_version,
-                cell_size_deg=args.cell_size_deg,
-                region_size_deg=args.region_size_deg,
+                cell_size_deg=FEATURE_CELL_SIZE_DEG,
+                region_size_deg=FEATURE_REGION_SIZE_DEG,
                 feature_template=feature_template,
-                fallback_time_policy=args.fallback_time_policy,
+                fallback_time_policy=fallback_time_policy,
                 background_ratio=args.background_ratio,
+                missing_feature_sentinel=MISSING_FEATURE_SENTINEL,
+                warn_min_cells_per_species=int(args.warn_min_cells_per_species),
+                static_context_template=str(args.static_context_template or ""),
+                static_context_path=args.static_context_path,
+                static_context_required=bool(args.static_context_required),
+                temporal_context_template=str(args.temporal_context_template or ""),
+                temporal_context_path=args.temporal_context_path,
+                temporal_context_required=bool(args.temporal_context_required),
             ): path
             for path in files
         }
@@ -136,7 +173,7 @@ def run_preprocess(args) -> int:
         while pending:
             done, pending = wait(
                 pending,
-                timeout=max(1.0, float(args.progress_interval_seconds)),
+                timeout=max(1.0, PROGRESS_INTERVAL_SECONDS),
                 return_when=FIRST_COMPLETED,
             )
 
@@ -148,9 +185,7 @@ def run_preprocess(args) -> int:
                     key=lambda item: item[0],
                     reverse=True,
                 )[:3]
-                oldest_text = " | ".join(
-                    f"{duration:.1f}s:{path}" for duration, path in oldest_active
-                )
+                oldest_text = " | ".join(f"{duration:.1f}s:{path}" for duration, path in oldest_active)
                 print(
                     f"Heartbeat | processed: {processed:,}/{total:,} | "
                     f"rows written: {written:,} | failures: {len(failures):,} | "
@@ -168,16 +203,14 @@ def run_preprocess(args) -> int:
                     result = future.result()
                     staged_paths.append(result.out_path)
                     written += result.rows
-                    if result.read_seconds >= float(args.log_slow_read_seconds):
-                        print(
-                            f"Slow read ({result.read_seconds:.1f}s) | "
-                            f"rows: {result.rows:,} | {src}"
-                        )
-                    if result.duration_seconds >= float(args.log_slow_file_seconds):
-                        print(
-                            f"Slow file ({result.duration_seconds:.1f}s) | "
-                            f"rows: {result.rows:,} | {src}"
-                        )
+                    if result.read_seconds >= LOG_SLOW_READ_SECONDS:
+                        print(f"Slow read ({result.read_seconds:.1f}s) | rows: {result.rows:,} | {src}")
+                    if result.duration_seconds >= LOG_SLOW_FILE_SECONDS:
+                        print(f"Slow file ({result.duration_seconds:.1f}s) | rows: {result.rows:,} | {src}")
+                    if result.low_cell_warnings:
+                        low_cell_warnings.extend(result.low_cell_warnings)
+                    static_join_rows_total += int(result.static_context_rows)
+                    temporal_join_rows_total += int(result.temporal_context_rows)
                 except (OSError, IOError, ValueError, RuntimeError) as exc:  # pragma: no cover
                     failures.append((src, str(exc)))
                     print(f"Failed file | {src} | {exc}")
@@ -201,10 +234,9 @@ def run_preprocess(args) -> int:
     write_start = time.perf_counter()
     write_heartbeat_stop, write_heartbeat_thread = start_phase_heartbeat(
         "Final write",
-        float(args.progress_interval_seconds),
+        PROGRESS_INTERVAL_SECONDS,
     )
     try:
-        staged_dataset = ds.dataset(staging_dir, format="parquet")
         output_root.mkdir(parents=True, exist_ok=True)
 
         partition_field_map = {
@@ -215,19 +247,28 @@ def run_preprocess(args) -> int:
         partition_fields = partition_field_map[args.partition_mode]
         partition_schema = pa.schema([pa.field(field_name, pa.string()) for field_name in partition_fields])
 
-        ds.write_dataset(
-            data=staged_dataset,
-            base_dir=output_root,
-            format="parquet",
-            partitioning=ds.partitioning(
-                partition_schema,
-                flavor="hive",
-            ),
-            max_rows_per_file=args.max_rows_per_file,
-            max_rows_per_group=args.max_rows_per_file,
-            max_partitions=8192,
-            existing_data_behavior="overwrite_or_ignore",
-        )
+        batch_size = max(1, int(args.final_write_batch_files))
+        total_batches = (len(staged_paths) + batch_size - 1) // batch_size
+        for batch_index, start_idx in enumerate(range(0, len(staged_paths), batch_size), start=1):
+            end_idx = min(start_idx + batch_size, len(staged_paths))
+            batch_paths = staged_paths[start_idx:end_idx]
+            staged_dataset = ds.dataset(batch_paths, format="parquet")
+            print(f"Final write batch {batch_index:,}/{total_batches:,} | files: {len(batch_paths):,}")
+            ds.write_dataset(
+                data=staged_dataset,
+                base_dir=output_root,
+                format="parquet",
+                partitioning=ds.partitioning(
+                    partition_schema,
+                    flavor="hive",
+                ),
+                max_rows_per_file=args.max_rows_per_file,
+                max_rows_per_group=args.max_rows_per_file,
+                max_open_files=max(32, min(256, batch_size)),
+                max_partitions=8192,
+                use_threads=FINAL_WRITE_USE_THREADS,
+                existing_data_behavior="overwrite_or_ignore",
+            )
     finally:
         write_heartbeat_stop.set()
         write_heartbeat_thread.join(timeout=2.0)
@@ -235,10 +276,20 @@ def run_preprocess(args) -> int:
 
     print(f"Final dataset written to {output_root}")
     print(f"Total rows: {written:,}")
+    print(f"Static context merged rows: {static_join_rows_total:,}")
+    print(f"Temporal context merged rows: {temporal_join_rows_total:,}")
     print(f"Final write duration: {write_seconds:.1f}s")
 
     if failures:
         print_failure_summary(failures)
+
+    if low_cell_warnings:
+        unique_warnings = sorted(set(low_cell_warnings))
+        print("Low-cell species warnings:")
+        for warning in unique_warnings[:100]:
+            print(f"  - {warning}")
+        if len(unique_warnings) > 100:
+            print(f"  ... and {len(unique_warnings) - 100} more")
 
     if not args.keep_staging:
         cleanup_start = time.perf_counter()

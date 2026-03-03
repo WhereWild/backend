@@ -62,18 +62,6 @@ def parse_args() -> argparse.Namespace:
         help="Feature version string written to output rows.",
     )
     parser.add_argument(
-        "--cell-size-deg",
-        type=float,
-        default=0.25,
-        help="Spatial bin size in degrees for derived cell_id.",
-    )
-    parser.add_argument(
-        "--region-size-deg",
-        type=float,
-        default=10.0,
-        help="Coarser spatial bin size in degrees for region_id.",
-    )
-    parser.add_argument(
         "--max-rows-per-file",
         type=int,
         default=250_000,
@@ -90,11 +78,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--fallback-time-policy",
-        type=str,
-        default="keep",
-        choices=["keep", "drop"],
-        help="How to handle rows with missing/unparseable event time that fall back to 1970-01.",
+        "--drop-missing-time",
+        action="store_true",
+        help="Drop rows with missing/unparseable event time instead of keeping fallback 1970-01 timestamps.",
     )
     parser.add_argument(
         "--background-ratio",
@@ -113,34 +99,62 @@ def parse_args() -> argparse.Namespace:
         help="Keep staging parquet files after final dataset write.",
     )
     parser.add_argument(
-        "--progress-interval-seconds",
-        type=float,
-        default=30.0,
-        help="Emit heartbeat logs every N seconds if no file completes.",
-    )
-    parser.add_argument(
-        "--log-slow-file-seconds",
-        type=float,
-        default=20.0,
-        help="Log completed files that take at least this many seconds.",
-    )
-    parser.add_argument(
-        "--log-slow-read-seconds",
-        type=float,
-        default=8.0,
-        help="Log files whose parquet read step takes at least this many seconds.",
-    )
-    parser.add_argument(
-        "--schema-log-interval-files",
-        type=int,
-        default=500,
-        help="During feature-template schema scan, log progress every N files.",
-    )
-    parser.add_argument(
         "--template-scan-max-files",
         type=int,
         default=0,
         help="Optional cap for schema files scanned to build feature template (0 = scan all discovered files).",
+    )
+    parser.add_argument(
+        "--warn-min-cells-per-species",
+        type=int,
+        default=3,
+        help="Warn when a species has fewer than this many unique cells in a transformed shard (0 = disabled).",
+    )
+    parser.add_argument(
+        "--final-write-batch-files",
+        type=int,
+        default=500,
+        help="Number of staged parquet shards to include in each final output write batch.",
+    )
+    parser.add_argument(
+        "--static-context-template",
+        type=str,
+        default="",
+        help=(
+            "Optional template to resolve per-source static context parquet path. "
+            "Supports {src_dir}, {src_stem}, {src_name}, {src_parent}."
+        ),
+    )
+    parser.add_argument(
+        "--static-context-path",
+        type=Path,
+        default=None,
+        help="Optional fixed static context parquet path joined by cell_id.",
+    )
+    parser.add_argument(
+        "--static-context-required",
+        action="store_true",
+        help="Fail file transform when static context path is configured but missing/unusable.",
+    )
+    parser.add_argument(
+        "--temporal-context-template",
+        type=str,
+        default="",
+        help=(
+            "Optional template to resolve per-source temporal context parquet path. "
+            "Supports {src_dir}, {src_stem}, {src_name}, {src_parent}."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-context-path",
+        type=Path,
+        default=None,
+        help="Optional fixed temporal context parquet path joined by cell_id+year_month.",
+    )
+    parser.add_argument(
+        "--temporal-context-required",
+        action="store_true",
+        help="Fail file transform when temporal context path is configured but missing/unusable.",
     )
     return parser.parse_args()
 
