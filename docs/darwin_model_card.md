@@ -181,6 +181,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root /data \
     --output-root /data/training_observation \
     --threads 16 \
+    --background-ratio 1.0 \
     --overwrite-output
 ```
 
@@ -188,6 +189,8 @@ Notes:
 
 - The script performs file-level multithreading for faster NVMe throughput.
 - It keeps `lat/lon/time/source` as metadata fields and excludes them from model input vectors.
+- Static and temporal context can be joined during this preprocessing step via configured context inputs, or pre-joined upstream into occurrence files; whichever path is used should be kept consistent per `feature_version`.
+- Known issue: current background sampling is not yet spatially stratified over an explicit accessible-area `M` definition; treat this as a temporary approximation until stratified/background-area sampling is implemented.
 
 ## 10) Partition Strategy: Time vs Species
 

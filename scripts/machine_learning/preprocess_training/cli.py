@@ -12,9 +12,7 @@ from pipeline import run_preprocess
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for preprocessing."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Preprocess occurrence parquet files into training_observation parquet dataset."
-        )
+        description=("Preprocess occurrence parquet files into training_observation parquet dataset.")
     )
     parser.add_argument(
         "--input-root",
@@ -32,10 +30,7 @@ def parse_args() -> argparse.Namespace:
         "--staging-dir",
         type=Path,
         default=None,
-        help=(
-            "Temporary directory for transformed intermediate parquet shards. "
-            "Defaults to a sibling of output-root."
-        ),
+        help=("Temporary directory for transformed intermediate parquet shards. Defaults to a sibling of output-root."),
     )
     parser.add_argument(
         "--glob",
@@ -72,10 +67,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="split/year_month/region_id",
         choices=["split", "split/year_month", "split/year_month/region_id"],
-        help=(
-            "Partition columns for final dataset write. "
-            "Coarser modes reduce file counts."
-        ),
+        help=("Partition columns for final dataset write. Coarser modes reduce file counts."),
     )
     parser.add_argument(
         "--drop-missing-time",
@@ -85,8 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--background-ratio",
         type=float,
-        default=0.0,
-        help="Optional unlabeled/background rows to generate per positive row (e.g., 1.0 = 1:1).",
+        default=1.0,
+        help="Unlabeled/background rows to generate per positive row (default 1.0 = 1:1).",
     )
     parser.add_argument(
         "--overwrite-output",

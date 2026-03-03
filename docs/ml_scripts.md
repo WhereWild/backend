@@ -87,8 +87,8 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - If set, drops rows with missing/unparseable event timestamps.
     - If omitted, keeps rows and applies fallback timestamps.
 - `--background-ratio`
-    - `0.0`: positives only.
-    - `1.0`: one generated unlabeled row per positive row.
+    - Default is `1.0` (one generated unlabeled row per positive row).
+    - Set `0.0` for positives-only debug runs.
 - `--template-scan-max-files`
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).
 - `--partition-mode`
