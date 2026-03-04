@@ -3,6 +3,9 @@ data/
 *.zip
 *.parquet
 
+# Models
+checkpoints/
+
 # Python cache / virtualenvs
 __pycache__/
 *.pyc
@@ -26,3 +29,6 @@ __tests__/
 
 # Node / frontend junk if repo is mixed
 node_modules/
+
+# Other
+tmp/
