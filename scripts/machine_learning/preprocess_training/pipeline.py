@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import json
 from pathlib import Path
 import shutil
 import threading
@@ -130,6 +131,15 @@ def run_preprocess(args) -> int:
         f"weather={len(feature_template.weather):,}"
     )
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
+
+    template_json_path = output_root / "feature_template.json"
+    with open(template_json_path, "w") as _ft_fh:
+        json.dump(
+            {"env": feature_template.env, "habitat": feature_template.habitat, "weather": feature_template.weather},
+            _ft_fh,
+            indent=2,
+        )
+    print(f"Saved feature template to {template_json_path}")
 
     staging_dir.mkdir(parents=True, exist_ok=True)
 
