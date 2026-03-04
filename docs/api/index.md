@@ -53,11 +53,66 @@ Compute a probability grid for one species over a bounding box.
 | `max_lat` | float | required | Northern edge. |
 | `max_lon` | float | required | Eastern edge. |
 | `resolution` | float | model native (0.25) | Output cell size in degrees. |
+| `include_source` | bool | false | Include per-cell feature source (`sampled` or `cell_table`) for debugging. |
+| `feature_mode` | string | `auto` | Feature source strategy: `auto`, `prefer_cell_table`, `cell_table_only`, `sampled_only`. |
+| `max_cells` | int | 20000 | Hard cap on output cells; oversized requests return 400. |
 
-All native-resolution (0.25 deg) cells in the bbox are scored in a single
-vectorized forward pass. When `resolution` exceeds native, per-cell scores are
-averaged into coarser tiles. Cells not in the pre-computed table are sampled
-from GIS rasters on the fly, giving dense coverage over any land area.
+All requested cells in the bbox are scored in vectorized batches.
+`feature_mode=prefer_cell_table` is the default stability mode and avoids
+over-aggressive sampled fallback by using precomputed native-cell features when
+available. When `include_source=true`, each returned cell may include `source`
+as `sampled` or `cell_table`.
+
+### `GET /api/predict/heatmap/stream`
+
+Stream the same heatmap as NDJSON (`application/x-ndjson`) so clients can
+render progressively without waiting for the full grid.
+
+Uses the same query parameters as `GET /api/predict/heatmap`.
+
+Event lines:
+
+- `{"type":"meta", ...}` once at start (includes `requested_cells`)
+- `{"type":"cell", "lat":..., "lon":..., "score":..., "n_native":...}` per cell
+- `{"type":"done", "n_cells":...}` once at end
+
+This endpoint is preferred for large bboxes because the server does not need to
+build a giant in-memory `cells` list before sending data.
+
+### Job resource model for stale-call cancellation
+
+For robust client workflows, use cancellable heatmap jobs:
+
+### `POST /api/predict/heatmap-jobs`
+
+Create a job resource and receive stable URLs to stream and cancel it.
+
+Request body uses the same fields as heatmap requests:
+`species_key`, `min_lat`, `min_lon`, `max_lat`, `max_lon`, optional
+`resolution`, `include_source`, `feature_mode`, `max_cells`.
+
+Response includes:
+
+- `job_id`
+- `status` (`created`)
+- `stream_url`
+- `cancel_url`
+
+### `GET /api/predict/heatmap-jobs/{job_id}/stream`
+
+Stream job output as NDJSON. Event lines:
+
+- `{"type":"meta", "job_id":..., ...}`
+- many `{"type":"cell", ...}`
+- terminal `{"type":"done", "job_id":..., "n_cells":...}`
+- or `{"type":"cancelled", "job_id":..., "n_cells":...}`
+
+Only one active stream is allowed per job.
+
+### `DELETE /api/predict/heatmap-jobs/{job_id}`
+
+Cancel stale jobs. Running streams will stop quickly and emit a
+`cancelled` terminal event.
 
 ### `GET /api/predict/info`
 

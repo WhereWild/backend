@@ -149,6 +149,12 @@ This enables predictions at any land coordinate on Earth.
     - high-precision threshold (user-facing confident mode),
     - high-recall threshold (exploration mode).
 
+Current best recorded Stage C sweep for `canary_cactus`:
+
+- `head_lr=0.0088`
+- `head_weight_decay=0.00055`
+- `head_epochs=140`
+
 ## 8) Recommended MVP (first production cut)
 
 1. Build 128-d tabular encoder only (no raster branch yet).

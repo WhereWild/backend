@@ -29,6 +29,14 @@ The script is portable across macOS/Linux/WSL and uses the repo root to locate t
 If you get a permission error, run `chmod +x ./gt.sh` once.
 It also runs `b2-mount` automatically before opening the shell, so you usually do not need to call it manually.
 
+Note: inference inside the GDAL container depends on Python packages installed from
+`requirements.txt` (including `torch`). After dependency updates, rebuild the image:
+
+```sh
+docker compose build gdal
+docker compose up -d gdal
+```
+
 The downside to this is that using Docker can require lots of typing to use simple commands. A great way around this is to use bash aliases. Inside `gt`, these helpers are already available via the container image, so there is nothing to copy into your `~/.bashrc`.
 
 `gt` stands for "GDAL Terminal" and simply opens a terminal within the GDAL docker. `pd` stands for "Python Docker" and can simply be run as `pd build_locations` for example; it automatically looks for Python files within the `/scripts` directory and runs them through Docker. `pdb` runs the same way in the background and writes logs to `logs/scripts/<script_name>`. `pdbs` stops a background `pdb` script by name. `pdbc` chains multiple scripts in the background, running each after the previous completes, and writes per-script logs to the same folder.
