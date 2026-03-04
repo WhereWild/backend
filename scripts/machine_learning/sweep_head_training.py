@@ -23,7 +23,7 @@ except ImportError:
     from scripts.machine_learning.train.train_heads import train_species_heads
 
 
-def _parse_numeric_list(raw: str, cast: type[int] | type[float], name: str) -> list[int] | list[float]:
+def _parse_numeric_list(raw: str, cast: type[int | float], name: str) -> list[int] | list[float]:
     """Parse a comma-separated numeric CLI list into typed values."""
     values: list[int] | list[float] = []
     for token in raw.split(","):

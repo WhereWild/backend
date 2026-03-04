@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
-from pathlib import Path
 import shutil
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-import pandas as pd
-
 from transform import build_feature_template, transform_file
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 FEATURE_CELL_SIZE_DEG = 0.25
 FEATURE_REGION_SIZE_DEG = 10.0
@@ -60,7 +61,7 @@ def _build_background_table_for_split(
     sampled_target_species: list[np.ndarray] = []
 
     for sp_key, n_pos in zip(unique_species.tolist(), positive_counts.tolist(), strict=True):
-        target_bg = int(round(float(n_pos) * background_ratio))
+        target_bg = round(float(n_pos) * background_ratio)
         if target_bg <= 0:
             continue
 
@@ -365,7 +366,7 @@ def run_preprocess(args) -> int:
                         low_cell_warnings.extend(result.low_cell_warnings)
                     static_join_rows_total += int(result.static_context_rows)
                     temporal_join_rows_total += int(result.temporal_context_rows)
-                except (OSError, IOError, ValueError, RuntimeError) as exc:  # pragma: no cover
+                except (OSError, ValueError, RuntimeError) as exc:  # pragma: no cover
                     failures.append((src, str(exc)))
                     print(f"Failed file | {src} | {exc}")
 

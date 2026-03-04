@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 try:
     from ._compat import import_local_symbol
@@ -104,7 +104,7 @@ def train_encoder(
 
     total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    amp = getattr(torch, "amp")
+    amp = torch.amp
     scaler = amp.GradScaler("cuda", enabled=amp_enabled)
 
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")

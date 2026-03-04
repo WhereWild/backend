@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import torch
 from torch.utils.data import Dataset
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 FEATURE_COLUMNS = ["env_features", "habitat_features", "weather_features"]
 MASK_COLUMNS = ["env_missing_mask", "habitat_missing_mask", "weather_missing_mask"]
@@ -99,7 +102,7 @@ class TrainingDataset(Dataset):
         self.feature_dim = self.features.shape[1]
         self.num_rows = self.features.shape[0]
 
-    def pin(self) -> "TrainingDataset":
+    def pin(self) -> TrainingDataset:
         """Pin all tensors to page-locked memory for fast GPU transfers."""
         self.features = self.features.pin_memory()
         self.masks = self.masks.pin_memory()
@@ -148,10 +151,7 @@ class BatchIterator:
         return self._n_batches
 
     def __iter__(self):
-        if self.shuffle:
-            perm = torch.randperm(self._n)
-        else:
-            perm = torch.arange(self._n)
+        perm = torch.randperm(self._n) if self.shuffle else torch.arange(self._n)
 
         ds = self.dataset
         for start in range(0, self._n, self.batch_size):

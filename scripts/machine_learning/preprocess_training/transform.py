@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
 import hashlib
-from pathlib import Path
 import re
 import threading
 import time
-from typing import Literal
 import uuid
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -167,8 +167,7 @@ def _find_join_column(columns: list[str], desired_name: str) -> str | None:
 def _load_context_table_cached(path_text: str) -> pd.DataFrame:
     """Load parquet context table once per path for process lifetime."""
     table = pq.read_table(Path(path_text), use_threads=True)
-    frame = table.to_pandas(types_mapper=None)
-    return frame
+    return table.to_pandas(types_mapper=None)
 
 
 def _context_lock_for_path(path_text: str) -> threading.Lock:
@@ -332,7 +331,7 @@ def parse_numeric_event_time(raw_time: pd.Series) -> pd.Series:
 
 def stable_split(cell_id: str, year_month: str) -> str:
     """Map a row deterministically to train/val/test based on space-time key."""
-    token = f"{cell_id}|{year_month}".encode("utf-8")
+    token = f"{cell_id}|{year_month}".encode()
     bucket = int.from_bytes(hashlib.blake2b(token, digest_size=2).digest(), byteorder="big") % 100
     if bucket < 80:
         return "train"
