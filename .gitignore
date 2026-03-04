@@ -5,6 +5,7 @@ data/
 processed/
 cache/
 tmp/
+.claude/
 
 # Ignore macOS Finder metadata
 .DS_Store
