@@ -1,6 +1,6 @@
 # Darwin Species Distribution Model (Modular, Server-Side)
 
-## 1) Goal
+## 1. Goal
 
 Predict species occurrence probability at a location while:
 
@@ -9,7 +9,7 @@ Predict species occurrence probability at a location while:
 - scaling to ~891 GB / ~2.93M files,
 - handling presence-only data (no true negatives).
 
-## 2) Recommended Model Family
+## 2. Recommended Model Family
 
 Use a shared global encoder + small per-species heads.
 
@@ -42,7 +42,7 @@ For each species `s`, train only a tiny classifier on `z`:
 
 This keeps per-species parameters tiny and allows fast retraining/new species onboarding.
 
-## 3) Handling Missing Negatives (Presence-Only)
+## 3. Handling Missing Negatives (Presence-Only)
 
 Train heads with Positive-Unlabeled (PU) learning instead of standard binary labels.
 
@@ -67,7 +67,7 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 - bias-corrected by observer effort proxy (if available),
 - hard-negative mining: periodically add top false positives from previous epoch.
 
-## 4) Training Strategy for Your Hardware (RTX 5090 32 GB)
+## 4. Training Strategy for Your Hardware (RTX 5090 32 GB)
 
 ### Stage A - Build training table
 
@@ -104,7 +104,7 @@ After Stage B, use the pretrained encoder embedding as the fixed representation 
 
 Expected outcome: most compute spent once in shared encoder; species updates are cheap.
 
-## 5) Server-Side Inference Design
+## 5. Server-Side Inference Design
 
 ### 5.1 Export format
 
@@ -135,14 +135,14 @@ This enables predictions at any land coordinate on Earth.
 - Heatmap endpoint scores all cells in a single vectorized forward pass.
 - Variable resolution aggregation allows zoom-dependent level of detail.
 
-## 6) Data Splits and Validation (avoid leakage)
+## 6. Data Splits and Validation (avoid leakage)
 
 - split by space and time, not random rows,
 - e.g. blocked CV by geohash/S2 + holdout recent months,
 - evaluate with PR-AUC, Recall@fixed precision, calibrated Brier score,
 - report by prevalence bins (common vs rare species).
 
-## 7) Calibration and Thresholding
+## 7. Calibration and Thresholding
 
 - fit per-species temperature scaling or isotonic calibration on holdout,
 - keep two thresholds per species:
@@ -155,7 +155,7 @@ Current best recorded Stage C sweep for `canary_cactus`:
 - `head_weight_decay=0.00055`
 - `head_epochs=140`
 
-## 8) Recommended MVP (first production cut)
+## 8. Recommended MVP (first production cut)
 
 1. Build 128-d tabular encoder only (no raster branch yet).
 2. Train encoder on all taxa with self-supervised + aux env prediction.
@@ -166,7 +166,7 @@ Current best recorded Stage C sweep for `canary_cactus`:
 This matches all requirements: modular per-species updates, server-side inference,
 single-GPU feasibility, and proper treatment of missing negatives.
 
-## 9) Data Preprocessing Pipeline (ETL)
+## 9. Data Preprocessing Pipeline (ETL)
 
 1. Ingest raw observations and standardize core fields (taxonomy, UTC timestamp, WGS84 coords).
 2. Snap each record to `cell_id` and derive `region_id`.
@@ -180,17 +180,6 @@ single-GPU feasibility, and proper treatment of missing negatives.
 7. Keep leakage-prone fields (`lat`, `lon`, `event_time_utc`, `source`) as metadata only; exclude from model input tensors.
 8. Write partitioned Parquet by `split/year_month/region_id`.
 
-Reference implementation script:
-
-```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root /data \
-    --output-root /data/training_observation \
-    --threads 16 \
-    --background-ratio 1.0 \
-    --overwrite-output
-```
-
 Notes:
 
 - The script performs file-level multithreading for faster NVMe throughput.
@@ -198,7 +187,7 @@ Notes:
 - Static and temporal context can be joined during this preprocessing step via configured context inputs, or pre-joined upstream into occurrence files; whichever path is used should be kept consistent per `feature_version`.
 - Known issue: current background sampling is not yet spatially stratified over an explicit accessible-area `M` definition; treat this as a temporary approximation until stratified/background-area sampling is implemented.
 
-## 10) Partition Strategy: Time vs Species
+## 10. Partition Strategy: Time vs Species
 
 - Base dataset should stay partitioned by `split/year_month/region_id`.
 - Why this base partitioning:
@@ -214,7 +203,7 @@ Notes:
     - keep base table time/region partitioned,
     - optionally materialize species-bucket shards (e.g., hash buckets) for per-species training throughput.
 
-## 11) Future Upgrades
+## 11. Future Upgrades
 
 - Hierarchical heads (kingdom→phylum→...→species) for better rare-species transfer.
 - Distill encoder to an even smaller student for low-end phones.
