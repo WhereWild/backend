@@ -76,7 +76,10 @@ class TrainingDataset(Dataset):
         # in missing slots does not affect the gradient.
         features[masks > 0.5] = 0.0
 
-        self.features = torch.from_numpy(features)
+        model_features = np.concatenate([features, masks], axis=1).astype(np.float32)
+
+        self.features = torch.from_numpy(model_features)
+        self.recon_target = torch.from_numpy(features)
         self.masks = torch.from_numpy(masks)
         self.species_key = torch.from_numpy(df["species_key"].to_numpy().astype(np.int64))
         self.presence_label = torch.from_numpy(df["presence_label"].to_numpy().astype(np.int8))
@@ -84,11 +87,13 @@ class TrainingDataset(Dataset):
         self.cell_ids = df["cell_id"].to_numpy()
 
         self.feature_dim = self.features.shape[1]
+        self.recon_dim = self.recon_target.shape[1]
         self.num_rows = self.features.shape[0]
 
     def pin(self) -> TrainingDataset:
         """Pin all tensors to page-locked memory for fast GPU transfers."""
         self.features = self.features.pin_memory()
+        self.recon_target = self.recon_target.pin_memory()
         self.masks = self.masks.pin_memory()
         self.species_key = self.species_key.pin_memory()
         self.presence_label = self.presence_label.pin_memory()
@@ -101,6 +106,7 @@ class TrainingDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return {
             "features": self.features[idx],
+            "recon_target": self.recon_target[idx],
             "masks": self.masks[idx],
             "species_key": self.species_key[idx],
             "presence_label": self.presence_label[idx],
@@ -140,6 +146,7 @@ class BatchIterator:
             idx = perm[start : start + self.batch_size]
             yield {
                 "features": ds.features[idx],
+                "recon_target": ds.recon_target[idx],
                 "masks": ds.masks[idx],
                 "species_key": ds.species_key[idx],
                 "presence_label": ds.presence_label[idx],

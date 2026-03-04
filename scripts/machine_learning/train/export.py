@@ -52,7 +52,7 @@ def build_cell_table(
         except (FileNotFoundError, OSError, ValueError, RuntimeError):
             continue
 
-        features = ds.features.numpy().astype(np.float64, copy=False)
+        features = ds.recon_target.numpy().astype(np.float64, copy=False)
         masks = ds.masks.numpy().astype(np.float64, copy=False)
         cell_ids = np.asarray(ds.cell_ids, dtype=str)
 
@@ -84,8 +84,9 @@ def build_cell_table(
         avg_mask = (cell_mask_sum[cid] / n >= 0.5).astype(np.float32)
         # Zero out features where the mask says missing.
         avg_feat[avg_mask > 0.5] = 0.0
+        model_feat = np.concatenate([avg_feat, avg_mask], axis=0)
         result[cid] = {
-            "features": torch.from_numpy(avg_feat),
+            "features": torch.from_numpy(model_feat),
             "mask": torch.from_numpy(avg_mask),
         }
 

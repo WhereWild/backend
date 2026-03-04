@@ -84,6 +84,7 @@ def train_encoder(
         train_ds.pin()
         val_ds.pin()
     input_dim = train_ds.feature_dim
+    recon_dim = train_ds.recon_dim
 
     print(f"Train rows: {len(train_ds):,} | Val rows: {len(val_ds):,} | Input dim: {input_dim}")
 
@@ -91,7 +92,7 @@ def train_encoder(
     val_loader = make_batches(val_ds, batch_size=batch_size, shuffle=False)
 
     encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(dev)
-    aux_decoder = AuxDecoder(embed_dim, input_dim).to(dev)
+    aux_decoder = AuxDecoder(embed_dim, recon_dim).to(dev)
 
     params = list(encoder.parameters()) + list(aux_decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
@@ -117,13 +118,14 @@ def train_encoder(
 
         for step, batch in enumerate(train_loader):
             features = batch["features"].to(dev, non_blocking=use_pin)
+            recon_target = batch["recon_target"].to(dev, non_blocking=use_pin)
             masks = batch["masks"].to(dev, non_blocking=use_pin)
 
             amp_context = amp.autocast("cuda", dtype=amp_dtype) if amp_enabled else nullcontext()
             with amp_context:
                 z = encoder(features)
                 recon = aux_decoder(z)
-                loss_recon = reconstruction_loss(recon, features, masks)
+                loss_recon = reconstruction_loss(recon, recon_target, masks)
                 loss = recon_weight * loss_recon
 
             optimizer.zero_grad(set_to_none=True)
@@ -153,12 +155,13 @@ def train_encoder(
         with torch.no_grad():
             for batch in val_loader:
                 features = batch["features"].to(dev, non_blocking=use_pin)
+                recon_target = batch["recon_target"].to(dev, non_blocking=use_pin)
                 masks = batch["masks"].to(dev, non_blocking=use_pin)
                 amp_context = amp.autocast("cuda", dtype=amp_dtype) if amp_enabled else nullcontext()
                 with amp_context:
                     z = encoder(features)
                     recon = aux_decoder(z)
-                    loss_recon = reconstruction_loss(recon, features, masks)
+                    loss_recon = reconstruction_loss(recon, recon_target, masks)
                     loss = recon_weight * loss_recon
                 val_loss_sum += loss.item()
                 val_steps += 1

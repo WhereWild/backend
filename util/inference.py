@@ -45,6 +45,25 @@ HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
 
 
+def _raw_feature_dim_from_names() -> int | None:
+    """Return raw feature dimension from feature names when available."""
+    if _feature_names is None:
+        return None
+    return len(_feature_names.get("env", [])) + len(_feature_names.get("habitat", [])) + len(
+        _feature_names.get("weather", [])
+    )
+
+
+def _encode_input_with_optional_mask(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Build encoder input tensor, concatenating masks when expected by model."""
+    raw_dim = int(features.shape[0])
+    if _input_dim == raw_dim:
+        return features
+    if _input_dim == raw_dim * 2:
+        return torch.cat([features, mask], dim=0)
+    return features
+
+
 def _resolve_heatmap_feature_mode(
     feature_mode: str, resolution: float, native_resolution: float
 ) -> tuple[bool, bool, bool]:
@@ -253,7 +272,7 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
 
     env_names: list[str] = _feature_names["env"]
     habitat_names: list[str] = _feature_names["habitat"]
-    weather_dim: int = _input_dim - len(env_names) - len(habitat_names)
+    weather_dim: int = len(_feature_names.get("weather", []))
 
     needs_dem = _DEM_DERIVED & set(env_names)
     dem_vals = _compute_dem_derived_single(lat, lon) if needs_dem else {}
@@ -286,7 +305,8 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
     feat_t = torch.tensor(features, dtype=torch.float32)
     mask_t = torch.tensor(mask, dtype=torch.float32)
     feat_t[mask_t > 0.5] = 0.0
-    return {"features": feat_t, "mask": mask_t}
+    model_input = _encode_input_with_optional_mask(feat_t, mask_t)
+    return {"features": model_input, "mask": mask_t}
 
 
 def _batch_sample_raster(layer_id: str, coords: list[tuple[float, float]]) -> list[float | None]:
@@ -388,7 +408,7 @@ def _batch_sample_features(
 
     env_names: list[str] = _feature_names["env"]
     habitat_names: list[str] = _feature_names["habitat"]
-    weather_dim: int = _input_dim - len(env_names) - len(habitat_names)
+    weather_dim: int = len(_feature_names.get("weather", []))
 
     needs_dem = _DEM_DERIVED & set(env_names)
     dem_results = _batch_compute_dem_derived(coords) if needs_dem else [{} for _ in coords]
@@ -428,13 +448,14 @@ def _batch_sample_features(
         ft = torch.tensor(features, dtype=torch.float32)
         mt = torch.tensor(mask, dtype=torch.float32)
         ft[mt > 0.5] = 0.0
+        model_input = _encode_input_with_optional_mask(ft, mt)
 
         # Skip if every static feature is missing (e.g. ocean).
         static_missing = sum(mask[: len(env_names) + len(habitat_names)])
         if static_missing == len(env_names) + len(habitat_names):
             out.append(None)
         else:
-            out.append({"features": ft, "mask": mt})
+            out.append({"features": model_input, "mask": mt})
     return out
 
 
@@ -482,6 +503,26 @@ def load_bundle(path: str | Path) -> None:
     _cell_size_deg = loaded.get("cell_size_deg", 0.25)
     _species_meta = loaded.get("species_meta", {})
     _feature_names = loaded.get("feature_names")
+
+    raw_dim = _raw_feature_dim_from_names()
+    if raw_dim is not None and _input_dim == raw_dim * 2:
+        normalized_table: dict[str, dict[str, torch.Tensor]] = {}
+        for cid, payload in _cell_table.items():
+            cell_features = payload.get("features")
+            cell_mask = payload.get("mask")
+            if (
+                isinstance(cell_features, torch.Tensor)
+                and isinstance(cell_mask, torch.Tensor)
+                and cell_features.ndim == 1
+                and int(cell_features.shape[0]) == raw_dim
+            ):
+                normalized_table[cid] = {
+                    **payload,
+                    "features": torch.cat([cell_features, cell_mask], dim=0),
+                }
+            else:
+                normalized_table[cid] = payload
+        _cell_table = normalized_table
 
 
 def is_loaded() -> bool:
