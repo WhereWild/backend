@@ -48,23 +48,22 @@ def compute_embeddings(
 
 def estimate_prior(
     n_species_positives: int,
-    n_total_rows: int,
+    n_total_positive_rows: int,
     min_prior: float = 1e-4,
     max_prior: float = 0.5,
 ) -> float:
     """Estimate class prior pi_s for one species.
 
-    pi_s = count(positives for species s) / count(all training rows).
+    pi_s = count(positives for species s) / count(all positive training rows).
 
-    Uses the full dataset size as denominator rather than only rows sharing
-    the same species_key, because background rows inherit species_key from
-    their source file and would bias the denominator upward.
+    Uses only positive rows in the train split as denominator so generated
+    unlabeled/background rows do not dilute priors as background_ratio changes.
 
     Clamped to [min_prior, max_prior] for numerical stability.
     """
-    if n_total_rows == 0:
+    if n_total_positive_rows == 0:
         return min_prior
-    return float(np.clip(n_species_positives / n_total_rows, min_prior, max_prior))
+    return float(np.clip(n_species_positives / n_total_positive_rows, min_prior, max_prior))
 
 
 def train_species_heads(
@@ -133,7 +132,7 @@ def train_species_heads(
     train_species = train_ds.species_key
     train_labels = train_ds.presence_label
     train_weights = train_ds.sample_weight
-    n_total_train = len(train_ds)
+    n_total_positive_train = int((train_labels == 1).sum().item())
 
     print("Computing validation embeddings...")
     val_z = compute_embeddings(encoder, val_ds, dev, batch_size=batch_size)
@@ -168,7 +167,7 @@ def train_species_heads(
         if n_pos == 0 or n_unl == 0:
             continue
 
-        prior_pi = estimate_prior(n_pos, n_total_train)
+        prior_pi = estimate_prior(n_pos, n_total_positive_train)
 
         head = SpeciesHead(embed_dim=embed_dim).to(dev)
         optimizer = torch.optim.AdamW(head.parameters(), lr=head_lr, weight_decay=head_weight_decay)
