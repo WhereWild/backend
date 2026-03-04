@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,9 +9,10 @@ from typing import Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
+from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, inference
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -36,7 +38,6 @@ default_species_limit = 12
 max_species_limit = 100
 
 
-
 app = FastAPI(title=api_title, version=api_version)
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +45,9 @@ app.add_middleware(
     allow_methods=list(cors_allow_methods),
     allow_headers=list(cors_allow_headers),
 )
+
+
+INFERENCE_BUNDLE_PATH = Path(os.environ.get("WHEREWILD_INFERENCE_BUNDLE", "checkpoints/inference_bundle.pt"))
 
 
 @app.on_event("startup")
@@ -56,6 +60,30 @@ def _preload_gis_legends() -> None:
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+
+
+@app.on_event("startup")
+def _load_inference_bundle() -> None:
+    bundle_path = INFERENCE_BUNDLE_PATH
+    if not bundle_path.is_absolute():
+        bundle_path = CONFIG.project_root / bundle_path
+    if bundle_path.exists():
+        try:
+            inference.load_bundle(bundle_path)
+            print(
+                f"Inference bundle loaded: {bundle_path} "
+                f"({len(inference.known_species()):,} species, "
+                f"{inference.cell_count():,} cells)"
+            )
+        except Exception:
+            import traceback as _tb
+
+            print(f"Warning: failed to load inference bundle {bundle_path}")
+            _tb.print_exc()
+    else:
+        print(f"Inference bundle not found at {bundle_path} — /api/predict disabled")
+
+
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:
@@ -66,7 +94,7 @@ def _path_exists(path: Path) -> bool:
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
     """Returns a simple liveness payload.
-    
+
     Returns:
         A status string and UTC timestamp.
     """
@@ -75,12 +103,10 @@ def health_check() -> dict[str, str]:
 
 @app.get("/variables")
 def list_environment_variables(
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> List[dict[str, Any]]:
     """Lists available environmental variables.
-    
+
     Returns:
         A list of variable metadata entries.
     """
@@ -96,11 +122,11 @@ def list_species(
     limit: int = Query(default_species_limit, ge=1, le=max_species_limit),
 ) -> List[dict[str, Any]]:
     """Searches taxa by name and returns serialized results.
-    
+
     Args:
         q: Search term for scientific or common names.
         limit: Maximum number of matches to return.
-    
+
     Returns:
         A list of serialized taxon payloads.
     """
@@ -123,19 +149,15 @@ def list_species(
 @app.get("/api/species/{taxon_id}")
 def get_species_detail(
     taxon_id: int,
-    location: Optional[str] = Query(
-        None, description="Optional location GID to tailor description text."
-    ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for description values (metric or imperial)"
-    ),
+    location: Optional[str] = Query(None, description="Optional location GID to tailor description text."),
+    unit_system: Optional[str] = Query(None, description="Unit system for description values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Loads a single taxon record by id.
-    
+
     Args:
         taxon_id: Taxon id to look up.
         location: Optional location GID filter for location text context.
-    
+
     Returns:
         A serialized taxon payload.
     """
@@ -169,11 +191,11 @@ def search_locations_endpoint(
     limit: int = Query(10, ge=1, le=50),
 ) -> dict[str, Any]:
     """Searches locations by name substring.
-    
+
     Args:
         q: Search term for location names.
         limit: Maximum number of matches to return.
-    
+
     Returns:
         A dict containing location match results.
     """
@@ -187,11 +209,11 @@ def species_occurrences(
     location: Optional[str] = Query(None, description="Filter observations by location gid"),
 ) -> dict[str, Any]:
     """Returns occurrence points for a taxon, optionally filtered by location.
-    
+
     Args:
         taxon_id: Taxon id to query.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict with occurrence count and point records.
     """
@@ -216,6 +238,7 @@ def species_occurrences(
         "count": len(rows),
         "occurrences": rows,
     }
+
 
 @app.get("/species/{taxon_id}/locations")
 def species_locations(
@@ -246,10 +269,7 @@ def species_locations(
     if not entries:
         return []
 
-    level_by_scope = {
-        str(scope): int(level_idx)
-        for level_idx, scope in CONFIG.location_scope_by_level.items()
-    }
+    level_by_scope = {str(scope): int(level_idx) for level_idx, scope in CONFIG.location_scope_by_level.items()}
     level_by_scope["gbif_region"] = -1
 
     parent_tokens = [token.strip() for token in (parent or "").split("|") if token.strip()]
@@ -304,10 +324,7 @@ def species_locations(
         cand_name = name.lower()
         hierarchy_name_set = {item.lower() for item in hierarchy_names}
         for name_options, gid_options in parent_matchers:
-            name_match = (
-                bool(name_options & hierarchy_name_set)
-                or cand_name in name_options
-            )
+            name_match = bool(name_options & hierarchy_name_set) or cand_name in name_options
             gid_match = cand_gid in gid_options or bool(gid_options & hierarchy_gids)
             if not (name_match or gid_match):
                 return False
@@ -345,15 +362,13 @@ def species_locations(
         if not matches_parent(gid_key, location_name, hierarchy, hierarchy_gids):
             continue
 
-        results.append(
-            {
-                "gid": gid_key,
-                "name": location_name,
-                "level": location_level,
-                "hierarchy": hierarchy,
-                "count": int(count),
-            }
-        )
+        results.append({
+            "gid": gid_key,
+            "name": location_name,
+            "level": location_level,
+            "hierarchy": hierarchy,
+            "count": int(count),
+        })
 
     results.sort(
         key=lambda item: (
@@ -366,11 +381,14 @@ def species_locations(
         return results[:limit]
     return results
 
+
 @app.get("/locations/search_hierarchy")
 def search_locations_by_hierarchy(
     q: str = Query("", description="Location name or partial match (optional if parent provided)"),
     level: Optional[str] = Query(None, description="continent|country|state|county or numeric level code"),
-    parent: Optional[str] = Query(None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."),
+    parent: Optional[str] = Query(
+        None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."
+    ),
     limit: int = Query(50, ge=1, le=1000),
 ) -> dict[str, Any]:
 
@@ -522,6 +540,7 @@ def search_locations_by_hierarchy(
 
     return {"results": results}
 
+
 @app.get("/species/{taxon_id}/environment/{variable_id}")
 def species_environment_stats(
     taxon_id: int,
@@ -529,17 +548,15 @@ def species_environment_stats(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns environment stats for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Environmental variable id.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing summary stats, distributions, and rankings.
     """
@@ -777,14 +794,14 @@ def species_environment_class_samples(
     ),
 ) -> dict[str, Any]:
     """Returns categorical class samples for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Categorical variable id.
         class_value: Class value to match.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing matching observation samples.
     """
@@ -852,12 +869,10 @@ def species_environment_slice(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns numeric samples within a value range for a taxon/variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Numeric variable id.
@@ -865,7 +880,7 @@ def species_environment_slice(
         max_value: Maximum value to include.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing range parameters and matching observations.
     """
@@ -928,14 +943,12 @@ def species_environment_slice(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     observations: list[dict[str, Any]] = []
     for catalog, lat, lon, value in rows:
-        observations.append(
-            {
-                "catalogNumber": catalog,
-                "value": float(value) if isinstance(value, (int, float)) else value,
-                "latitude": lat,
-                "longitude": lon,
-            }
-        )
+        observations.append({
+            "catalogNumber": catalog,
+            "value": float(value) if isinstance(value, (int, float)) else value,
+            "latitude": lat,
+            "longitude": lon,
+        })
     response = {
         "speciesId": taxon_id,
         "variable": variable_id,
@@ -957,9 +970,7 @@ def get_relative_rankings(
     limit: int = Query(50, ge=1, le=200),
     order: str = Query("asc", description="Sort order: asc or desc"),
     min_samples: int = Query(0, ge=0, description="Minimum samples required to appear"),
-    include_species_like: bool = Query(
-        False, description="When rank=SPECIES, include subspecies/varieties/forms"
-    ),
+    include_species_like: bool = Query(False, description="When rank=SPECIES, include subspecies/varieties/forms"),
     include_distribution: bool = Query(
         False,
         description=(
@@ -971,12 +982,10 @@ def get_relative_rankings(
         None,
         description="Optional location GID (GADM) or GBIF region to filter descendants by",
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns descendant rankings for a taxon by variable/metric.
-    
+
     Args:
         taxon_id: Ancestor taxon id to rank descendants under.
         rank: Descendant rank to include.
@@ -988,7 +997,7 @@ def get_relative_rankings(
         include_species_like: Whether to include subspecies-like ranks for species.
         include_distribution: Whether to return raw values for density curves.
         location: Optional location GID to filter descendants by occurrence membership.
-    
+
     Returns:
         A dict containing ranking entries and optional distribution data.
     """
@@ -1042,11 +1051,11 @@ def list_relative_ranking_options(
     rank: str = Query(..., description="Descendant rank to inspect (e.g., SPECIES)"),
 ) -> dict[str, Any]:
     """Lists available ranking metrics for an ancestor/rank.
-    
+
     Args:
         taxon_id: Ancestor taxon id to inspect.
         rank: Descendant rank to inspect.
-    
+
     Returns:
         A dict containing available variable/metric options.
     """
@@ -1059,6 +1068,232 @@ def list_relative_ranking_options(
         "rank": rank.upper(),
         "options": options,
     }
+
+
+# ---------------------------------------------------------------------------
+# SDM prediction response models
+# ---------------------------------------------------------------------------
+
+
+class SpeciesPrediction(BaseModel):
+    species_key: int
+    score: float
+    prior: float
+
+
+class PredictResponse(BaseModel):
+    lat: float
+    lon: float
+    top_k: int
+    threshold: float
+    n_results: int
+    predictions: list[SpeciesPrediction]
+
+
+class CoordinatePredictions(BaseModel):
+    lat: float
+    lon: float
+    n_results: int
+    predictions: list[SpeciesPrediction]
+
+
+class PredictBatchResponse(BaseModel):
+    n_coordinates: int
+    top_k: int
+    threshold: float
+    results: list[CoordinatePredictions]
+
+
+class HeatmapCell(BaseModel):
+    lat: float
+    lon: float
+    score: float
+    n_native: int
+
+
+class PredictHeatmapResponse(BaseModel):
+    species_key: int
+    bbox: list[float]
+    resolution: float
+    native_resolution: float
+    n_cells: int
+    cells: list[HeatmapCell]
+
+
+class PredictInfoResponse(BaseModel):
+    loaded: bool
+    n_species: int
+    n_cells: int
+    species_keys: list[int]
+
+
+# ---------------------------------------------------------------------------
+# SDM prediction endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/predict", response_model=PredictResponse)
+def predict_species(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude in degrees."),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude in degrees."),
+    top_k: int = Query(20, ge=1, le=500, description="Maximum species to return."),
+    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum score threshold."),
+) -> PredictResponse:
+    """Predict species suitability for a geographic coordinate.
+
+    Returns ranked species scores from the Darwin SDM.  Requires an
+    inference bundle to be loaded at startup (set WHEREWILD_INFERENCE_BUNDLE
+    env var or place at checkpoints/inference_bundle.pt).
+
+    Args:
+        lat: Latitude of the query point.
+        lon: Longitude of the query point.
+        top_k: Number of top-scoring species to return.
+        threshold: Minimum sigmoid score to include.
+
+    Returns:
+        A dict with coordinate echo, cell info, and ranked predictions.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(
+            status_code=503,
+            detail="Inference model not loaded. Set WHEREWILD_INFERENCE_BUNDLE or place bundle at checkpoints/inference_bundle.pt.",
+        )
+
+    predictions = inference.predict(
+        lat,
+        lon,
+        top_k=top_k,
+        score_threshold=threshold,
+    )
+    return PredictResponse(
+        lat=lat,
+        lon=lon,
+        top_k=top_k,
+        threshold=threshold,
+        n_results=len(predictions),
+        predictions=predictions,
+    )
+
+
+@app.get("/api/predict/batch", response_model=PredictBatchResponse)
+def predict_species_batch(
+    coords: str = Query(
+        ...,
+        description=("Comma-separated lat,lon pairs. Example: 25.0,-100.0,26.5,-99.0"),
+    ),
+    top_k: int = Query(20, ge=1, le=500),
+    threshold: float = Query(0.0, ge=0.0, le=1.0),
+) -> PredictBatchResponse:
+    """Batch prediction for multiple coordinates.
+
+    Coordinates are passed as a flat comma-separated string of
+    alternating lat,lon values.
+
+    Args:
+        coords: Flat comma-separated lat,lon pairs.
+        top_k: Number of top-scoring species per coordinate.
+        threshold: Minimum sigmoid score.
+
+    Returns:
+        A list of per-coordinate prediction results.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(
+            status_code=503,
+            detail="Inference model not loaded.",
+        )
+
+    parts = [float(v.strip()) for v in coords.split(",")]
+    if len(parts) % 2 != 0:
+        raise HTTPException(status_code=400, detail="coords must have an even number of values (lat,lon pairs).")
+
+    coordinate_list = [(parts[i], parts[i + 1]) for i in range(0, len(parts), 2)]
+    if len(coordinate_list) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 coordinate pairs per batch request.")
+
+    batch_results = inference.predict_batch(
+        coordinate_list,
+        top_k=top_k,
+        score_threshold=threshold,
+    )
+    return PredictBatchResponse(
+        n_coordinates=len(coordinate_list),
+        top_k=top_k,
+        threshold=threshold,
+        results=[
+            CoordinatePredictions(
+                lat=lat,
+                lon=lon,
+                n_results=len(preds),
+                predictions=preds,
+            )
+            for (lat, lon), preds in zip(coordinate_list, batch_results)
+        ],
+    )
+
+
+@app.get("/api/predict/heatmap", response_model=PredictHeatmapResponse)
+def predict_species_heatmap(
+    species_key: int = Query(..., description="GBIF species key."),
+    min_lat: float = Query(..., ge=-90, le=90, description="Southern edge of bounding box."),
+    min_lon: float = Query(..., ge=-180, le=180, description="Western edge of bounding box."),
+    max_lat: float = Query(..., ge=-90, le=90, description="Northern edge of bounding box."),
+    max_lon: float = Query(..., ge=-180, le=180, description="Eastern edge of bounding box."),
+    resolution: float | None = Query(None, gt=0, le=10, description="Grid cell size in degrees. Defaults to model native (0.25)."),
+) -> PredictHeatmapResponse:
+    """Compute a probability grid for one species over a bounding box.
+
+    Returns per-cell scores suitable for rendering a heat map.
+    All cells within the bounding box are evaluated in a single vectorized
+    forward pass.
+
+    Args:
+        species_key: GBIF species key (must exist in the loaded model).
+        min_lat: Southern edge latitude.
+        min_lon: Western edge longitude.
+        max_lat: Northern edge latitude.
+        max_lon: Eastern edge longitude.
+        resolution: Grid cell size in degrees (default: model native).
+
+    Returns:
+        A dict containing species_key, bbox, resolution, cell count, and
+        a list of ``{lat, lon, score}`` entries for every cell that has
+        environmental data.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    if min_lat >= max_lat:
+        raise HTTPException(status_code=400, detail="min_lat must be less than max_lat.")
+    if min_lon >= max_lon:
+        raise HTTPException(status_code=400, detail="min_lon must be less than max_lon.")
+    try:
+        result = inference.predict_heatmap(
+            species_key,
+            (min_lat, min_lon, max_lat, max_lon),
+            resolution=resolution,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return result
+
+
+@app.get("/api/predict/info", response_model=PredictInfoResponse)
+def predict_model_info() -> PredictInfoResponse:
+    """Return metadata about the loaded inference model.
+
+    Returns:
+        Species count, cell count, and per-species metadata.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+
+    return PredictInfoResponse(
+        loaded=True,
+        n_species=len(inference.known_species()),
+        n_cells=inference.cell_count(),
+        species_keys=inference.known_species(),
+    )
 
 
 if __name__ == "__main__":
