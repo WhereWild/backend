@@ -35,6 +35,42 @@ SCHEMA_LOG_INTERVAL_FILES = 500
 FINAL_WRITE_USE_THREADS = False
 
 
+def _species_inverse_frequency_weights(
+    donor_species: np.ndarray,
+    target_species: np.ndarray,
+) -> np.ndarray:
+    """Compute per-row sample weights that correct for donor-species frequency skew.
+
+    For each target species independently, rows donated by over-represented
+    donor species receive a lower weight so that common species do not
+    dominate the unlabeled distribution.  Weights are normalised per
+    target species so the mean weight for each target remains 1.0,
+    keeping the nnPU negative-risk term at a consistent scale.
+
+    Args:
+        donor_species: species_key of the donor row for each background row.
+        target_species: target species_key each background row is assigned to.
+
+    Returns:
+        float32 array of per-row weights, same length as donor_species.
+    """
+    weights = np.ones(len(donor_species), dtype=np.float32)
+    for sp_key in np.unique(target_species):
+        sp_mask = target_species == sp_key
+        d_sp = donor_species[sp_mask]
+        if d_sp.size == 0:
+            continue
+        unique_donors, inverse, donor_counts = np.unique(d_sp, return_inverse=True, return_counts=True)
+        # Inverse-frequency: common donors get lower weight.
+        w = 1.0 / donor_counts[inverse].astype(np.float32)
+        # Normalise so mean weight within this target species = 1.0.
+        mean_w = w.mean()
+        if mean_w > 0:
+            w /= mean_w
+        weights[sp_mask] = w
+    return weights
+
+
 def _build_background_table_for_split(
     split_table: pa.Table,
     *,
@@ -119,6 +155,8 @@ def _build_background_table_for_split(
 
     donor_indices_all = np.concatenate(sampled_donor_indices)
     target_species_all = np.concatenate(sampled_target_species)
+    donor_species_all = species[donor_indices_all]
+    sample_weights = _species_inverse_frequency_weights(donor_species_all, target_species_all)
     take_indices = pa.array(donor_indices_all, type=pa.int64())
     sampled = split_table.take(take_indices)
 
@@ -135,7 +173,7 @@ def _build_background_table_for_split(
         elif name == "presence_label":
             arrays.append(pa.array(np.zeros(n_rows, dtype=np.int8), type=pa.int8()))
         elif name == "sample_weight":
-            arrays.append(pa.array(np.ones(n_rows, dtype=np.float32), type=pa.float32()))
+            arrays.append(pa.array(sample_weights, type=pa.float32()))
         elif name == "source":
             arrays.append(pa.array(["generated_background"] * n_rows, type=pa.string()))
         else:

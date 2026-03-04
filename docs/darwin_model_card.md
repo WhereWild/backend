@@ -29,9 +29,11 @@ Encoder output:
 
 Practical architecture:
 
-- tabular encoder: 3-layer MLP with residual connections, GELU, LayerNorm,
+- tabular encoder: 4 linear layers total (`project_in` + two residual block linears + `project_out`) with residual connections, GELU, LayerNorm,
 - optional raster branch: tiny CNN (MobileNet-style depthwise blocks), fused with tabular branch,
 - final projection to 128-d embedding.
+
+Counting note: this may be informally described as a 3-stage stack (input projection, residual trunk, output projection), but implementation uses 4 linear layers.
 
 ### 2.2 Species heads (`H_s`)
 
@@ -53,7 +55,17 @@ Train heads with Positive-Unlabeled (PU) learning instead of standard binary lab
 
 ### 3.2 Loss
 
-Use non-negative PU risk (`nnPU`) with prior `π_s = P(y=1|s)`:
+Use non-negative PU risk (`nnPU`) with prior `π_s = P(y=1|s)`.
+
+Current implementation estimates `π_s` with empirical-Bayes smoothing:
+
+`raw_s = n_pos_s / n_rows_s`
+
+`π_s = (n_pos_s + α * p_global) / (n_rows_s + α)`
+
+where `p_global` is the global positive rate in the train split and `α=50`.
+
+Then apply non-negative PU risk:
 
 $R(f) = \pi_s \mathbb{E}_{x \sim P_s}[\ell(f(x))] + \max\bigl(0,\ \mathbb{E}_{x \sim U_s}[\ell(-f(x))] - \pi_s \mathbb{E}_{x \sim P_s}[\ell(-f(x))]\bigr)$
 
@@ -70,8 +82,10 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 Constraints:
 
-- constrain donor pools by region/biome/month to avoid unrealistic easy negatives,
-- rebalance with sample weights when donor pools are highly skewed by common species or hotspot cells.
+- Current implementation: donor rows are constrained to the same split and filtered to avoid `(cell_id, year_month)` conflicts for the target species.
+- Current implementation: sample weights rebalance donor-species frequency skew within each target species.
+- Not yet implemented: explicit donor-pool constraints by region/biome/month.
+- Not yet implemented: explicit hotspot-cell rebalancing beyond donor-species frequency weighting.
 
 ## 4. Training Strategy for Your Hardware (RTX 5090 32 GB)
 
@@ -100,7 +114,7 @@ Default settings:
 
 - embedding dim: 128,
 - mixed precision (bf16/fp16),
-- effective batch size: 4k to 16k (gradient accumulation),
+- batch size: 4096,
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads
@@ -108,8 +122,9 @@ Default settings:
 After Stage B, use the pretrained encoder embedding as the fixed representation for species-level training.
 
 - freeze encoder,
-- train PU logistic head per species (parallelized CPU/GPU mini-jobs),
-- unfreeze top encoder block for rare species only if needed.
+- train PU logistic head per species.
+- Current implementation status: heads are trained sequentially in one process (not yet parallelized into CPU/GPU mini-jobs).
+- Not yet implemented: optional unfreeze of top encoder block for rare species.
 
 Expected outcome: most compute spent once in shared encoder; species updates are cheap.
 
@@ -124,7 +139,15 @@ Expected outcome: most compute spent once in shared encoder; species updates are
 
 - The inference engine (`util/inference.py`) loads the bundle at startup and runs on CPU.
 - No CUDA, AMP, or heavy ML dependencies are needed on the server.
-- Four FastAPI endpoints expose predictions: single-point, batch, heatmap, and model info.
+- FastAPI prediction endpoints currently exposed:
+    - `/api/predict` (single-point scoring)
+    - `/api/predict/batch` (batch scoring)
+    - `/api/predict/heatmap` (materialized heatmap)
+    - `/api/predict/heatmap/stream` (streaming heatmap)
+    - `/api/predict/heatmap-jobs` (create async heatmap job)
+    - `/api/predict/heatmap-jobs/{job_id}/stream` (stream async heatmap job progress/results)
+    - `/api/predict/heatmap-jobs/{job_id}` (delete/cancel heatmap job)
+    - `/api/predict/info` (model/bundle metadata)
 
 ### 5.3 On-the-fly GIS sampling
 
@@ -147,9 +170,10 @@ This enables predictions at any land coordinate on Earth.
 ## 6. Data Splits and Validation (avoid leakage)
 
 - split by space and time, not random rows,
-- e.g. blocked CV by geohash/S2 + holdout recent months,
-- evaluate with PR-AUC, Recall@fixed precision, calibrated Brier score,
-- report by prevalence bins (common vs rare species).
+- Current implementation: deterministic space-time split by hashed `(cell_id, year_month)` into train/val/test partitions.
+- Not yet implemented: blocked CV by geohash/S2 and explicit recent-month holdout protocol.
+- Not yet implemented in training scripts: PR-AUC, Recall@fixed precision, calibrated Brier score reporting.
+- Not yet implemented in training scripts: prevalence-bin reporting (common vs rare species).
 
 ## 7. Recommended MVP (first production cut)
 
@@ -159,8 +183,10 @@ This enables predictions at any land coordinate on Earth.
 4. Export `.pt` inference bundle containing encoder + heads + geocell feature table + feature names.
 5. Serve predictions via FastAPI with on-the-fly GIS raster sampling for arbitrary coordinates.
 
-This matches all requirements: modular per-species updates, server-side inference,
-single-GPU feasibility, and proper treatment of missing negatives.
+Current implementation covers modular per-species updates, server-side inference,
+single-GPU feasibility, and nnPU treatment of missing negatives.
+
+Remaining gaps to close full policy alignment are documented in Sections 3.3 and 6.
 
 ## 8. Data Preprocessing Pipeline (ETL)
 

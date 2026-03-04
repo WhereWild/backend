@@ -14,8 +14,8 @@ try:
 except ImportError:
     from _compat import import_local_symbol
 
-TrainingDataset = import_local_symbol("data", "TrainingDataset")
-make_batches = import_local_symbol("data", "make_batches")
+StreamingTrainingDataset = import_local_symbol("data", "StreamingTrainingDataset")
+make_streaming_batches = import_local_symbol("data", "make_streaming_batches")
 reconstruction_loss = import_local_symbol("losses", "reconstruction_loss")
 AuxDecoder = import_local_symbol("model", "AuxDecoder")
 SharedEncoder = import_local_symbol("model", "SharedEncoder")
@@ -74,22 +74,19 @@ def train_encoder(
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
         amp_dtype = torch.float32
+    use_pin = dev.type == "cuda"
 
     print(f"Device: {dev} | AMP: {amp_enabled} ({amp_dtype})")
-    print("Loading training split...")
-    use_pin = dev.type == "cuda"
-    train_ds = TrainingDataset(data_root, split="train")
-    val_ds = TrainingDataset(data_root, split="val")
-    if use_pin:
-        train_ds.pin()
-        val_ds.pin()
+    print("Probing training split (streaming mode)...")
+    train_ds = StreamingTrainingDataset(data_root, split="train")
+    val_ds = StreamingTrainingDataset(data_root, split="val")
     input_dim = train_ds.feature_dim
     recon_dim = train_ds.recon_dim
 
-    print(f"Train rows: {len(train_ds):,} | Val rows: {len(val_ds):,} | Input dim: {input_dim}")
+    print(f"Train rows: {train_ds.row_count:,} | Val rows: {val_ds.row_count:,} | Input dim: {input_dim}")
 
-    train_loader = make_batches(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = make_batches(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = make_streaming_batches(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = make_streaming_batches(val_ds, batch_size=batch_size, shuffle=False)
 
     encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(dev)
     aux_decoder = AuxDecoder(embed_dim, recon_dim).to(dev)

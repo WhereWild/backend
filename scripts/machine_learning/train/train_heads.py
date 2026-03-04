@@ -48,22 +48,31 @@ def compute_embeddings(
 
 def estimate_prior(
     n_species_positives: int,
-    n_total_positive_rows: int,
+    n_species_total_rows: int,
+    global_positive_rate: float,
+    smoothing_strength: float = 50.0,
     min_prior: float = 1e-4,
     max_prior: float = 0.5,
 ) -> float:
     """Estimate class prior pi_s for one species.
 
-    pi_s = count(positives for species s) / count(all positive training rows).
+    Uses an empirical-Bayes shrinkage estimate:
 
-    Uses only positive rows in the train split as denominator so generated
-    unlabeled/background rows do not dilute priors as background_ratio changes.
+        raw_s = n_pos_s / n_total_s
+        pi_s = (n_pos_s + smoothing_strength * global_positive_rate)
+               / (n_total_s + smoothing_strength)
+
+    This keeps species-specific signal while stabilizing rare-species priors.
+    The estimate is computed once per species from train-split counts, so
+    runtime overhead is negligible relative to head optimization.
 
     Clamped to [min_prior, max_prior] for numerical stability.
     """
-    if n_total_positive_rows == 0:
+    if n_species_total_rows <= 0:
         return min_prior
-    return float(np.clip(n_species_positives / n_total_positive_rows, min_prior, max_prior))
+    numerator = n_species_positives + smoothing_strength * global_positive_rate
+    denominator = n_species_total_rows + smoothing_strength
+    return float(np.clip(numerator / max(denominator, 1e-12), min_prior, max_prior))
 
 
 def train_species_heads(
@@ -133,6 +142,10 @@ def train_species_heads(
     train_labels = train_ds.presence_label
     train_weights = train_ds.sample_weight
     n_total_positive_train = int((train_labels == 1).sum().item())
+    n_total_rows_train = int(train_labels.numel())
+    global_positive_rate = (
+        float(n_total_positive_train / n_total_rows_train) if n_total_rows_train > 0 else 0.0
+    )
 
     print("Computing validation embeddings...")
     val_z = compute_embeddings(encoder, val_ds, dev, batch_size=batch_size)
@@ -167,7 +180,12 @@ def train_species_heads(
         if n_pos == 0 or n_unl == 0:
             continue
 
-        prior_pi = estimate_prior(n_pos, n_total_positive_train)
+        n_species_rows = n_pos + n_unl
+        prior_pi = estimate_prior(
+            n_pos,
+            n_species_rows,
+            global_positive_rate,
+        )
 
         head = SpeciesHead(embed_dim=embed_dim).to(dev)
         optimizer = torch.optim.AdamW(head.parameters(), lr=head_lr, weight_decay=head_weight_decay)
@@ -219,7 +237,10 @@ def train_species_heads(
         species_meta[sp_key] = {
             "n_positives": n_pos,
             "n_unlabeled": n_unl,
+            "n_rows": n_species_rows,
             "prior_pi": prior_pi,
+            "prior_global_positive_rate": global_positive_rate,
+            "prior_smoothing_strength": 50.0,
             "val_loss": best_val_loss if best_val_loss < float("inf") else None,
         }
 
