@@ -45,7 +45,9 @@ HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
 
 
-def _resolve_heatmap_feature_mode(feature_mode: str, resolution: float, native_resolution: float) -> tuple[bool, bool, bool]:
+def _resolve_heatmap_feature_mode(
+    feature_mode: str, resolution: float, native_resolution: float
+) -> tuple[bool, bool, bool]:
     """Resolve feature lookup behavior for heatmap scoring.
 
     Returns a tuple ``(use_cell_table, sample_missing, fallback_to_cell_table)``.
@@ -198,7 +200,7 @@ def _compute_dem_derived_single(lat: float, lon: float) -> dict[str, float]:
         row, col = ds.index(lon, lat)
         if row - 1 < 0 or col - 1 < 0 or row + 1 >= ds.height or col + 1 >= ds.width:
             return {}
-        win = ds.read(1, window=Window(col - 1, row - 1, 3, 3), boundless=False)
+        win = ds.read(indexes=1, window=Window(col - 1, row - 1, 3, 3), boundless=False)  # type: ignore[call-arg]
         if win.shape != (3, 3):
             return {}
         nodata = ds.nodata
@@ -341,7 +343,7 @@ def _batch_compute_dem_derived(coords: list[tuple[float, float]]) -> list[dict[s
                 row, col = ds.index(lon, lat)
                 if row - 1 < 0 or col - 1 < 0 or row + 1 >= ds.height or col + 1 >= ds.width:
                     continue
-                win = ds.read(1, window=Window(col - 1, row - 1, 3, 3), boundless=False)
+                win = ds.read(indexes=1, window=Window(col - 1, row - 1, 3, 3), boundless=False)  # type: ignore[call-arg]
                 if win.shape != (3, 3):
                     continue
                 if nodata is not None and np.any(win == nodata):
@@ -609,16 +611,16 @@ def predict_heatmap(
             model's native cell size (0.25 deg).
         include_source: Include per-cell feature source (`sampled` or
             `cell_table`) for debugging map blockiness.
-                feature_mode: Feature lookup strategy for each heatmap point.
-                        - ``prefer_cell_table`` (default): use precomputed native cell
-                            features when available; sample GIS only for missing cells.
-                        - ``auto``: use cell table only when resolution >= native, else
-                            prefer sampled GIS features.
-                        - ``cell_table_only``: use only precomputed native cell features.
-                        - ``sampled_only``: use only sampled GIS features.
-                max_cells: Optional hard cap on requested output cells. Requests above
-                        this limit raise ``ValueError`` to avoid OOM.
-                score_batch_size: Chunk size for model forward passes during scoring.
+        feature_mode: Feature lookup strategy for each heatmap point.
+                - ``prefer_cell_table`` (default): use precomputed native cell
+                    features when available; sample GIS only for missing cells.
+                - ``auto``: use cell table only when resolution >= native, else
+                    prefer sampled GIS features.
+                - ``cell_table_only``: use only precomputed native cell features.
+                - ``sampled_only``: use only sampled GIS features.
+        max_cells: Optional hard cap on requested output cells. Requests above
+                this limit raise ``ValueError`` to avoid OOM.
+        score_batch_size: Chunk size for model forward passes during scoring.
 
     Returns:
         A dict with:

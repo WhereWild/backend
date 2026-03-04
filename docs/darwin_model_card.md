@@ -87,11 +87,14 @@ Constraints:
 
 This stage can be run without species labels (self-supervised/unsupervised pretraining on all rows).
 
-Multi-task objective (recommended):
+Current objective:
 
-- self-supervised contrastive term on nearby vs far cells,
-- auxiliary reconstruction/regression of environmental variables,
-- optional taxonomy-aware metric loss for species co-occurrence neighborhoods.
+- auxiliary reconstruction/regression of environmental variables.
+
+Deferred objective terms (not active in current scripts):
+
+- spatial contrastive term,
+- taxonomy-aware metric loss for species co-occurrence neighborhoods.
 
 Default settings:
 

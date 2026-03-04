@@ -53,8 +53,6 @@ def parse_args() -> argparse.Namespace:
     encoder_args.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate.")
     encoder_args.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     encoder_args.add_argument("--recon-weight", type=float, default=1.0, help="Reconstruction loss weight.")
-    encoder_args.add_argument("--contrastive-weight", type=float, default=0.5, help="Contrastive loss weight.")
-    encoder_args.add_argument("--contrastive-temperature", type=float, default=0.1, help="NT-Xent temperature.")
     encoder_args.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
 
     # Heads-specific arguments
@@ -97,8 +95,6 @@ def main() -> int:
             lr=args.lr,
             weight_decay=args.weight_decay,
             recon_weight=args.recon_weight,
-            contrastive_weight=args.contrastive_weight,
-            contrastive_temperature=args.contrastive_temperature,
             use_amp=not args.no_amp,
             device=args.device,
         )

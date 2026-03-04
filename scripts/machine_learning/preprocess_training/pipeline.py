@@ -68,6 +68,7 @@ def _build_background_table_for_split(
         forbidden_key_ids = per_species_positive_keys[int(sp_key)]
         selected: list[np.ndarray] = []
         selected_count = 0
+        used_indices: set[int] = set()
 
         attempts = 0
         while selected_count < target_bg and attempts < 8:
@@ -86,11 +87,19 @@ def _build_background_table_for_split(
                 non_conflict = ~np.isin(candidate_keys, forbidden_key_ids)
                 candidate_idx = candidate_idx[non_conflict]
 
+            if candidate_idx.size > 0:
+                candidate_idx = np.unique(candidate_idx.astype(np.int64, copy=False))
+                if used_indices:
+                    used_idx_arr = np.fromiter(used_indices, dtype=np.int64)
+                    candidate_idx = candidate_idx[~np.isin(candidate_idx, used_idx_arr)]
+
             if candidate_idx.size == 0:
                 continue
 
             take_n = min(remaining, int(candidate_idx.size))
-            selected.append(candidate_idx[:take_n].astype(np.int64, copy=False))
+            chosen = candidate_idx[:take_n].astype(np.int64, copy=False)
+            selected.append(chosen)
+            used_indices.update(chosen.tolist())
             selected_count += take_n
 
         if not selected:

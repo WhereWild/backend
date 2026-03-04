@@ -16,7 +16,6 @@ except ImportError:
 
 TrainingDataset = import_local_symbol("data", "TrainingDataset")
 make_batches = import_local_symbol("data", "make_batches")
-contrastive_loss = import_local_symbol("losses", "contrastive_loss")
 reconstruction_loss = import_local_symbol("losses", "reconstruction_loss")
 AuxDecoder = import_local_symbol("model", "AuxDecoder")
 SharedEncoder = import_local_symbol("model", "SharedEncoder")
@@ -35,16 +34,13 @@ def train_encoder(
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     recon_weight: float = 1.0,
-    contrastive_weight: float = 0.5,
-    contrastive_temperature: float = 0.1,
     use_amp: bool = True,
     device: str = "auto",
 ) -> Path:
-    """Train shared encoder with self-supervised objectives.
+    """Train shared encoder with masked reconstruction objective.
 
-    Multi-task objective (model card Stage B):
+    Objective (model card Stage B):
     - Auxiliary reconstruction of environmental features (MSE on observed values).
-    - Spatial contrastive loss on cell_id proximity (NT-Xent).
 
     Args:
         data_root: path to preprocessed partitioned parquet dataset.
@@ -56,8 +52,6 @@ def train_encoder(
         lr: peak learning rate.
         weight_decay: AdamW weight decay.
         recon_weight: loss weight for reconstruction term.
-        contrastive_weight: loss weight for contrastive term.
-        contrastive_temperature: temperature for NT-Xent.
         use_amp: use automatic mixed precision (bf16/fp16).
         device: "auto", "cuda", "mps", or "cpu".
 
@@ -104,7 +98,7 @@ def train_encoder(
 
     total_steps = epochs * len(train_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    amp = torch.amp
+    amp = getattr(torch, "amp")
     scaler = amp.GradScaler("cuda", enabled=amp_enabled)
 
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
@@ -125,16 +119,12 @@ def train_encoder(
             features = batch["features"].to(dev, non_blocking=use_pin)
             masks = batch["masks"].to(dev, non_blocking=use_pin)
 
-            cell_id_hash = batch["cell_id_hash"].to(dev, non_blocking=use_pin)
-
             amp_context = amp.autocast("cuda", dtype=amp_dtype) if amp_enabled else nullcontext()
             with amp_context:
                 z = encoder(features)
                 recon = aux_decoder(z)
                 loss_recon = reconstruction_loss(recon, features, masks)
-                loss_contrastive = contrastive_loss(z, cell_id_hash, temperature=contrastive_temperature)
-
-                loss = recon_weight * loss_recon + contrastive_weight * loss_contrastive
+                loss = recon_weight * loss_recon
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -164,14 +154,12 @@ def train_encoder(
             for batch in val_loader:
                 features = batch["features"].to(dev, non_blocking=use_pin)
                 masks = batch["masks"].to(dev, non_blocking=use_pin)
-                cell_id_hash = batch["cell_id_hash"].to(dev, non_blocking=use_pin)
                 amp_context = amp.autocast("cuda", dtype=amp_dtype) if amp_enabled else nullcontext()
                 with amp_context:
                     z = encoder(features)
                     recon = aux_decoder(z)
                     loss_recon = reconstruction_loss(recon, features, masks)
-                    loss_contrastive = contrastive_loss(z, cell_id_hash, temperature=contrastive_temperature)
-                    loss = recon_weight * loss_recon + contrastive_weight * loss_contrastive
+                    loss = recon_weight * loss_recon
                 val_loss_sum += loss.item()
                 val_steps += 1
 

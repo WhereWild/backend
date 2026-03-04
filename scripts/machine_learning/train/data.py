@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -84,21 +83,6 @@ class TrainingDataset(Dataset):
         self.sample_weight = torch.from_numpy(df["sample_weight"].to_numpy().astype(np.float32))
         self.cell_ids = df["cell_id"].to_numpy()
 
-        # Pre-hash cell_id strings to int64 so they can travel as tensors
-        # (needed for contrastive pairing after shuffle).
-        cell_id_hashes = np.array(
-            [
-                int.from_bytes(
-                    hashlib.blake2b(str(cid).encode("utf-8"), digest_size=8).digest(),
-                    byteorder="big",
-                    signed=True,
-                )
-                for cid in self.cell_ids
-            ],
-            dtype=np.int64,
-        )
-        self.cell_id_hash = torch.from_numpy(cell_id_hashes)
-
         self.feature_dim = self.features.shape[1]
         self.num_rows = self.features.shape[0]
 
@@ -109,7 +93,6 @@ class TrainingDataset(Dataset):
         self.species_key = self.species_key.pin_memory()
         self.presence_label = self.presence_label.pin_memory()
         self.sample_weight = self.sample_weight.pin_memory()
-        self.cell_id_hash = self.cell_id_hash.pin_memory()
         return self
 
     def __len__(self) -> int:
@@ -122,7 +105,6 @@ class TrainingDataset(Dataset):
             "species_key": self.species_key[idx],
             "presence_label": self.presence_label[idx],
             "sample_weight": self.sample_weight[idx],
-            "cell_id_hash": self.cell_id_hash[idx],
         }
 
 
@@ -162,7 +144,6 @@ class BatchIterator:
                 "species_key": ds.species_key[idx],
                 "presence_label": ds.presence_label[idx],
                 "sample_weight": ds.sample_weight[idx],
-                "cell_id_hash": ds.cell_id_hash[idx],
             }
 
 

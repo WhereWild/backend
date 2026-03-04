@@ -162,6 +162,8 @@ Requires the `ml` optional dependency group: `uv sync --extra ml`.
 
 ### Stage B: Train shared encoder (self-supervised)
 
+Current Stage B objective is masked reconstruction of observed feature values.
+
 ```bash
 uv run python scripts/machine_learning/train/cli.py encoder \
     --data-root ./data/species_observation_canary \
@@ -210,7 +212,7 @@ uv run python scripts/machine_learning/train/cli.py all \
 - `--head-epochs`: epochs per species head (default 100).
 - `--lr`: encoder peak learning rate (default 1e-3).
 - `--head-lr`: species head learning rate (default 1e-2).
-- `--recon-weight` / `--contrastive-weight`: loss term weights for encoder pretraining.
+- `--recon-weight`: reconstruction loss weight for encoder pretraining.
 - `--min-positives`: skip species with fewer positives (default 5).
 - `--device`: auto (default), cuda, mps, cpu.
 - `--no-amp`: disable automatic mixed precision.
