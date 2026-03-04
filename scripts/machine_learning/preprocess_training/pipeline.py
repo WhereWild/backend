@@ -16,7 +16,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
-from transform import build_feature_template, transform_file
+
+try:
+    from .transform import build_feature_template, transform_file
+except ImportError:
+    from transform import build_feature_template, transform_file  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     from pathlib import Path

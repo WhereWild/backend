@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 import torch
 
@@ -40,6 +40,7 @@ _cell_size_deg: float = 0.25
 _species_meta: dict[int, dict] = {}
 _feature_names: dict[str, list[str]] | None = None
 _input_dim: int = 0
+_model_uses_mask: bool = False
 
 HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
@@ -56,32 +57,32 @@ def _raw_feature_dim_from_names() -> int | None:
 
 def _encode_input_with_optional_mask(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Build encoder input tensor, concatenating masks when expected by model."""
-    raw_dim = int(features.shape[0])
-    if _input_dim == raw_dim:
-        return features
-    if _input_dim == raw_dim * 2:
+    if _model_uses_mask:
         return torch.cat([features, mask], dim=0)
     return features
 
 
+class _HeatmapFeatureConfig(NamedTuple):
+    use_cell_table: bool
+    sample_missing: bool
+    fallback_to_cell_table: bool
+
+
 def _resolve_heatmap_feature_mode(
     feature_mode: str, resolution: float, native_resolution: float
-) -> tuple[bool, bool, bool]:
-    """Resolve feature lookup behavior for heatmap scoring.
-
-    Returns a tuple ``(use_cell_table, sample_missing, fallback_to_cell_table)``.
-    """
+) -> _HeatmapFeatureConfig:
+    """Resolve feature lookup behavior for heatmap scoring."""
     valid_feature_modes = {"auto", "prefer_cell_table", "cell_table_only", "sampled_only"}
     if feature_mode not in valid_feature_modes:
         raise ValueError(f"feature_mode must be one of {sorted(valid_feature_modes)}")
 
     if feature_mode == "prefer_cell_table":
-        return True, True, True
+        return _HeatmapFeatureConfig(True, True, True)
     if feature_mode == "cell_table_only":
-        return True, False, True
+        return _HeatmapFeatureConfig(True, False, True)
     if feature_mode == "sampled_only":
-        return False, True, False
-    return resolution >= native_resolution, True, True
+        return _HeatmapFeatureConfig(False, True, False)
+    return _HeatmapFeatureConfig(resolution >= native_resolution, True, True)
 
 
 def _build_heatmap_coords(
@@ -466,7 +467,7 @@ def load_bundle(path: str | Path) -> None:
     once during application startup.
     """
     global _bundle, _encoder, _heads, _cell_table, _cell_size_deg, _species_meta  # noqa: PLW0603
-    global _feature_names, _input_dim  # noqa: PLW0603
+    global _feature_names, _input_dim, _model_uses_mask  # noqa: PLW0603
 
     _lazy_import_models()
 
@@ -505,7 +506,8 @@ def load_bundle(path: str | Path) -> None:
     _feature_names = loaded.get("feature_names")
 
     raw_dim = _raw_feature_dim_from_names()
-    if raw_dim is not None and _input_dim == raw_dim * 2:
+    _model_uses_mask = raw_dim is not None and input_dim == raw_dim * 2
+    if _model_uses_mask:
         normalized_table: dict[str, dict[str, torch.Tensor]] = {}
         for cid, payload in _cell_table.items():
             cell_features = payload.get("features")

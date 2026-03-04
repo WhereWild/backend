@@ -6,7 +6,10 @@ import argparse
 import os
 from pathlib import Path
 
-from pipeline import run_preprocess
+try:
+    from .pipeline import run_preprocess
+except ImportError:
+    from pipeline import run_preprocess  # type: ignore[no-redef]
 
 
 def parse_args() -> argparse.Namespace:
