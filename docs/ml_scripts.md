@@ -41,6 +41,10 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 
 ### PU-ready run (with unlabeled/background rows)
 
+This uses pooled same-split background generation: for each target species,
+donor rows are sampled from other-species positives in the same split,
+with `(cell_id, year_month)` conflicts excluded.
+
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data \
@@ -93,7 +97,9 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - If set, drops rows with missing/unparseable event timestamps.
     - If omitted, keeps rows and applies fallback timestamps.
 - `--background-ratio`
-    - Default is `1.0` (one generated unlabeled row per positive row).
+    - Default is `1.0` (one generated unlabeled row per positive row for each target species).
+    - Donors come from other-species positives in the same split (`train`, `val`, `test` kept separate).
+    - Rows that conflict with target-species positives on `(cell_id, year_month)` are excluded.
     - Set `0.0` for positives-only debug runs.
 - `--template-scan-max-files`
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).

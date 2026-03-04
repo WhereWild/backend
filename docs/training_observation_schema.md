@@ -14,6 +14,10 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 
 - Primary partitions are split/year_month/region_id for efficient spatiotemporal slicing and leakage-safe evaluation. Species partitioning is optional for derived head-training datasets (e.g., species_bucket) but not recommended as the base layout due to high cardinality and small-file risk.
 
+## Sampling Semantics
+
+- For PU runs, generated unlabeled/background rows are sampled from other-species positive rows within the same split. Candidate rows that conflict with target-species positives on (cell_id, year_month) are excluded. Generated rows keep unlabeled semantics (presence_label=0) and are not treated as true negatives.
+
 ## Feature Roles
 
 - `input`: can be fed into model tensors.

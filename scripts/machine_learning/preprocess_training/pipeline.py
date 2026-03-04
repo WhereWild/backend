@@ -8,9 +8,14 @@ from pathlib import Path
 import shutil
 import threading
 import time
+import uuid
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import pandas as pd
 
 from transform import build_feature_template, transform_file
 
@@ -23,6 +28,143 @@ LOG_SLOW_FILE_SECONDS = 20.0
 LOG_SLOW_READ_SECONDS = 8.0
 SCHEMA_LOG_INTERVAL_FILES = 500
 FINAL_WRITE_USE_THREADS = False
+
+
+def _build_background_table_for_split(
+    split_table: pa.Table,
+    *,
+    split_name: str,
+    background_ratio: float,
+    rng: np.random.Generator,
+) -> pa.Table | None:
+    """Generate pooled other-species unlabeled rows for one split."""
+    if split_table.num_rows == 0 or background_ratio <= 0:
+        return None
+
+    species = split_table.column("species_key").to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    cell_ids = split_table.column("cell_id").to_numpy(zero_copy_only=False)
+    year_month = split_table.column("year_month").to_numpy(zero_copy_only=False)
+
+    if len(species) == 0:
+        return None
+
+    key_frame = pd.DataFrame({"cell_id": cell_ids, "year_month": year_month})
+    key_ids = pd.util.hash_pandas_object(key_frame, index=False).to_numpy(dtype=np.uint64, copy=False)
+
+    unique_species, positive_counts = np.unique(species, return_counts=True)
+    per_species_positive_keys: dict[int, np.ndarray] = {}
+    for sp_key in unique_species.tolist():
+        per_species_positive_keys[int(sp_key)] = np.unique(key_ids[species == sp_key])
+
+    sampled_donor_indices: list[np.ndarray] = []
+    sampled_target_species: list[np.ndarray] = []
+
+    for sp_key, n_pos in zip(unique_species.tolist(), positive_counts.tolist(), strict=True):
+        target_bg = int(round(float(n_pos) * background_ratio))
+        if target_bg <= 0:
+            continue
+
+        forbidden_key_ids = per_species_positive_keys[int(sp_key)]
+        selected: list[np.ndarray] = []
+        selected_count = 0
+
+        attempts = 0
+        while selected_count < target_bg and attempts < 8:
+            attempts += 1
+            remaining = target_bg - selected_count
+            draw_size = max(128, int(remaining * 2.0))
+            draw_idx = rng.integers(0, len(species), size=draw_size, endpoint=False)
+
+            valid_species = species[draw_idx] != int(sp_key)
+            if not valid_species.any():
+                continue
+
+            candidate_idx = draw_idx[valid_species]
+            if forbidden_key_ids.size > 0:
+                candidate_keys = key_ids[candidate_idx]
+                non_conflict = ~np.isin(candidate_keys, forbidden_key_ids)
+                candidate_idx = candidate_idx[non_conflict]
+
+            if candidate_idx.size == 0:
+                continue
+
+            take_n = min(remaining, int(candidate_idx.size))
+            selected.append(candidate_idx[:take_n].astype(np.int64, copy=False))
+            selected_count += take_n
+
+        if not selected:
+            continue
+
+        donor_idx = np.concatenate(selected)
+        sampled_donor_indices.append(donor_idx)
+        sampled_target_species.append(np.full(donor_idx.shape[0], int(sp_key), dtype=np.int64))
+
+    if not sampled_donor_indices:
+        print(f"Background generation | split={split_name} | no valid donor rows")
+        return None
+
+    donor_indices_all = np.concatenate(sampled_donor_indices)
+    target_species_all = np.concatenate(sampled_target_species)
+    take_indices = pa.array(donor_indices_all, type=pa.int64())
+    sampled = split_table.take(take_indices)
+
+    n_rows = sampled.num_rows
+    arrays: list[pa.Array] = []
+    names = sampled.schema.names
+    for name in names:
+        if name == "sample_id":
+            arrays.append(pa.array([str(uuid.uuid4()) for _ in range(n_rows)], type=pa.string()))
+        elif name == "observation_id":
+            arrays.append(pa.array([None] * n_rows, type=pa.string()))
+        elif name == "species_key":
+            arrays.append(pa.array(target_species_all, type=pa.int64()))
+        elif name == "presence_label":
+            arrays.append(pa.array(np.zeros(n_rows, dtype=np.int8), type=pa.int8()))
+        elif name == "sample_weight":
+            arrays.append(pa.array(np.ones(n_rows, dtype=np.float32), type=pa.float32()))
+        elif name == "source":
+            arrays.append(pa.array(["generated_background"] * n_rows, type=pa.string()))
+        else:
+            arrays.append(sampled.column(name))
+
+    return pa.Table.from_arrays(arrays, names=names)
+
+
+def generate_pooled_background_shards(
+    staged_paths: list[Path],
+    *,
+    staging_dir: Path,
+    background_ratio: float,
+) -> tuple[list[Path], int]:
+    """Generate unlabeled rows from pooled other-species positives per split."""
+    if background_ratio <= 0.0:
+        return [], 0
+
+    dataset = ds.dataset(staged_paths, format="parquet")
+    generated_paths: list[Path] = []
+    generated_rows = 0
+    rng = np.random.default_rng(0)
+
+    for split_name in ("train", "val", "test"):
+        split_table = dataset.to_table(filter=pc.field("split") == split_name, use_threads=True)
+        background_table = _build_background_table_for_split(
+            split_table,
+            split_name=split_name,
+            background_ratio=background_ratio,
+            rng=rng,
+        )
+        if background_table is None or background_table.num_rows == 0:
+            continue
+
+        out_path = staging_dir / f"background_pooled_{split_name}.parquet"
+        pq.write_table(background_table, out_path, compression="zstd")
+        generated_paths.append(out_path)
+        generated_rows += int(background_table.num_rows)
+        print(
+            f"Background generation | split={split_name} | rows={background_table.num_rows:,} | path={out_path.name}"
+        )
+
+    return generated_paths, generated_rows
 
 
 def discover_files(input_root: Path, glob_pattern: str, max_files: int) -> list[Path]:
@@ -166,7 +308,6 @@ def run_preprocess(args) -> int:
                 region_size_deg=FEATURE_REGION_SIZE_DEG,
                 feature_template=feature_template,
                 fallback_time_policy=fallback_time_policy,
-                background_ratio=args.background_ratio,
                 missing_feature_sentinel=MISSING_FEATURE_SENTINEL,
                 warn_min_cells_per_species=int(args.warn_min_cells_per_species),
                 static_context_template=str(args.static_context_template or ""),
@@ -243,6 +384,23 @@ def run_preprocess(args) -> int:
                 print(f"  ... and {len(failures) - 20} more")
         raise SystemExit("No transformed shards were produced; aborting final write.")
 
+    positive_rows = written
+    if float(args.background_ratio) > 0.0:
+        print("Generating pooled unlabeled/background rows from other-species observations...")
+        bg_start = time.perf_counter()
+        background_paths, background_rows = generate_pooled_background_shards(
+            staged_paths,
+            staging_dir=staging_dir,
+            background_ratio=float(args.background_ratio),
+        )
+        staged_paths.extend(background_paths)
+        written += int(background_rows)
+        bg_seconds = time.perf_counter() - bg_start
+        print(
+            f"Background generation complete | rows: {background_rows:,} | "
+            f"shards: {len(background_paths):,} | duration: {bg_seconds:.1f}s"
+        )
+
     print(f"Starting final dataset write from staging: {staging_dir}")
     write_start = time.perf_counter()
     write_heartbeat_stop, write_heartbeat_thread = start_phase_heartbeat(
@@ -291,6 +449,7 @@ def run_preprocess(args) -> int:
     write_seconds = time.perf_counter() - write_start
 
     print(f"Final dataset written to {output_root}")
+    print(f"Positive rows: {positive_rows:,}")
     print(f"Total rows: {written:,}")
     print(f"Static context merged rows: {static_join_rows_total:,}")
     print(f"Temporal context merged rows: {temporal_join_rows_total:,}")

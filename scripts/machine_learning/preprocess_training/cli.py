@@ -78,7 +78,10 @@ def parse_args() -> argparse.Namespace:
         "--background-ratio",
         type=float,
         default=1.0,
-        help="Unlabeled/background rows to generate per positive row (default 1.0 = 1:1).",
+        help=(
+            "Unlabeled/background rows to generate per positive row (default 1.0 = 1:1), "
+            "sampled from other-species rows within the same split."
+        ),
     )
     parser.add_argument(
         "--overwrite-output",

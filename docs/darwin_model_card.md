@@ -63,9 +63,15 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 ### 3.3 Unlabeled sampling policy (critical)
 
-- spatially stratified by biome/ecoregion,
-- bias-corrected by observer effort proxy (if available),
-- hard-negative mining: periodically add top false positives from previous epoch.
+- pool transformed positive rows across species,
+- for target species `s`, sample unlabeled rows from other-species rows in the same split only,
+- exclude sampled rows whose `(cell_id, year_month)` pair is already positive for species `s`,
+- set `presence_label=0` for sampled rows and treat them as unlabeled (not true negatives).
+
+Constraints:
+
+- constrain donor pools by region/biome/month to avoid unrealistic easy negatives,
+- rebalance with sample weights when donor pools are highly skewed by common species or hotspot cells.
 
 ## 4. Training Strategy for Your Hardware (RTX 5090 32 GB)
 
@@ -161,7 +167,7 @@ single-GPU feasibility, and proper treatment of missing negatives.
 4. Join temporal context (recent weather aggregates aligned to observation time).
 5. Build PU rows:
     - positives from observations,
-    - unlabeled/background samples stratified by region and time.
+    - unlabeled/background rows sampled from other-species positives in the same split, filtered to avoid `(cell_id, year_month)` conflicts for the target species.
 6. Build vectors:
     - `env_features`, `habitat_features`, `weather_features` with fixed order by `feature_version`.
 7. Keep leakage-prone fields (`lat`, `lon`, `event_time_utc`, `source`) as metadata only; exclude from model input tensors.

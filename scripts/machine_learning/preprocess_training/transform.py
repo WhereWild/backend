@@ -595,17 +595,11 @@ def transform_frame(
 
     low_cell_warnings: list[str] = []
     if warn_min_cells_per_species > 0:
-        species_cells = pd.DataFrame(
-            {
-                "species_key": species_key.to_numpy(),
-                "cell_id": np.asarray(cell_ids, dtype=object),
-            }
-        )
-        min_cells = (
-            species_cells.groupby("species_key", sort=False)["cell_id"]
-            .nunique(dropna=True)
-            .astype(int)
-        )
+        species_cells = pd.DataFrame({
+            "species_key": species_key.to_numpy(),
+            "cell_id": np.asarray(cell_ids, dtype=object),
+        })
+        min_cells = species_cells.groupby("species_key", sort=False)["cell_id"].nunique(dropna=True).astype(int)
         flagged = min_cells[min_cells < int(warn_min_cells_per_species)]
         for sp_key, cell_count in flagged.items():
             low_cell_warnings.append(
@@ -651,168 +645,55 @@ def transform_frame(
 
     return (
         pa.Table.from_arrays(
-        [
-            pa.array(sample_id.tolist(), type=pa.string()),
-            pa.array(observation_id.tolist(), type=pa.string()),
-            pa.array(species_key.tolist(), type=pa.int64()),
-            pa.array([1] * len(filtered), type=pa.int8()),
-            pa.array([1.0] * len(filtered), type=pa.float32()),
-            pa.array(cell_ids, type=pa.string()),
-            pa.array(region_ids, type=pa.string()),
-            pa.array(lat.to_numpy(), type=pa.float64()),
-            pa.array(lon.to_numpy(), type=pa.float64()),
-            pa.Array.from_pandas(event_time, type=pa.timestamp("ms", tz="UTC")),
-            pa.array(year_month.tolist(), type=pa.string()),
-            pa.array(splits, type=pa.string()),
-            pa.array(source.tolist(), type=pa.string()),
-            pa.array([feature_version] * len(filtered), type=pa.string()),
-            env_values,
-            env_missing_mask,
-            habitat_values,
-            habitat_missing_mask,
-            weather_values,
-            weather_missing_mask,
-        ],
-        names=[
-            "sample_id",
-            "observation_id",
-            "species_key",
-            "presence_label",
-            "sample_weight",
-            "cell_id",
-            "region_id",
-            "lat",
-            "lon",
-            "event_time_utc",
-            "year_month",
-            "split",
-            "source",
-            "feature_version",
-            "env_features",
-            "env_missing_mask",
-            "habitat_features",
-            "habitat_missing_mask",
-            "weather_features",
-            "weather_missing_mask",
-        ],
+            [
+                pa.array(sample_id.tolist(), type=pa.string()),
+                pa.array(observation_id.tolist(), type=pa.string()),
+                pa.array(species_key.tolist(), type=pa.int64()),
+                pa.array([1] * len(filtered), type=pa.int8()),
+                pa.array([1.0] * len(filtered), type=pa.float32()),
+                pa.array(cell_ids, type=pa.string()),
+                pa.array(region_ids, type=pa.string()),
+                pa.array(lat.to_numpy(), type=pa.float64()),
+                pa.array(lon.to_numpy(), type=pa.float64()),
+                pa.Array.from_pandas(event_time, type=pa.timestamp("ms", tz="UTC")),
+                pa.array(year_month.tolist(), type=pa.string()),
+                pa.array(splits, type=pa.string()),
+                pa.array(source.tolist(), type=pa.string()),
+                pa.array([feature_version] * len(filtered), type=pa.string()),
+                env_values,
+                env_missing_mask,
+                habitat_values,
+                habitat_missing_mask,
+                weather_values,
+                weather_missing_mask,
+            ],
+            names=[
+                "sample_id",
+                "observation_id",
+                "species_key",
+                "presence_label",
+                "sample_weight",
+                "cell_id",
+                "region_id",
+                "lat",
+                "lon",
+                "event_time_utc",
+                "year_month",
+                "split",
+                "source",
+                "feature_version",
+                "env_features",
+                "env_missing_mask",
+                "habitat_features",
+                "habitat_missing_mask",
+                "weather_features",
+                "weather_missing_mask",
+            ],
         ),
         low_cell_warnings,
         static_context_rows,
         temporal_context_rows,
     )
-
-
-def append_background_rows(
-    table: pa.Table,
-    ratio: float,
-    src_path: Path,
-    *,
-    cell_size_deg: float,
-    region_size_deg: float,
-    feature_template: FeatureGroups,
-    missing_feature_sentinel: float,
-) -> pa.Table:
-    """Append unlabeled/background rows via deterministic spatial sampling in file bounds."""
-    if ratio <= 0 or table.num_rows == 0:
-        return table
-
-    background_count = int(round(table.num_rows * ratio))
-    if background_count <= 0:
-        return table
-
-    seed = int.from_bytes(hashlib.blake2b(str(src_path).encode("utf-8"), digest_size=8).digest(), byteorder="big")
-    rng = np.random.default_rng(seed)
-    take_idx = rng.choice(table.num_rows, size=background_count, replace=background_count > table.num_rows)
-
-    lat_positive = table.column("lat").to_numpy(zero_copy_only=False)
-    lon_positive = table.column("lon").to_numpy(zero_copy_only=False)
-
-    min_lat = float(np.nanmin(lat_positive))
-    max_lat = float(np.nanmax(lat_positive))
-    min_lon = float(np.nanmin(lon_positive))
-    max_lon = float(np.nanmax(lon_positive))
-
-    if np.isclose(min_lat, max_lat):
-        min_lat -= 0.05
-        max_lat += 0.05
-    if np.isclose(min_lon, max_lon):
-        min_lon -= 0.05
-        max_lon += 0.05
-
-    sampled_lat = rng.uniform(min_lat, max_lat, size=background_count)
-    sampled_lon = rng.uniform(min_lon, max_lon, size=background_count)
-
-    species_positive = table.column("species_key").to_numpy(zero_copy_only=False)
-    sampled_species = species_positive[take_idx]
-
-    take_idx_array = pa.array(take_idx, type=pa.int64())
-    sampled_year_month_array = table.column("year_month").take(take_idx_array)
-    sampled_year_month = sampled_year_month_array.to_pylist()
-
-    cell_ids = [
-        bin_id(float(la), float(lo), size_deg=cell_size_deg, prefix="cell")
-        for la, lo in zip(sampled_lat, sampled_lon, strict=True)
-    ]
-    region_ids = [
-        bin_id(float(la), float(lo), size_deg=region_size_deg, prefix="region")
-        for la, lo in zip(sampled_lat, sampled_lon, strict=True)
-    ]
-    sampled_split = [
-        stable_split(cell_id, month)
-        for cell_id, month in zip(cell_ids, sampled_year_month, strict=True)
-    ]
-
-    env_values = _build_constant_fixed_list_array(
-        background_count,
-        len(feature_template.env),
-        float(missing_feature_sentinel),
-    )
-    env_mask = _build_constant_mask_array(background_count, len(feature_template.env), 1)
-    habitat_values = _build_constant_fixed_list_array(
-        background_count,
-        len(feature_template.habitat),
-        float(missing_feature_sentinel),
-    )
-    habitat_mask = _build_constant_mask_array(background_count, len(feature_template.habitat), 1)
-    weather_values = _build_constant_fixed_list_array(
-        background_count,
-        len(feature_template.weather),
-        float(missing_feature_sentinel),
-    )
-    weather_mask = _build_constant_mask_array(background_count, len(feature_template.weather), 1)
-
-    background_event_time = pa.array(
-        [pd.Timestamp(f"{month}-01T00:00:00Z") for month in sampled_year_month],
-        type=pa.timestamp("ms", tz="UTC"),
-    )
-
-    background = pa.Table.from_arrays(
-        [
-            pa.array([str(uuid.uuid4()) for _ in range(background_count)], type=pa.string()),
-            pa.array([None] * background_count, type=pa.string()),
-            pa.array(sampled_species.tolist(), type=pa.int64()),
-            pa.array([0] * background_count, type=pa.int8()),
-            pa.array([1.0] * background_count, type=pa.float32()),
-            pa.array(cell_ids, type=pa.string()),
-            pa.array(region_ids, type=pa.string()),
-            pa.array(sampled_lat, type=pa.float64()),
-            pa.array(sampled_lon, type=pa.float64()),
-            background_event_time,
-            pa.array(sampled_year_month, type=pa.string()),
-            pa.array(sampled_split, type=pa.string()),
-            pa.array(["generated_background"] * background_count, type=pa.string()),
-            pa.array([str(table.column("feature_version")[0].as_py())] * background_count, type=pa.string()),
-            env_values,
-            env_mask,
-            habitat_values,
-            habitat_mask,
-            weather_values,
-            weather_mask,
-        ],
-        names=table.schema.names,
-    )
-
-    return pa.concat_tables([table, background], promote_options="none")
 
 
 def transform_file(
@@ -824,7 +705,6 @@ def transform_file(
     region_size_deg: float,
     feature_template: FeatureGroups,
     fallback_time_policy: str,
-    background_ratio: float,
     missing_feature_sentinel: float,
     warn_min_cells_per_species: int,
     static_context_template: str,
@@ -896,17 +776,6 @@ def transform_file(
         static_context=static_context,
         temporal_context=temporal_context,
     )
-
-    if background_ratio > 0:
-        transformed = append_background_rows(
-            transformed,
-            background_ratio,
-            src_path,
-            cell_size_deg=cell_size_deg,
-            region_size_deg=region_size_deg,
-            feature_template=feature_template,
-            missing_feature_sentinel=missing_feature_sentinel,
-        )
 
     staging_dir.mkdir(parents=True, exist_ok=True)
     out_path = staging_dir / (
