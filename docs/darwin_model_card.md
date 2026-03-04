@@ -142,20 +142,7 @@ This enables predictions at any land coordinate on Earth.
 - evaluate with PR-AUC, Recall@fixed precision, calibrated Brier score,
 - report by prevalence bins (common vs rare species).
 
-## 7. Calibration and Thresholding
-
-- fit per-species temperature scaling or isotonic calibration on holdout,
-- keep two thresholds per species:
-    - high-precision threshold (user-facing confident mode),
-    - high-recall threshold (exploration mode).
-
-Current best recorded Stage C sweep for `canary_cactus`:
-
-- `head_lr=0.0088`
-- `head_weight_decay=0.00055`
-- `head_epochs=140`
-
-## 8. Recommended MVP (first production cut)
+## 7. Recommended MVP (first production cut)
 
 1. Build 128-d tabular encoder only (no raster branch yet).
 2. Train encoder on all taxa with self-supervised + aux env prediction.
@@ -166,7 +153,7 @@ Current best recorded Stage C sweep for `canary_cactus`:
 This matches all requirements: modular per-species updates, server-side inference,
 single-GPU feasibility, and proper treatment of missing negatives.
 
-## 9. Data Preprocessing Pipeline (ETL)
+## 8. Data Preprocessing Pipeline (ETL)
 
 1. Ingest raw observations and standardize core fields (taxonomy, UTC timestamp, WGS84 coords).
 2. Snap each record to `cell_id` and derive `region_id`.
@@ -187,7 +174,7 @@ Notes:
 - Static and temporal context can be joined during this preprocessing step via configured context inputs, or pre-joined upstream into occurrence files; whichever path is used should be kept consistent per `feature_version`.
 - Known issue: current background sampling is not yet spatially stratified over an explicit accessible-area `M` definition; treat this as a temporary approximation until stratified/background-area sampling is implemented.
 
-## 10. Partition Strategy: Time vs Species
+## 9. Partition Strategy: Time vs Species
 
 - Base dataset should stay partitioned by `split/year_month/region_id`.
 - Why this base partitioning:
@@ -203,7 +190,7 @@ Notes:
     - keep base table time/region partitioned,
     - optionally materialize species-bucket shards (e.g., hash buckets) for per-species training throughput.
 
-## 11. Future Upgrades
+## 10. Future Upgrades
 
 - Hierarchical heads (kingdom→phylum→...→species) for better rare-species transfer.
 - Distill encoder to an even smaller student for low-end phones.

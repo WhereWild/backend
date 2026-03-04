@@ -287,20 +287,7 @@ coverage).
 For the heatmap endpoint, missing cells are batch-sampled efficiently by opening
 each raster once per 10-degree region tile rather than once per coordinate.
 
-## Model-level calibration and tuning workflow
-
-Current heatmap controls (`feature_mode`, chunking, stream jobs) improve serving
-stability, but they are not the root-cause model fix.
-
-Recommended model-first workflow:
-
-1. Build an evaluation set that reflects sampled-feature inference behavior.
-2. Measure baseline calibration per species (ECE, Brier, reliability bins).
-3. Fit per-species temperature scaling on `val`.
-4. Validate on `test` and compare against baseline.
-5. Export calibration params with the inference bundle and apply them in runtime.
-
-This is the primary path to reduce overconfidence and improve map quality.
+## Head hyperparameter tuning
 
 ### Sweep Stage C head hyperparameters (training-level)
 
@@ -325,23 +312,3 @@ Current best (canary_cactus, latest recorded `pass_f`):
 - `head_lr=0.0088`
 - `head_weight_decay=0.00055`
 - `head_epochs=140`
-
-### Fit temperature scaling (model-level)
-
-Fit one scalar temperature for a species on `val` and evaluate before/after
-metrics on both `val` and `test`:
-
-```bash
-uv run python scripts/machine_learning/fit_temperature_calibration.py \
-    --bundle ./checkpoints/inference_bundle.pt \
-    --data-root ./data/species_observation_canary \
-    --species-key 11498251 \
-    --val-split val \
-    --eval-split test \
-    --bins 20 \
-    --output ./checkpoints/calibration/species_11498251_temperature_fit.json \
-    --temperature-json ./checkpoints/calibration/species_temperature_map.json
-```
-
-The generated `species_temperature_map.json` is intended to be bundled and
-applied in inference runtime once calibration export/load wiring is enabled.
