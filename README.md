@@ -32,6 +32,14 @@ It also runs `b2-mount` automatically before opening the shell, so you usually d
 
 If you keep multiple local clones of the back-end repo, set per-copy Docker values in a local `.env` file next to `docker-compose.yml`. Docker Compose loads this automatically for both `./gt.sh` and direct `docker compose` commands, which avoids collisions in image tags, host ports, host data paths, and Compose project names. Start from `.env.example` and adjust the values for each clone.
 
+Note: inference inside the GDAL container depends on Python packages installed from
+`requirements.txt` (including `torch`). After dependency updates, rebuild the image:
+
+```sh
+docker compose build gdal
+docker compose up -d gdal
+```
+
 The downside to this is that using Docker can require lots of typing to use simple commands. A great way around this is to use bash aliases. Inside `gt`, these helpers are already available via the container image, so there is nothing to copy into your `~/.bashrc`.
 
 `gt` stands for "GDAL Terminal" and simply opens a terminal within the GDAL docker. `pd` stands for "Python Docker" and can simply be run as `pd build_locations` for example; it automatically looks for Python files within the `/scripts` directory and runs them through Docker. `pdb` runs the same way in the background and writes logs to `logs/scripts/<script_name>`. `pdbs` stops a background `pdb` script by name. `pdbc` chains multiple scripts in the background, running each after the previous completes, and writes per-script logs to the same folder.
@@ -291,14 +299,15 @@ refresh of `.md` files.
 
 Finally, it's a great idea to install the [parquet viewer](https://marketplace.visualstudio.com/items?itemName=dvirtz.parquet-viewer) extension on VSCode which allows the viewing of parquet files as simple csvs which really helps quick manual inspection. It will likely require you install pyarrow or fastparquet OUTSIDE of Docker or something similar so it can convert the parquets to CSVs. [Rainbow CSV](https://marketplace.visualstudio.com/items?itemName=mechatroner.rainbow-csv) is also a great addition with this that makes it easy to tell which values are part of which columns.
 
-## ML Data Scripts
+## ML Pipeline
 
-For ML preprocessing and schema workflow, see [docs/ml_scripts.md](docs/ml_scripts.md).
+For the full end-to-end guide (preprocessing, training, export, and inference),
+see [docs/ml_scripts.md](docs/ml_scripts.md).
 
 Quick commands:
 
 ```sh
-# Build training dataset shards (smoke run)
+# 1. Build training dataset shards (smoke run)
 uv run python scripts/machine_learning/preprocess_training/cli.py \
   --input-root ./data \
   --output-root ./data/training_observation_smoke \
@@ -306,12 +315,51 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
   --threads 8 \
   --overwrite-output
 
-# Validate output schema contract
+# 2. Validate output schema contract
 uv run python scripts/machine_learning/validate_training_schema.py \
   --schema schemas/training_observation.schema.json \
   --data ./data/training_observation_smoke \
   --partitioning hive \
   --allow-extra-columns
+
+# 3. Train encoder + species heads
+uv run python scripts/machine_learning/train/cli.py all \
+  --data-root ./data/training_observation_smoke \
+  --output-dir ./checkpoints \
+  --epochs 50 \
+  --batch-size 4096
+
+# 4. Export inference bundle
+uv run python scripts/machine_learning/train/export.py \
+  --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
+  --heads-checkpoint ./checkpoints/heads/species_heads.pt \
+  --data-root ./data/training_observation_smoke \
+  --output ./checkpoints/inference_bundle.pt
+
+# 5. Serve the prediction API
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
+  uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Optional runtime device controls
+# Inference compute: auto|cpu|cuda (default: auto)
+# Cell table placement: auto|cpu|cuda (default: auto -> cpu)
+# Raster sampling workers: integer >=1 (default: 1)
+#   Keep this at 1 unless benchmarked on your machine; higher values can be slower.
+# Stream sampling chunk size: integer >=1 (default: 8192)
+#   Controls how many coords are sampled per stream chunk (independent of score batch size).
+# Stream prefetch queue depth: integer >=1 (default: 2)
+#   Controls how many prepared stream chunks can queue ahead (more overlap, more memory).
+# Heatmap profiling: 0|1 (default: 0)
+#   When enabled, /api/predict/heatmap includes a profile block with stage timings.
+# Note: cell-table cuda requires WHEREWILD_INFERENCE_DEVICE=cuda
+WHEREWILD_INFERENCE_DEVICE=cuda \
+WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
+WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
+WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
+WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS=2 \
+WHEREWILD_INFERENCE_PROFILE=0 \
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
+  uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 # Regenerate schema docs from JSON contract
 uv run python scripts/machine_learning/generate_training_schema_docs.py

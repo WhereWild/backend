@@ -6,6 +6,15 @@ import torch
 import torch.nn.functional as F
 
 
+def _weighted_mean(loss: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    """Compute mean(loss) or sum(weights * loss) / sum(weights)."""
+    if weights is None:
+        return loss.mean()
+    weighted = loss * weights
+    denom = torch.clamp(weights.sum(), min=1e-12)
+    return weighted.sum() / denom
+
+
 def nnpu_loss(
     f_positive: torch.Tensor,
     f_unlabeled: torch.Tensor,
@@ -38,14 +47,11 @@ def nnpu_loss(
     pos_neg_loss = F.softplus(f_positive)  # l(-f(x)) on positives
     unl_neg_loss = F.softplus(f_unlabeled)  # l(-f(x)) on unlabeled
 
-    if weights_positive is not None:
-        pos_pos_loss = pos_pos_loss * weights_positive
-        pos_neg_loss = pos_neg_loss * weights_positive
-    if weights_unlabeled is not None:
-        unl_neg_loss = unl_neg_loss * weights_unlabeled
-
-    positive_risk = prior_pi * pos_pos_loss.mean()
-    negative_risk = unl_neg_loss.mean() - prior_pi * pos_neg_loss.mean()
+    positive_risk = prior_pi * _weighted_mean(pos_pos_loss, weights_positive)
+    negative_risk = _weighted_mean(unl_neg_loss, weights_unlabeled) - prior_pi * _weighted_mean(
+        pos_neg_loss,
+        weights_positive,
+    )
 
     # Non-negative correction: clamp to prevent pathological gradient
     return positive_risk + torch.clamp(negative_risk, min=0.0)
@@ -70,42 +76,3 @@ def reconstruction_loss(
         return torch.tensor(0.0, device=prediction.device, requires_grad=True)
     diff_sq = (prediction - target) ** 2
     return (diff_sq * observed).sum() / observed.sum()
-
-
-def contrastive_loss(
-    embeddings: torch.Tensor,
-    cell_ids_encoded: torch.Tensor,
-    temperature: float = 0.1,
-) -> torch.Tensor:
-    """Simple spatial contrastive loss for encoder pretraining.
-
-    Pairs with matching cell_id are positive; others are negative.
-    Uses NT-Xent style loss on cosine similarity.
-
-    Args:
-        embeddings: (B, D) encoder output.
-        cell_ids_encoded: (B,) integer-encoded cell ids.
-        temperature: softmax temperature.
-    """
-    embeddings = F.normalize(embeddings, dim=1)
-    sim = embeddings @ embeddings.T / temperature  # (B, B)
-
-    # Positive mask: same cell_id pairs (excluding self)
-    pos_mask = cell_ids_encoded.unsqueeze(0) == cell_ids_encoded.unsqueeze(1)
-    eye = torch.eye(sim.shape[0], device=sim.device, dtype=torch.bool)
-    pos_mask = pos_mask & ~eye
-
-    if not pos_mask.any():
-        return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
-
-    # NT-Xent: for each anchor with at least one positive, compute cross-entropy
-    # against all non-self entries
-    log_softmax = sim - torch.logsumexp(sim.masked_fill(eye, float("-inf")), dim=1, keepdim=True)
-    pos_log_prob = (log_softmax * pos_mask.float()).sum(dim=1)
-    num_positives = pos_mask.float().sum(dim=1)
-    has_positive = num_positives > 0
-    if not has_positive.any():
-        return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
-
-    loss_per_anchor = -pos_log_prob[has_positive] / num_positives[has_positive]
-    return loss_per_anchor.mean()

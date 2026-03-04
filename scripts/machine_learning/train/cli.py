@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument("--data-root", type=Path, required=True, help="Preprocessed parquet dataset root.")
     shared.add_argument("--output-dir", type=Path, required=True, help="Output directory for checkpoints.")
     shared.add_argument("--device", type=str, default="auto", help="Device: auto, cuda, mps, cpu.")
-    shared.add_argument("--batch-size", type=int, default=4096, help="Mini-batch size.")
+    shared.add_argument("--batch-size", type=int, default=32768, help="Mini-batch size.")
 
     # Encoder-specific arguments
     encoder_args = argparse.ArgumentParser(add_help=False)
@@ -53,14 +53,55 @@ def parse_args() -> argparse.Namespace:
     encoder_args.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate.")
     encoder_args.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     encoder_args.add_argument("--recon-weight", type=float, default=1.0, help="Reconstruction loss weight.")
-    encoder_args.add_argument("--contrastive-weight", type=float, default=0.5, help="Contrastive loss weight.")
-    encoder_args.add_argument("--contrastive-temperature", type=float, default=0.1, help="NT-Xent temperature.")
     encoder_args.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
+    encoder_args.add_argument(
+        "--encoder-data-mode",
+        type=str,
+        default="chunk-cached",
+        choices=["streaming", "chunk-cached", "in-memory"],
+        help=(
+            "Encoder Stage B data loading mode. "
+            "'streaming' lazily scans parquet from disk (lowest RAM), "
+            "'chunk-cached' materializes bounded row chunks (default middle ground), "
+            "'in-memory' materializes full split tensors first (highest RAM, often fastest)."
+        ),
+    )
+    encoder_args.add_argument(
+        "--encoder-chunk-rows",
+        type=int,
+        default=400_000,
+        help="Rows per chunk when --encoder-data-mode=chunk-cached.",
+    )
+    encoder_args.add_argument(
+        "--encoder-prefetch-chunks",
+        type=int,
+        default=3,
+        help="Number of chunk-cached chunks to prefetch in the background.",
+    )
+    encoder_args.add_argument(
+        "--encoder-adaptive-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt prefetch queue depth based on host memory/swap pressure (default: enabled).",
+    )
+    encoder_args.add_argument(
+        "--encoder-shuffle-mode",
+        type=str,
+        default="block",
+        choices=["global", "block"],
+        help="Shuffle mode for streaming/chunk-cached encoder batches.",
+    )
+    encoder_args.add_argument(
+        "--encoder-shuffle-block-rows",
+        type=int,
+        default=131_072,
+        help="Block size when --encoder-shuffle-mode=block.",
+    )
 
     # Heads-specific arguments
     heads_args = argparse.ArgumentParser(add_help=False)
-    heads_args.add_argument("--min-positives", type=int, default=5, help="Skip species with fewer positives.")
-    heads_args.add_argument("--head-epochs", type=int, default=100, help="Epochs per species head.")
+    heads_args.add_argument("--min-positives", type=int, default=50, help="Skip species with fewer positives.")
+    heads_args.add_argument("--head-epochs", type=int, default=50, help="Epochs per species head.")
     heads_args.add_argument("--head-lr", type=float, default=1e-2, help="Species head learning rate.")
     heads_args.add_argument("--head-weight-decay", type=float, default=1e-3, help="Species head weight decay.")
 
@@ -97,10 +138,14 @@ def main() -> int:
             lr=args.lr,
             weight_decay=args.weight_decay,
             recon_weight=args.recon_weight,
-            contrastive_weight=args.contrastive_weight,
-            contrastive_temperature=args.contrastive_temperature,
             use_amp=not args.no_amp,
             device=args.device,
+            data_mode=args.encoder_data_mode,
+            chunk_rows=args.encoder_chunk_rows,
+            prefetch_chunks=args.encoder_prefetch_chunks,
+            shuffle_mode=args.encoder_shuffle_mode,
+            shuffle_block_rows=args.encoder_shuffle_block_rows,
+            adaptive_prefetch=args.encoder_adaptive_prefetch,
         )
     else:
         encoder_path = None

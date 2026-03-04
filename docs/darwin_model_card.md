@@ -1,15 +1,15 @@
-# Darwin Species Distribution Model (Modular, Mobile-First)
+# Darwin Species Distribution Model (Modular, Server-Side)
 
-## 1) Goal
+## 1. Goal
 
 Predict species occurrence probability at a location while:
 
 - avoiding a separate large model per species,
-- supporting on-device inference,
+- supporting server-side inference at arbitrary coordinates,
 - scaling to ~891 GB / ~2.93M files,
 - handling presence-only data (no true negatives).
 
-## 2) Recommended Model Family
+## 2. Recommended Model Family
 
 Use a shared global encoder + small per-species heads.
 
@@ -29,9 +29,11 @@ Encoder output:
 
 Practical architecture:
 
-- tabular encoder: 3-layer MLP with residual connections, GELU, LayerNorm,
+- tabular encoder: 4 linear layers total (`project_in` + two residual block linears + `project_out`) with residual connections, GELU, LayerNorm,
 - optional raster branch: tiny CNN (MobileNet-style depthwise blocks), fused with tabular branch,
 - final projection to 128-d embedding.
+
+Counting note: this may be informally described as a 3-stage stack (input projection, residual trunk, output projection), but implementation uses 4 linear layers.
 
 ### 2.2 Species heads (`H_s`)
 
@@ -42,7 +44,7 @@ For each species `s`, train only a tiny classifier on `z`:
 
 This keeps per-species parameters tiny and allows fast retraining/new species onboarding.
 
-## 3) Handling Missing Negatives (Presence-Only)
+## 3. Handling Missing Negatives (Presence-Only)
 
 Train heads with Positive-Unlabeled (PU) learning instead of standard binary labels.
 
@@ -53,7 +55,17 @@ Train heads with Positive-Unlabeled (PU) learning instead of standard binary lab
 
 ### 3.2 Loss
 
-Use non-negative PU risk (`nnPU`) with prior `π_s = P(y=1|s)`:
+Use non-negative PU risk (`nnPU`) with prior `π_s = P(y=1|s)`.
+
+Current implementation estimates `π_s` with empirical-Bayes smoothing:
+
+`raw_s = n_pos_s / n_rows_s`
+
+`π_s = (n_pos_s + α * p_global) / (n_rows_s + α)`
+
+where `p_global` is the global positive rate in the train split and `α=50`.
+
+Then apply non-negative PU risk:
 
 $R(f) = \pi_s \mathbb{E}_{x \sim P_s}[\ell(f(x))] + \max\bigl(0,\ \mathbb{E}_{x \sim U_s}[\ell(-f(x))] - \pi_s \mathbb{E}_{x \sim P_s}[\ell(-f(x))]\bigr)$
 
@@ -63,11 +75,19 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 ### 3.3 Unlabeled sampling policy (critical)
 
-- spatially stratified by biome/ecoregion,
-- bias-corrected by observer effort proxy (if available),
-- hard-negative mining: periodically add top false positives from previous epoch.
+- pool transformed positive rows across species,
+- for target species `s`, sample unlabeled rows from other-species rows in the same split only,
+- exclude sampled rows whose `(cell_id, year_month)` pair is already positive for species `s`,
+- set `presence_label=0` for sampled rows and treat them as unlabeled (not true negatives).
 
-## 4) Training Strategy for Your Hardware (RTX 5090 32 GB)
+Constraints:
+
+- Current implementation: donor rows are constrained to the same split and filtered to avoid `(cell_id, year_month)` conflicts for the target species.
+- Current implementation: sample weights rebalance donor-species frequency skew within each target species.
+- Not yet implemented: explicit donor-pool constraints by region/biome/month.
+- Not yet implemented: explicit hotspot-cell rebalancing beyond donor-species frequency weighting.
+
+## 4. Training Strategy for Your Hardware (RTX 5090 32 GB)
 
 ### Stage A - Build training table
 
@@ -81,17 +101,25 @@ Why: this directly addresses “absence of negatives” and reduces false-negati
 
 This stage can be run without species labels (self-supervised/unsupervised pretraining on all rows).
 
-Multi-task objective (recommended):
+Current objective:
 
-- self-supervised contrastive term on nearby vs far cells,
-- auxiliary reconstruction/regression of environmental variables,
-- optional taxonomy-aware metric loss for species co-occurrence neighborhoods.
+- auxiliary reconstruction/regression of environmental variables.
+
+Deferred objective terms (not active in current scripts):
+
+- spatial contrastive term,
+- taxonomy-aware metric loss for species co-occurrence neighborhoods.
 
 Default settings:
 
 - embedding dim: 128,
 - mixed precision (bf16/fp16),
-- effective batch size: 4k to 16k (gradient accumulation),
+- batch size: 32768 (current training CLI default; tune per memory budget),
+- encoder data mode: chunk-cached (default bounded-RAM middle ground), streaming (lowest RAM), or in-memory (fastest when RAM allows),
+- chunk rows: 400000 (default),
+- prefetch chunks: 3 (default max depth),
+- adaptive prefetch: enabled by default (backs off queue depth under memory/swap pressure),
+- encoder shuffle mode: block (default) or global,
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads
@@ -99,68 +127,73 @@ Default settings:
 After Stage B, use the pretrained encoder embedding as the fixed representation for species-level training.
 
 - freeze encoder,
-- train PU logistic head per species (parallelized CPU/GPU mini-jobs),
-- unfreeze top encoder block for rare species only if needed.
+- train PU logistic head per species.
+- Current implementation status: heads are trained sequentially in one process (not yet parallelized into CPU/GPU mini-jobs).
+- Not yet implemented: optional unfreeze of top encoder block for rare species.
 
 Expected outcome: most compute spent once in shared encoder; species updates are cheap.
 
-## 5) Mobile Inference Design
+## 5. Server-Side Inference Design
 
 ### 5.1 Export format
 
-- Preferred React Native path: export encoder from PyTorch to ExecuTorch-compatible artifact (via `torch.export`/ExecuTorch tooling),
-- fallback path: export encoder to ONNX and quantize to int8,
-- export species heads as small matrices + biases (can stay outside the encoder graph when convenient).
+- The trained encoder + per-species heads + geocell feature table are packaged into a single `.pt` inference bundle via `scripts/machine_learning/train/export.py`.
+- The bundle also stores feature names (env, habitat, weather) so the server can sample GIS rasters on the fly.
 
-### 5.2 Runtime options
+### 5.2 Runtime
 
-- React Native: ExecuTorch in app runtime (plausible for this model family, especially tabular MLP encoder + small heads),
-- Android fallback: ONNX Runtime Mobile / TFLite,
-- iOS fallback: CoreML conversion from ONNX.
+- The inference engine (`util/inference.py`) loads the bundle at startup and runs on CPU.
+- No CUDA, AMP, or heavy ML dependencies are needed on the server.
+- FastAPI prediction endpoints currently exposed:
+    - `/api/predict` (single-point scoring)
+    - `/api/predict/batch` (batch scoring)
+    - `/api/predict/heatmap` (materialized heatmap)
+    - `/api/predict/heatmap/stream` (streaming heatmap)
+    - `/api/predict/heatmap-jobs` (create async heatmap job)
+    - `/api/predict/heatmap-jobs/{job_id}/stream` (stream async heatmap job progress/results)
+    - `/api/predict/heatmap-jobs/{job_id}` (delete/cancel heatmap job)
+    - `/api/predict/info` (model/bundle metadata)
 
-### 5.3 React Native + ExecuTorch viability notes
+### 5.3 On-the-fly GIS sampling
 
-- This is realistic for the MVP because the proposed encoder is small and operator-simple.
-- Validate operator coverage and quantization support early on target devices.
-- Keep a runtime fallback (ONNX/CoreML path) for unsupported ops or regressions.
+For coordinates without pre-computed features (not in the training cell table):
+
+- Static features (bioclim, elevation, slope, aspect, landcover, Koppen-Geiger) are sampled from local COG rasters via rasterio.
+- DEM-derived features (slope, aspect, aspect_deg) are computed from a 3x3 window around the query point.
+- Weather features are marked all-missing (the model handles masked inputs).
+- Batch sampling opens each raster once per 10-degree region tile for efficiency.
+
+This enables predictions at any land coordinate on Earth.
 
 ### 5.4 Latency strategy
 
-Best mobile path:
+- Pre-computed cell table gives instant lookup for training-covered areas.
+- On-the-fly GIS sampling adds sub-millisecond overhead per query for uncovered areas (rasterio COG reads are fast with local files).
+- Heatmap endpoint scores all cells in a single vectorized forward pass.
+- Variable resolution aggregation allows zoom-dependent level of detail.
 
-- precompute environmental features per geocell offline,
-- on phone: lookup features for user location, run encoder once, score selected species heads.
-
-If memory constrained:
-
-- cache last `z` embeddings by geocell,
-- evaluate only top-K candidate species from region prior before full scoring.
-
-## 6) Data Splits and Validation (avoid leakage)
+## 6. Data Splits and Validation (avoid leakage)
 
 - split by space and time, not random rows,
-- e.g. blocked CV by geohash/S2 + holdout recent months,
-- evaluate with PR-AUC, Recall@fixed precision, calibrated Brier score,
-- report by prevalence bins (common vs rare species).
+- Current implementation: deterministic space-time split by hashed `(cell_id, year_month)` into train/val/test partitions.
+- Not yet implemented: blocked CV by geohash/S2 and explicit recent-month holdout protocol.
+- Not yet implemented in training scripts: PR-AUC, Recall@fixed precision, calibrated Brier score reporting.
+- Not yet implemented in training scripts: prevalence-bin reporting (common vs rare species).
 
-## 7) Calibration and Thresholding
-
-- fit per-species temperature scaling or isotonic calibration on holdout,
-- keep two thresholds per species:
-    - high-precision threshold (user-facing confident mode),
-    - high-recall threshold (exploration mode).
-
-## 8) Recommended MVP (first production cut)
+## 7. Recommended MVP (first production cut)
 
 1. Build 128-d tabular encoder only (no raster branch yet).
 2. Train encoder on all taxa with self-supervised + aux env prediction.
 3. Train PU logistic heads for top N species with enough positives.
-4. Export ONNX int8 encoder + head matrix.
-5. Run on-device scoring for user region species shortlist.
+4. Export `.pt` inference bundle containing encoder + heads + geocell feature table + feature names.
+5. Serve predictions via FastAPI with on-the-fly GIS raster sampling for arbitrary coordinates.
 
-This matches all requirements: modular per-species updates, mobile inference, single-GPU feasibility, and proper treatment of missing negatives.
+Current implementation covers modular per-species updates, server-side inference,
+single-GPU feasibility, and nnPU treatment of missing negatives.
 
-## 9) Data Preprocessing Pipeline (ETL)
+Remaining gaps to close full policy alignment are documented in Sections 3.3 and 6.
+
+## 8. Data Preprocessing Pipeline (ETL)
 
 1. Ingest raw observations and standardize core fields (taxonomy, UTC timestamp, WGS84 coords).
 2. Snap each record to `cell_id` and derive `region_id`.
@@ -168,22 +201,11 @@ This matches all requirements: modular per-species updates, mobile inference, si
 4. Join temporal context (recent weather aggregates aligned to observation time).
 5. Build PU rows:
     - positives from observations,
-    - unlabeled/background samples stratified by region and time.
+    - unlabeled/background rows sampled from other-species positives in the same split, filtered to avoid `(cell_id, year_month)` conflicts for the target species.
 6. Build vectors:
     - `env_features`, `habitat_features`, `weather_features` with fixed order by `feature_version`.
 7. Keep leakage-prone fields (`lat`, `lon`, `event_time_utc`, `source`) as metadata only; exclude from model input tensors.
 8. Write partitioned Parquet by `split/year_month/region_id`.
-
-Reference implementation script:
-
-```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root /data \
-    --output-root /data/training_observation \
-    --threads 16 \
-    --background-ratio 1.0 \
-    --overwrite-output
-```
 
 Notes:
 
@@ -192,7 +214,7 @@ Notes:
 - Static and temporal context can be joined during this preprocessing step via configured context inputs, or pre-joined upstream into occurrence files; whichever path is used should be kept consistent per `feature_version`.
 - Known issue: current background sampling is not yet spatially stratified over an explicit accessible-area `M` definition; treat this as a temporary approximation until stratified/background-area sampling is implemented.
 
-## 10) Partition Strategy: Time vs Species
+## 9. Partition Strategy: Time vs Species
 
 - Base dataset should stay partitioned by `split/year_month/region_id`.
 - Why this base partitioning:
@@ -208,7 +230,7 @@ Notes:
     - keep base table time/region partitioned,
     - optionally materialize species-bucket shards (e.g., hash buckets) for per-species training throughput.
 
-## 11) Future Upgrades
+## 10. Future Upgrades
 
 - Hierarchical heads (kingdom→phylum→...→species) for better rare-species transfer.
 - Distill encoder to an even smaller student for low-end phones.

@@ -3,28 +3,26 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class ResidualBlock(nn.Module):
-    """Single residual MLP block: Linear → LayerNorm → GELU with skip connection."""
+    """Single residual MLP block: Linear → GELU → add residual → LayerNorm (post-norm)."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-        )
+        self.linear = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x) + x
+        return self.norm(nn.functional.gelu(self.linear(x)) + x)
 
 
 class SharedEncoder(nn.Module):
     """Shared global encoder (model card Section 2.1).
 
-    3-layer MLP with residual connections, GELU, LayerNorm.
+    4-linear-layer MLP stack with residual connections:
+    project_in + two residual block linears + project_out.
     Projects concatenated feature vector to a fixed-size embedding.
     """
 
@@ -48,13 +46,11 @@ class SharedEncoder(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
-        # Skip connection from input to embedding when dims differ
-        self.shortcut = nn.Linear(input_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.project_in(x)
         h = self.residual_blocks(h)
-        return self.project_out(h) + self.shortcut(x)
+        return self.project_out(h)
 
 
 class SpeciesHead(nn.Module):

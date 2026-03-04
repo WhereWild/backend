@@ -3,6 +3,9 @@
 *.zip
 *.parquet
 
+# Models
+checkpoints/
+
 # Python cache / virtualenvs
 __pycache__/
 *.pyc
@@ -32,3 +35,6 @@ node_modules/
 # Local secrets
 .env
 .env.local
+
+# Other
+tmp/

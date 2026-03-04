@@ -6,22 +6,28 @@ import io
 import logging
 import math
 import re
+import os
+import json
 import shutil
 import time
+import threading
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass as _dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, Callable, List, Literal, Optional
+from uuid import uuid4
 
 import numpy as _np_global
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from starlette.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image
+from pydantic import BaseModel
 import pandas as pd
 from pydantic import BaseModel, Field
 
@@ -40,6 +46,7 @@ from util import (
     weather_tiles,
 )
 from util.tile_request import log_tile_cancellation, render_species_deep_zoom_tile, run_tile_render_with_cancellation
+from util import inference
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -53,7 +60,8 @@ category_sample_limit = 500
 
 cors_allow_headers = ("*",)
 
-cors_allow_methods = ("GET", "POST")
+cors_allow_methods = ("GET", "POST", "DELETE", "OPTIONS")
+cors_allow_methods = ("GET", "POST", "DELETE", "OPTIONS")
 
 cors_allow_origins = ("*",)
 
@@ -76,6 +84,7 @@ derived_tile_variables = frozenset({"slope", "aspect", "aspect_deg"})
 no_summary_stats_variables = frozenset({"aspect_deg"})
 _SPECIES_DEEP_ZOOM_RENDER_SEMAPHORE = asyncio.Semaphore(species_deep_zoom_render_limit)
 
+INFERENCE_BUNDLE_PATH = Path(os.environ.get("WHEREWILD_INFERENCE_BUNDLE", "checkpoints/inference_bundle.pt"))
 
 def _warm_taxa_name_index() -> None:
     try:
@@ -132,11 +141,28 @@ async def lifespan(app: FastAPI):
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
-    import threading
-
     threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
     threading.Thread(target=_get_homepage_cache, daemon=True, name="homepage-cache").start()
     threading.Thread(target=_warm_taxa_name_index, daemon=True, name="taxa-name-index").start()
+
+    bundle_path = INFERENCE_BUNDLE_PATH
+    if not bundle_path.is_absolute():
+        bundle_path = CONFIG.project_root / bundle_path
+    if bundle_path.exists():
+        try:
+            inference.load_bundle(bundle_path)
+            print(
+                f"Inference bundle loaded: {bundle_path} "
+                f"({len(inference.known_species()):,} species, "
+                f"{inference.cell_count():,} cells)"
+            )
+        except Exception:
+            import traceback as _tb
+
+            print(f"Warning: failed to load inference bundle {bundle_path}")
+            _tb.print_exc()
+    else:
+        print(f"Inference bundle not found at {bundle_path} — /api/predict disabled")
     yield
 
 
@@ -232,6 +258,7 @@ class TaxaRankingOptionsResponse(BaseModel):
 
 
 def _path_exists(path: Path) -> bool:
+    """Check path existence for local filesystem or configured remote storage."""
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:
         return storage.exists(path)
@@ -1484,6 +1511,7 @@ def species_locations(
     ancestor_gid_cache: dict[str, set[str]] = {}
 
     def ancestor_gids_for(record: gis_lookup.LocationRecord) -> set[str]:
+        """Collect ancestor GIDs for parent-filter matching with cache reuse."""
         cached = ancestor_gid_cache.get(record.gid)
         if cached is not None:
             return cached
@@ -1509,6 +1537,7 @@ def species_locations(
         hierarchy_names: list[str],
         hierarchy_gids: set[str],
     ) -> bool:
+        """Return True when a location satisfies all provided parent constraints."""
         if not parent_matchers:
             return True
         cand_gid = gid.lower()
@@ -1553,15 +1582,13 @@ def species_locations(
         if not matches_parent(gid_key, location_name, hierarchy, hierarchy_gids):
             continue
 
-        results.append(
-            {
-                "gid": gid_key,
-                "name": location_name,
-                "level": location_level,
-                "hierarchy": hierarchy,
-                "count": int(count),
-            }
-        )
+        results.append({
+            "gid": gid_key,
+            "name": location_name,
+            "level": location_level,
+            "hierarchy": hierarchy,
+            "count": int(count),
+        })
 
     results.sort(
         key=lambda item: (
@@ -1629,6 +1656,7 @@ def search_locations_by_hierarchy(
     seen_gids = set()
 
     def matches_parent(cand: dict[str, Any]) -> bool:
+        """Check whether a candidate location belongs to the requested parent chain."""
         # if no parent requested, everything matches
         if not resolved_parent_names:
             return True
@@ -2265,14 +2293,12 @@ def species_environment_slice(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     observations: list[dict[str, Any]] = []
     for catalog, lat, lon, value in rows:
-        observations.append(
-            {
-                "catalogNumber": catalog,
-                "value": float(value) if isinstance(value, (int, float)) else value,
-                "latitude": lat,
-                "longitude": lon,
-            }
-        )
+        observations.append({
+            "catalogNumber": catalog,
+            "value": float(value) if isinstance(value, (int, float)) else value,
+            "latitude": lat,
+            "longitude": lon,
+        })
     response = {
         "speciesId": taxon_id,
         "variable": variable_id,
@@ -2401,6 +2427,574 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
         path=archive_path,
         media_type="application/zip",
         filename=out_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SDM prediction response models
+# ---------------------------------------------------------------------------
+
+
+class SpeciesPrediction(BaseModel):
+    species_key: int
+    score: float
+    prior: float
+
+
+class PredictResponse(BaseModel):
+    lat: float
+    lon: float
+    top_k: int
+    threshold: float
+    n_results: int
+    predictions: list[SpeciesPrediction]
+
+
+class CoordinatePredictions(BaseModel):
+    lat: float
+    lon: float
+    n_results: int
+    predictions: list[SpeciesPrediction]
+
+
+class PredictBatchResponse(BaseModel):
+    n_coordinates: int
+    top_k: int
+    threshold: float
+    results: list[CoordinatePredictions]
+
+
+class HeatmapCell(BaseModel):
+    lat: float
+    lon: float
+    score: float
+    n_native: int
+    source: str | None = None
+
+
+class PredictHeatmapResponse(BaseModel):
+    species_key: int
+    bbox: list[float]
+    resolution: float
+    native_resolution: float
+    n_cells: int
+    cells: list[HeatmapCell]
+
+
+class PredictInfoResponse(BaseModel):
+    loaded: bool
+    n_species: int
+    n_cells: int
+    species_keys: list[int]
+
+
+class HeatmapJobCreateRequest(BaseModel):
+    species_key: int
+    min_lat: float
+    min_lon: float
+    max_lat: float
+    max_lon: float
+    resolution: float | None = None
+    include_source: bool = False
+    feature_mode: str = "auto"
+    max_cells: int = 20000
+
+
+class HeatmapJobResponse(BaseModel):
+    job_id: str
+    status: str
+    created_at: str
+    stream_url: str
+    cancel_url: str
+
+
+class HeatmapJobDeleteResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+_heatmap_jobs_lock = threading.Lock()
+_heatmap_jobs: dict[str, dict[str, Any]] = {}
+_HEATMAP_JOB_TTL_SECONDS = 6 * 60 * 60
+_HEATMAP_JOB_MAX_ENTRIES = 2000
+
+
+def _parse_iso8601(ts: Any) -> datetime | None:
+    """Parse an ISO8601 timestamp value into an aware datetime when possible."""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _prune_heatmap_jobs() -> None:
+    """Prune stale/finished jobs and cap in-memory job count."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=_HEATMAP_JOB_TTL_SECONDS)
+    finished_statuses = {"cancelled", "completed", "failed"}
+
+    with _heatmap_jobs_lock:
+        stale_ids: list[str] = []
+        for job_id, job in _heatmap_jobs.items():
+            status = str(job.get("status") or "")
+            finished_at = _parse_iso8601(job.get("finished_at"))
+            if status in finished_statuses and finished_at is not None and finished_at <= cutoff:
+                stale_ids.append(job_id)
+
+        for job_id in stale_ids:
+            _heatmap_jobs.pop(job_id, None)
+
+        overflow = len(_heatmap_jobs) - _HEATMAP_JOB_MAX_ENTRIES
+        if overflow <= 0:
+            return
+
+        def _eviction_key(item: tuple[str, dict[str, Any]]) -> tuple[int, datetime]:
+            _id, job = item
+            status = str(job.get("status") or "")
+            is_finished = status in finished_statuses
+            finished_at = _parse_iso8601(job.get("finished_at"))
+            created_at = _parse_iso8601(job.get("created_at"))
+            ref_time = finished_at or created_at or now
+            return (0 if is_finished else 1, ref_time)
+
+        for job_id, _job in sorted(_heatmap_jobs.items(), key=_eviction_key)[:overflow]:
+            _heatmap_jobs.pop(job_id, None)
+
+
+def _validate_heatmap_bbox(min_lat: float, min_lon: float, max_lat: float, max_lon: float) -> None:
+    """Validate heatmap bbox ordering and raise HTTP 400 on invalid bounds."""
+    if min_lat >= max_lat:
+        raise HTTPException(status_code=400, detail="min_lat must be less than max_lat.")
+    if min_lon >= max_lon:
+        raise HTTPException(status_code=400, detail="min_lon must be less than max_lon.")
+
+
+def _get_heatmap_job(job_id: str) -> dict[str, Any]:
+    """Fetch a heatmap job by id or raise HTTP 404 when absent."""
+    _prune_heatmap_jobs()
+    with _heatmap_jobs_lock:
+        job = _heatmap_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
+    return job
+
+
+def _build_heatmap_stream_response(
+    stream_result: dict[str, Any],
+    *,
+    job_id: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    on_cancel: Callable[[int], None] | None = None,
+    on_done: Callable[[int], None] | None = None,
+) -> StreamingResponse:
+    """Build a reusable NDJSON stream response for heatmap cell iterators."""
+    cells_iter = stream_result["cells"]
+    meta_payload: dict[str, Any] = {
+        "type": "meta",
+        "species_key": stream_result["species_key"],
+        "bbox": stream_result["bbox"],
+        "resolution": stream_result["resolution"],
+        "native_resolution": stream_result["native_resolution"],
+        "requested_cells": stream_result["requested_cells"],
+    }
+    if job_id is not None:
+        meta_payload["job_id"] = job_id
+
+    def _terminal_payload(event_type: str, yielded: int) -> dict[str, Any]:
+        payload: dict[str, Any] = {"type": event_type, "n_cells": yielded}
+        if job_id is not None:
+            payload["job_id"] = job_id
+        return payload
+
+    def _ndjson_events():
+        yielded = 0
+        yield json.dumps(meta_payload) + "\n"
+        for cell in cells_iter:
+            if cancel_check is not None and cancel_check():
+                if on_cancel is not None:
+                    on_cancel(yielded)
+                yield json.dumps(_terminal_payload("cancelled", yielded)) + "\n"
+                return
+            yielded += 1
+            yield json.dumps({"type": "cell", **cell}) + "\n"
+
+        was_cancelled = cancel_check is not None and cancel_check()
+        if was_cancelled:
+            if on_cancel is not None:
+                on_cancel(yielded)
+            yield json.dumps(_terminal_payload("cancelled", yielded)) + "\n"
+            return
+
+        if on_done is not None:
+            on_done(yielded)
+        yield json.dumps(_terminal_payload("done", yielded)) + "\n"
+
+    return StreamingResponse(_ndjson_events(), media_type="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# SDM prediction endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/predict", response_model=PredictResponse)
+def predict_species(
+    lat: float = Query(..., ge=-90, le=90, description="Latitude in degrees."),
+    lon: float = Query(..., ge=-180, le=180, description="Longitude in degrees."),
+    top_k: int = Query(20, ge=1, le=500, description="Maximum species to return."),
+    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum score threshold."),
+) -> PredictResponse:
+    """Predict species suitability for a geographic coordinate.
+
+    Returns ranked species scores from the Darwin SDM.  Requires an
+    inference bundle to be loaded at startup (set WHEREWILD_INFERENCE_BUNDLE
+    env var or place at checkpoints/inference_bundle.pt).
+
+    Args:
+        lat: Latitude of the query point.
+        lon: Longitude of the query point.
+        top_k: Number of top-scoring species to return.
+        threshold: Minimum sigmoid score to include.
+
+    Returns:
+        A dict with coordinate echo, cell info, and ranked predictions.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(
+            status_code=503,
+            detail="Inference model not loaded. Set WHEREWILD_INFERENCE_BUNDLE or place bundle at checkpoints/inference_bundle.pt.",
+        )
+
+    predictions = inference.predict(
+        lat,
+        lon,
+        top_k=top_k,
+        score_threshold=threshold,
+    )
+    return PredictResponse(
+        lat=lat,
+        lon=lon,
+        top_k=top_k,
+        threshold=threshold,
+        n_results=len(predictions),
+        predictions=predictions,
+    )
+
+
+@app.get("/api/predict/batch", response_model=PredictBatchResponse)
+def predict_species_batch(
+    coords: str = Query(
+        ...,
+        description=("Comma-separated lat,lon pairs. Example: 25.0,-100.0,26.5,-99.0"),
+    ),
+    top_k: int = Query(20, ge=1, le=500),
+    threshold: float = Query(0.0, ge=0.0, le=1.0),
+) -> PredictBatchResponse:
+    """Batch prediction for multiple coordinates.
+
+    Coordinates are passed as a flat comma-separated string of
+    alternating lat,lon values.
+
+    Args:
+        coords: Flat comma-separated lat,lon pairs.
+        top_k: Number of top-scoring species per coordinate.
+        threshold: Minimum sigmoid score.
+
+    Returns:
+        A list of per-coordinate prediction results.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(
+            status_code=503,
+            detail="Inference model not loaded.",
+        )
+
+    parts = [float(v.strip()) for v in coords.split(",")]
+    if len(parts) % 2 != 0:
+        raise HTTPException(status_code=400, detail="coords must have an even number of values (lat,lon pairs).")
+
+    coordinate_list = [(parts[i], parts[i + 1]) for i in range(0, len(parts), 2)]
+    if len(coordinate_list) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 coordinate pairs per batch request.")
+
+    batch_results = inference.predict_batch(
+        coordinate_list,
+        top_k=top_k,
+        score_threshold=threshold,
+    )
+    return PredictBatchResponse(
+        n_coordinates=len(coordinate_list),
+        top_k=top_k,
+        threshold=threshold,
+        results=[
+            CoordinatePredictions(
+                lat=lat,
+                lon=lon,
+                n_results=len(preds),
+                predictions=preds,
+            )
+            for (lat, lon), preds in zip(coordinate_list, batch_results)
+        ],
+    )
+
+
+@app.get("/api/predict/heatmap", response_model=PredictHeatmapResponse)
+def predict_species_heatmap(
+    species_key: int = Query(..., description="GBIF species key."),
+    min_lat: float = Query(..., ge=-90, le=90, description="Southern edge of bounding box."),
+    min_lon: float = Query(..., ge=-180, le=180, description="Western edge of bounding box."),
+    max_lat: float = Query(..., ge=-90, le=90, description="Northern edge of bounding box."),
+    max_lon: float = Query(..., ge=-180, le=180, description="Eastern edge of bounding box."),
+    resolution: float | None = Query(
+        None, gt=0, le=10, description="Grid cell size in degrees. Defaults to model native (0.25)."
+    ),
+    include_source: bool = Query(
+        False, description="Include per-cell feature source (`sampled` or `cell_table`) for debugging."
+    ),
+    feature_mode: str = Query(
+        "auto",
+        description="Feature source strategy: auto, prefer_cell_table, cell_table_only, sampled_only.",
+    ),
+    max_cells: int = Query(
+        20000,
+        ge=100,
+        le=2_000_000,
+        description="Hard cap on output heatmap cells to avoid OOM.",
+    ),
+) -> PredictHeatmapResponse:
+    """Compute a probability grid for one species over a bounding box.
+
+    Returns per-cell scores suitable for rendering a heat map.
+    All cells within the bounding box are evaluated in a single vectorized
+    forward pass.
+
+    Args:
+        species_key: GBIF species key (must exist in the loaded model).
+        min_lat: Southern edge latitude.
+        min_lon: Western edge longitude.
+        max_lat: Northern edge latitude.
+        max_lon: Eastern edge longitude.
+        resolution: Grid cell size in degrees (default: model native).
+
+    Returns:
+        A dict containing species_key, bbox, resolution, cell count, and
+        a list of ``{lat, lon, score}`` entries for every cell that has
+        environmental data.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    _validate_heatmap_bbox(min_lat, min_lon, max_lat, max_lon)
+    try:
+        result = inference.predict_heatmap(
+            species_key,
+            (min_lat, min_lon, max_lat, max_lon),
+            resolution=resolution,
+            include_source=include_source,
+            feature_mode=feature_mode,
+            max_cells=max_cells,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PredictHeatmapResponse(**result)
+
+
+@app.get("/api/predict/heatmap/stream")
+def predict_species_heatmap_stream(
+    species_key: int = Query(..., description="GBIF species key."),
+    min_lat: float = Query(..., ge=-90, le=90, description="Southern edge of bounding box."),
+    min_lon: float = Query(..., ge=-180, le=180, description="Western edge of bounding box."),
+    max_lat: float = Query(..., ge=-90, le=90, description="Northern edge of bounding box."),
+    max_lon: float = Query(..., ge=-180, le=180, description="Eastern edge of bounding box."),
+    resolution: float | None = Query(
+        None, gt=0, le=10, description="Grid cell size in degrees. Defaults to model native (0.25)."
+    ),
+    include_source: bool = Query(
+        False, description="Include per-cell feature source (`sampled` or `cell_table`) for debugging."
+    ),
+    feature_mode: str = Query(
+        "auto",
+        description="Feature source strategy: auto, prefer_cell_table, cell_table_only, sampled_only.",
+    ),
+    max_cells: int = Query(
+        20000,
+        ge=100,
+        le=2_000_000,
+        description="Hard cap on output heatmap cells to avoid OOM.",
+    ),
+) -> StreamingResponse:
+    """Stream heatmap cells as NDJSON.
+
+    Emits one line of JSON per event:
+    - ``{"type": "meta", ...}``
+    - many ``{"type": "cell", ...}``
+    - final ``{"type": "done", "n_cells": N}``
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    _validate_heatmap_bbox(min_lat, min_lon, max_lat, max_lon)
+
+    try:
+        stream_result = inference.predict_heatmap_stream(
+            species_key,
+            (min_lat, min_lon, max_lat, max_lon),
+            resolution=resolution,
+            include_source=include_source,
+            feature_mode=feature_mode,
+            max_cells=max_cells,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return _build_heatmap_stream_response(stream_result)
+
+
+@app.post("/api/predict/heatmap-jobs", response_model=HeatmapJobResponse)
+def create_predict_heatmap_job(payload: HeatmapJobCreateRequest) -> HeatmapJobResponse:
+    """Create a cancellable heatmap job resource."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    _prune_heatmap_jobs()
+    _validate_heatmap_bbox(payload.min_lat, payload.min_lon, payload.max_lat, payload.max_lon)
+
+    job_id = uuid4().hex
+    created_at = datetime.now(timezone.utc).isoformat()
+    job = {
+        "job_id": job_id,
+        "status": "created",
+        "created_at": created_at,
+        "params": payload.model_dump(),
+        "cancel_event": threading.Event(),
+        "started_at": None,
+        "finished_at": None,
+    }
+    with _heatmap_jobs_lock:
+        _heatmap_jobs[job_id] = job
+
+    return HeatmapJobResponse(
+        job_id=job_id,
+        status="created",
+        created_at=created_at,
+        stream_url=f"/api/predict/heatmap-jobs/{job_id}/stream",
+        cancel_url=f"/api/predict/heatmap-jobs/{job_id}",
+    )
+
+
+@app.get("/api/predict/heatmap-jobs/{job_id}/stream")
+def stream_predict_heatmap_job(job_id: str) -> StreamingResponse:
+    """Stream job results as NDJSON and support cancellation via DELETE."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+
+    _prune_heatmap_jobs()
+    _get_heatmap_job(job_id)
+
+    with _heatmap_jobs_lock:
+        job = _heatmap_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
+        if job["status"] == "cancelled":
+            raise HTTPException(status_code=409, detail=f"Heatmap job {job_id} is cancelled.")
+        if job["status"] == "running":
+            raise HTTPException(status_code=409, detail=f"Heatmap job {job_id} is already streaming.")
+        job["status"] = "running"
+        job["started_at"] = datetime.now(timezone.utc).isoformat()
+
+    params = job["params"]
+    cancel_event: threading.Event = job["cancel_event"]
+
+    try:
+        stream_result = inference.predict_heatmap_stream(
+            params["species_key"],
+            (params["min_lat"], params["min_lon"], params["max_lat"], params["max_lon"]),
+            resolution=params.get("resolution"),
+            include_source=params.get("include_source", False),
+            feature_mode=params.get("feature_mode", "prefer_cell_table"),
+            max_cells=params.get("max_cells", 20000),
+            cancel_check=cancel_event.is_set,
+        )
+    except KeyError as exc:
+        with _heatmap_jobs_lock:
+            job["status"] = "failed"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        with _heatmap_jobs_lock:
+            job["status"] = "failed"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _on_cancel(_yielded: int) -> None:
+        with _heatmap_jobs_lock:
+            tracked = _heatmap_jobs.get(job_id)
+            if tracked is None:
+                return
+            tracked["status"] = "cancelled"
+            tracked["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    def _on_done(_yielded: int) -> None:
+        with _heatmap_jobs_lock:
+            tracked = _heatmap_jobs.get(job_id)
+            if tracked is None:
+                return
+            tracked["status"] = "cancelled" if cancel_event.is_set() else "completed"
+            tracked["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    return _build_heatmap_stream_response(
+        stream_result,
+        job_id=job_id,
+        cancel_check=cancel_event.is_set,
+        on_cancel=_on_cancel,
+        on_done=_on_done,
+    )
+
+
+@app.delete("/api/predict/heatmap-jobs/{job_id}", response_model=HeatmapJobDeleteResponse)
+def cancel_predict_heatmap_job(job_id: str) -> HeatmapJobDeleteResponse:
+    """Cancel a stale heatmap job."""
+    _prune_heatmap_jobs()
+    _get_heatmap_job(job_id)
+    with _heatmap_jobs_lock:
+        job = _heatmap_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
+        cancel_event: threading.Event = job["cancel_event"]
+        if not cancel_event.is_set():
+            cancel_event.set()
+        if job["status"] == "created":
+            job["status"] = "cancelled"
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        elif job["status"] == "running":
+            job["status"] = "cancelling"
+
+        current_status = job["status"]
+
+    return HeatmapJobDeleteResponse(job_id=job_id, status=current_status)
+
+
+@app.get("/api/predict/info", response_model=PredictInfoResponse)
+def predict_model_info() -> PredictInfoResponse:
+    """Return metadata about the loaded inference model.
+
+    Returns:
+        Species count, cell count, and per-species metadata.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+
+    return PredictInfoResponse(
+        loaded=True,
+        n_species=len(inference.known_species()),
+        n_cells=inference.cell_count(),
+        species_keys=inference.known_species(),
     )
 
 

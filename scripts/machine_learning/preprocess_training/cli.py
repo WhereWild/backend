@@ -6,7 +6,10 @@ import argparse
 import os
 from pathlib import Path
 
-from pipeline import run_preprocess
+try:
+    from .pipeline import run_preprocess
+except ImportError:
+    from pipeline import run_preprocess  # type: ignore[no-redef]
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,13 +66,6 @@ def parse_args() -> argparse.Namespace:
         help="Max rows per output parquet file in final partitioned dataset.",
     )
     parser.add_argument(
-        "--partition-mode",
-        type=str,
-        default="split/year_month/region_id",
-        choices=["split", "split/year_month", "split/year_month/region_id"],
-        help=("Partition columns for final dataset write. Coarser modes reduce file counts."),
-    )
-    parser.add_argument(
         "--drop-missing-time",
         action="store_true",
         help="Drop rows with missing/unparseable event time instead of keeping fallback 1970-01 timestamps.",
@@ -78,7 +74,19 @@ def parse_args() -> argparse.Namespace:
         "--background-ratio",
         type=float,
         default=1.0,
-        help="Unlabeled/background rows to generate per positive row (default 1.0 = 1:1).",
+        help=(
+            "Unlabeled/background rows to generate per positive row (default 1.0 = 1:1), "
+            "sampled from other-species rows within the same split."
+        ),
+    )
+    parser.add_argument(
+        "--background-split-chunk-rows",
+        type=int,
+        default=2_000_000,
+        help=(
+            "Row cap per split chunk during pooled background generation. "
+            "Lower values reduce peak memory usage on very large datasets."
+        ),
     )
     parser.add_argument(
         "--overwrite-output",
@@ -101,12 +109,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Warn when a species has fewer than this many unique cells in a transformed shard (0 = disabled).",
-    )
-    parser.add_argument(
-        "--final-write-batch-files",
-        type=int,
-        default=500,
-        help="Number of staged parquet shards to include in each final output write batch.",
     )
     parser.add_argument(
         "--static-context-template",

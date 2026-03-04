@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from importlib import import_module
-from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
 def import_local_module(module_name: str) -> ModuleType:

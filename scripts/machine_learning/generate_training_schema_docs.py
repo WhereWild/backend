@@ -41,6 +41,13 @@ def _render_markdown(schema: dict) -> str:
         lines.append("")
         lines.append(f"- {partitioning_note}")
 
+    sampling_note = str(notes.get("sampling_semantics", "")).strip()
+    if sampling_note:
+        lines.append("")
+        lines.append("## Sampling Semantics")
+        lines.append("")
+        lines.append(f"- {sampling_note}")
+
     lines.append("")
     lines.append("## Feature Roles")
     lines.append("")
@@ -59,9 +66,7 @@ def _render_markdown(schema: dict) -> str:
         required = "yes" if bool(column.get("required", False)) else "no"
         feature_role = str(column.get("feature_role", "metadata"))
         description = str(column.get("description", "")).replace("\n", " ").strip()
-        lines.append(
-            f"| `{name}` | `{parquet_type}` | {required} | `{feature_role}` | {description} |"
-        )
+        lines.append(f"| `{name}` | `{parquet_type}` | {required} | `{feature_role}` | {description} |")
 
     lines.append("")
     lines.append("## Validation")
