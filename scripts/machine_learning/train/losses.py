@@ -6,6 +6,15 @@ import torch
 import torch.nn.functional as F
 
 
+def _weighted_mean(loss: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+    """Compute mean(loss) or sum(weights * loss) / sum(weights)."""
+    if weights is None:
+        return loss.mean()
+    weighted = loss * weights
+    denom = torch.clamp(weights.sum(), min=1e-12)
+    return weighted.sum() / denom
+
+
 def nnpu_loss(
     f_positive: torch.Tensor,
     f_unlabeled: torch.Tensor,
@@ -38,14 +47,11 @@ def nnpu_loss(
     pos_neg_loss = F.softplus(f_positive)  # l(-f(x)) on positives
     unl_neg_loss = F.softplus(f_unlabeled)  # l(-f(x)) on unlabeled
 
-    if weights_positive is not None:
-        pos_pos_loss = pos_pos_loss * weights_positive
-        pos_neg_loss = pos_neg_loss * weights_positive
-    if weights_unlabeled is not None:
-        unl_neg_loss = unl_neg_loss * weights_unlabeled
-
-    positive_risk = prior_pi * pos_pos_loss.mean()
-    negative_risk = unl_neg_loss.mean() - prior_pi * pos_neg_loss.mean()
+    positive_risk = prior_pi * _weighted_mean(pos_pos_loss, weights_positive)
+    negative_risk = _weighted_mean(unl_neg_loss, weights_unlabeled) - prior_pi * _weighted_mean(
+        pos_neg_loss,
+        weights_positive,
+    )
 
     # Non-negative correction: clamp to prevent pathological gradient
     return positive_risk + torch.clamp(negative_risk, min=0.0)

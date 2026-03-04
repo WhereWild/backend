@@ -266,13 +266,13 @@ def merge_context_columns(
         suffixes=("", "__context"),
     )
 
-    matched_sources: list[str] = []
+    matched_any = pd.Series(False, index=merged.index)
     for feature in feature_columns:
         context_column = f"{feature}__context" if feature in base.columns else feature
         if context_column not in merged.columns:
             continue
         context_values = pd.to_numeric(merged[context_column], errors="coerce")
-        matched_sources.append(context_column)
+        matched_any = matched_any | context_values.notna()
 
         if feature in base.columns:
             base_values = pd.to_numeric(merged[feature], errors="coerce")
@@ -281,7 +281,7 @@ def merge_context_columns(
         else:
             merged[feature] = context_values
 
-    merged_rows = int(merged[matched_sources].notna().any(axis=1).sum()) if matched_sources else 0
+    merged_rows = int(matched_any.sum())
     return merged, merged_rows
 
 

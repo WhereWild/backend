@@ -163,7 +163,7 @@ def train_species_heads(
         pos_mask = sp_labels == 1
         unl_mask = sp_labels == 0
         n_pos = int(pos_mask.sum().item())
-        n_unl = unl_mask.sum().item()
+        n_unl = int(unl_mask.sum().item())
 
         if n_pos == 0 or n_unl == 0:
             continue
