@@ -164,12 +164,15 @@ def train_encoder(
             for batch in val_loader:
                 features = batch["features"].to(dev, non_blocking=use_pin)
                 masks = batch["masks"].to(dev, non_blocking=use_pin)
+                cell_id_hash = batch["cell_id_hash"].to(dev, non_blocking=use_pin)
                 amp_context = amp.autocast("cuda", dtype=amp_dtype) if amp_enabled else nullcontext()
                 with amp_context:
                     z = encoder(features)
                     recon = aux_decoder(z)
                     loss_recon = reconstruction_loss(recon, features, masks)
-                val_loss_sum += loss_recon.item()
+                    loss_contrastive = contrastive_loss(z, cell_id_hash, temperature=contrastive_temperature)
+                    loss = recon_weight * loss_recon + contrastive_weight * loss_contrastive
+                val_loss_sum += loss.item()
                 val_steps += 1
 
         train_avg = train_loss_sum / max(train_steps, 1)

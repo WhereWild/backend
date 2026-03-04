@@ -48,13 +48,11 @@ class SharedEncoder(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
-        # Skip connection from input to embedding when dims differ
-        self.shortcut = nn.Linear(input_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.project_in(x)
         h = self.residual_blocks(h)
-        return self.project_out(h) + self.shortcut(x)
+        return self.project_out(h)
 
 
 class SpeciesHead(nn.Module):

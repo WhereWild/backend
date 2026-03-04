@@ -52,18 +52,28 @@ def build_cell_table(
         except (FileNotFoundError, OSError, ValueError, RuntimeError):
             continue
 
-        features = ds.features.numpy()
-        masks = ds.masks.numpy()
-        cell_ids = ds.cell_ids
+        features = ds.features.numpy().astype(np.float64, copy=False)
+        masks = ds.masks.numpy().astype(np.float64, copy=False)
+        cell_ids = np.asarray(ds.cell_ids, dtype=str)
 
-        for i in range(len(ds)):
-            cid = str(cell_ids[i])
+        if len(cell_ids) == 0:
+            continue
+
+        unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
+        split_feat_sum = np.zeros((len(unique_ids), features.shape[1]), dtype=np.float64)
+        split_mask_sum = np.zeros((len(unique_ids), masks.shape[1]), dtype=np.float64)
+        split_count = np.bincount(inverse, minlength=len(unique_ids)).astype(np.int64)
+
+        np.add.at(split_feat_sum, inverse, features)
+        np.add.at(split_mask_sum, inverse, masks)
+
+        for idx, cid in enumerate(unique_ids):
             if cell_feat_sum[cid].shape[0] == 0:
                 cell_feat_sum[cid] = np.zeros(features.shape[1], dtype=np.float64)
                 cell_mask_sum[cid] = np.zeros(masks.shape[1], dtype=np.float64)
-            cell_feat_sum[cid] += features[i].astype(np.float64)
-            cell_mask_sum[cid] += masks[i].astype(np.float64)
-            cell_count[cid] += 1
+            cell_feat_sum[cid] += split_feat_sum[idx]
+            cell_mask_sum[cid] += split_mask_sum[idx]
+            cell_count[cid] += int(split_count[idx])
 
     result: dict[str, dict[str, torch.Tensor]] = {}
     for cid in cell_feat_sum:

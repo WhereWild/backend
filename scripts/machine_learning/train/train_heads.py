@@ -157,7 +157,7 @@ def train_species_heads(
     for idx, sp_key in enumerate(eligible):
         sp_train_mask = train_species == sp_key
         sp_z = train_z[sp_train_mask].to(dev)
-        sp_labels = train_labels[sp_train_mask]
+        sp_labels = train_labels[sp_train_mask].to(dev)
         sp_weights = train_weights[sp_train_mask].to(dev)
 
         pos_mask = sp_labels == 1
@@ -200,7 +200,7 @@ def train_species_heads(
                     sp_val_mask = val_species == sp_key
                     if sp_val_mask.any():
                         sp_val_z = val_z[sp_val_mask].to(dev)
-                        sp_val_labels = val_labels[sp_val_mask]
+                        sp_val_labels = val_labels[sp_val_mask].to(dev)
                         val_pos = sp_val_labels == 1
                         val_unl = sp_val_labels == 0
                         if val_pos.any() and val_unl.any():

@@ -599,9 +599,8 @@ def predict_heatmap(
     """Compute a probability grid for a single species over a bounding box.
 
     All requested grid cells within the bounding box are scored in a single
-    vectorized forward pass. When *resolution* is larger than the model's
-    native cell size, per-cell scores are averaged into coarser tiles; when
-    it is smaller, finer cell centers are sampled directly.
+    vectorized forward pass. Output points are scored independently at their
+    grid-cell centers for the requested *resolution*.
 
     Args:
         species_key: GBIF species key (must be in the loaded bundle).
@@ -629,9 +628,8 @@ def predict_heatmap(
         - ``native_resolution``: the model's intrinsic cell size.
         - ``n_cells``: number of output cells with data.
         - ``cells``: list of ``{lat, lon, score, n_native}`` dicts.
-          ``lat``/``lon`` are output-cell centers, ``score`` is the mean
-          probability across contributing native cells, and ``n_native``
-          is how many native cells were averaged.
+                    ``lat``/``lon`` are output-cell centers, ``score`` is the predicted
+                    probability at each center, and ``n_native`` is always ``1``.
     """
     if _encoder is None:
         raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
