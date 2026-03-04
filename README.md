@@ -246,14 +246,15 @@ refresh of `.md` files.
 
 Finally, it's a great idea to install the [parquet viewer](https://marketplace.visualstudio.com/items?itemName=dvirtz.parquet-viewer) extension on VSCode which allows the viewing of parquet files as simple csvs which really helps quick manual inspection. It will likely require you install pyarrow or fastparquet OUTSIDE of Docker or something similar so it can convert the parquets to CSVs. [Rainbow CSV](https://marketplace.visualstudio.com/items?itemName=mechatroner.rainbow-csv) is also a great addition with this that makes it easy to tell which values are part of which columns.
 
-## ML Data Scripts
+## ML Pipeline
 
-For ML preprocessing and schema workflow, see [docs/ml_scripts.md](docs/ml_scripts.md).
+For the full end-to-end guide (preprocessing, training, export, and inference),
+see [docs/ml_scripts.md](docs/ml_scripts.md).
 
 Quick commands:
 
 ```sh
-# Build training dataset shards (smoke run)
+# 1. Build training dataset shards (smoke run)
 uv run python scripts/machine_learning/preprocess_training/cli.py \
   --input-root ./data \
   --output-root ./data/training_observation_smoke \
@@ -261,12 +262,30 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
   --threads 8 \
   --overwrite-output
 
-# Validate output schema contract
+# 2. Validate output schema contract
 uv run python scripts/machine_learning/validate_training_schema.py \
   --schema schemas/training_observation.schema.json \
   --data ./data/training_observation_smoke \
   --partitioning hive \
   --allow-extra-columns
+
+# 3. Train encoder + species heads
+uv run python scripts/machine_learning/train/cli.py all \
+  --data-root ./data/training_observation_smoke \
+  --output-dir ./checkpoints \
+  --epochs 50 \
+  --batch-size 4096
+
+# 4. Export inference bundle
+uv run python scripts/machine_learning/train/export.py \
+  --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
+  --heads-checkpoint ./checkpoints/heads/species_heads.pt \
+  --data-root ./data/training_observation_smoke \
+  --output ./checkpoints/inference_bundle.pt
+
+# 5. Serve the prediction API
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
+  uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 # Regenerate schema docs from JSON contract
 uv run python scripts/machine_learning/generate_training_schema_docs.py

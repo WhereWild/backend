@@ -1,11 +1,11 @@
-# Darwin Species Distribution Model (Modular, Mobile-First)
+# Darwin Species Distribution Model (Modular, Server-Side)
 
 ## 1) Goal
 
 Predict species occurrence probability at a location while:
 
 - avoiding a separate large model per species,
-- supporting on-device inference,
+- supporting server-side inference at arbitrary coordinates,
 - scaling to ~891 GB / ~2.93M files,
 - handling presence-only data (no true negatives).
 
@@ -104,37 +104,36 @@ After Stage B, use the pretrained encoder embedding as the fixed representation 
 
 Expected outcome: most compute spent once in shared encoder; species updates are cheap.
 
-## 5) Mobile Inference Design
+## 5) Server-Side Inference Design
 
 ### 5.1 Export format
 
-- Preferred React Native path: export encoder from PyTorch to ExecuTorch-compatible artifact (via `torch.export`/ExecuTorch tooling),
-- fallback path: export encoder to ONNX and quantize to int8,
-- export species heads as small matrices + biases (can stay outside the encoder graph when convenient).
+- The trained encoder + per-species heads + geocell feature table are packaged into a single `.pt` inference bundle via `scripts/machine_learning/train/export.py`.
+- The bundle also stores feature names (env, habitat, weather) so the server can sample GIS rasters on the fly.
 
-### 5.2 Runtime options
+### 5.2 Runtime
 
-- React Native: ExecuTorch in app runtime (plausible for this model family, especially tabular MLP encoder + small heads),
-- Android fallback: ONNX Runtime Mobile / TFLite,
-- iOS fallback: CoreML conversion from ONNX.
+- The inference engine (`util/inference.py`) loads the bundle at startup and runs on CPU.
+- No CUDA, AMP, or heavy ML dependencies are needed on the server.
+- Four FastAPI endpoints expose predictions: single-point, batch, heatmap, and model info.
 
-### 5.3 React Native + ExecuTorch viability notes
+### 5.3 On-the-fly GIS sampling
 
-- This is realistic for the MVP because the proposed encoder is small and operator-simple.
-- Validate operator coverage and quantization support early on target devices.
-- Keep a runtime fallback (ONNX/CoreML path) for unsupported ops or regressions.
+For coordinates without pre-computed features (not in the training cell table):
+
+- Static features (bioclim, elevation, slope, aspect, landcover, Koppen-Geiger) are sampled from local COG rasters via rasterio.
+- DEM-derived features (slope, aspect, aspect_deg) are computed from a 3x3 window around the query point.
+- Weather features are marked all-missing (the model handles masked inputs).
+- Batch sampling opens each raster once per 10-degree region tile for efficiency.
+
+This enables predictions at any land coordinate on Earth.
 
 ### 5.4 Latency strategy
 
-Best mobile path:
-
-- precompute environmental features per geocell offline,
-- on phone: lookup features for user location, run encoder once, score selected species heads.
-
-If memory constrained:
-
-- cache last `z` embeddings by geocell,
-- evaluate only top-K candidate species from region prior before full scoring.
+- Pre-computed cell table gives instant lookup for training-covered areas.
+- On-the-fly GIS sampling adds sub-millisecond overhead per query for uncovered areas (rasterio COG reads are fast with local files).
+- Heatmap endpoint scores all cells in a single vectorized forward pass.
+- Variable resolution aggregation allows zoom-dependent level of detail.
 
 ## 6) Data Splits and Validation (avoid leakage)
 
@@ -155,10 +154,11 @@ If memory constrained:
 1. Build 128-d tabular encoder only (no raster branch yet).
 2. Train encoder on all taxa with self-supervised + aux env prediction.
 3. Train PU logistic heads for top N species with enough positives.
-4. Export ONNX int8 encoder + head matrix.
-5. Run on-device scoring for user region species shortlist.
+4. Export `.pt` inference bundle containing encoder + heads + geocell feature table + feature names.
+5. Serve predictions via FastAPI with on-the-fly GIS raster sampling for arbitrary coordinates.
 
-This matches all requirements: modular per-species updates, mobile inference, single-GPU feasibility, and proper treatment of missing negatives.
+This matches all requirements: modular per-species updates, server-side inference,
+single-GPU feasibility, and proper treatment of missing negatives.
 
 ## 9) Data Preprocessing Pipeline (ETL)
 
