@@ -262,6 +262,9 @@ def run_preprocess(args) -> int:
                     partition_schema,
                     flavor="hive",
                 ),
+                # Use a batch-specific prefix so successive batches do
+                # not overwrite the files written by earlier batches.
+                basename_template=f"part-{batch_index}-{{i}}.parquet",
                 max_rows_per_file=args.max_rows_per_file,
                 max_rows_per_group=args.max_rows_per_file,
                 max_open_files=max(32, min(256, batch_size)),
