@@ -132,7 +132,10 @@ def run_preprocess(args) -> int:
     )
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
 
-    template_json_path = output_root / "feature_template.json"
+    output_root.mkdir(parents=True, exist_ok=True)
+    meta_dir = output_root / "_meta"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    template_json_path = meta_dir / "feature_template.json"
     with open(template_json_path, "w") as _ft_fh:
         json.dump(
             {"env": feature_template.env, "habitat": feature_template.habitat, "weather": feature_template.weather},
