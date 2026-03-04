@@ -26,24 +26,24 @@ Then use `ww-preprocess ...` instead of typing the full command.
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-  --input-root ./data \
-  --output-root ./data/training_observation_smoke \
-  --max-files 100 \
-  --threads 8 \
-  --overwrite-output
+    --input-root ./data \
+    --output-root ./data/training_observation_smoke \
+    --max-files 100 \
+    --threads 8 \
+    --overwrite-output
 ```
 
 ### PU-ready run (with unlabeled/background rows)
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-  --input-root ./data \
-  --output-root ./data/training_observation_smoke \
-  --max-files 1000 \
-  --threads 16 \
-  --overwrite-output \
+    --input-root ./data \
+    --output-root ./data/training_observation_smoke \
+    --max-files 1000 \
+    --threads 16 \
+    --overwrite-output \
     --drop-missing-time \
-  --background-ratio 1.0
+    --background-ratio 1.0
 ```
 
 ### Large run (OOM-safer schema scan)
@@ -117,10 +117,10 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
 
 ```bash
 uv run python scripts/machine_learning/validate_training_schema.py \
-  --schema schemas/training_observation.schema.json \
-  --data ./data/training_observation_smoke \
-  --partitioning hive \
-  --allow-extra-columns
+    --schema schemas/training_observation.schema.json \
+    --data ./data/training_observation_smoke \
+    --partitioning hive \
+    --allow-extra-columns
 ```
 
 Notes:
