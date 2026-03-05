@@ -7,24 +7,21 @@ from torch import nn
 
 
 class ResidualBlock(nn.Module):
-    """Single residual MLP block: Linear → LayerNorm → GELU with skip connection."""
+    """Single residual MLP block: Linear → GELU → add residual → LayerNorm (post-norm)."""
 
     def __init__(self, dim: int) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-        )
+        self.linear = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x) + x
+        return self.norm(nn.functional.gelu(self.linear(x)) + x)
 
 
 class SharedEncoder(nn.Module):
     """Shared global encoder (model card Section 2.1).
 
-    3-layer MLP with residual connections, GELU, LayerNorm.
+    3-layer MLP with residual connections: Linear → GELU → add residual → LayerNorm (post-norm).
     Projects concatenated feature vector to a fixed-size embedding.
     """
 
