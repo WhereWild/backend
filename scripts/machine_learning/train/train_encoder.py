@@ -33,14 +33,18 @@ def train_encoder(
     embed_dim: int = 128,
     hidden_dim: int = 256,
     epochs: int = 50,
-    batch_size: int = 16384,
+    batch_size: int = 32768,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     recon_weight: float = 1.0,
     use_amp: bool = True,
     device: str = "auto",
     data_mode: str = "chunk-cached",
-    chunk_rows: int = 1_000_000,
+    chunk_rows: int = 400_000,
+    prefetch_chunks: int = 3,
+    shuffle_mode: str = "block",
+    shuffle_block_rows: int = 131_072,
+    adaptive_prefetch: bool = True,
 ) -> Path:
     """Train shared encoder with masked reconstruction objective.
 
@@ -63,6 +67,10 @@ def train_encoder(
             (bounded in-memory chunks), or "in-memory"
             (materialize split tensors in RAM for fastest iteration).
         chunk_rows: rows per in-memory chunk when data_mode="chunk-cached".
+        prefetch_chunks: number of chunk-cached chunks to prefetch in background.
+        shuffle_mode: encoder training shuffle mode: "global" or "block".
+        shuffle_block_rows: block size when shuffle_mode="block".
+        adaptive_prefetch: dynamically reduce prefetch depth under memory/swap pressure.
 
     Returns:
         Path to saved encoder checkpoint.
@@ -87,10 +95,7 @@ def train_encoder(
 
     print(f"Device: {dev} | AMP: {amp_enabled} ({amp_dtype})")
     if data_mode not in {"streaming", "chunk-cached", "in-memory"}:
-        raise ValueError(
-            f"Unsupported data_mode={data_mode!r}. "
-            "Expected 'streaming', 'chunk-cached', or 'in-memory'."
-        )
+        raise ValueError(f"Unsupported data_mode={data_mode!r}. Expected 'streaming', 'chunk-cached', or 'in-memory'.")
 
     if data_mode in {"streaming", "chunk-cached"}:
         print(f"Probing training split ({data_mode} mode)...")
@@ -100,21 +105,46 @@ def train_encoder(
         recon_dim = train_ds.recon_dim
         print(f"Train rows: {train_ds.row_count:,} | Val rows: {val_ds.row_count:,} | Input dim: {input_dim}")
         if data_mode == "streaming":
-            train_loader = make_streaming_batches(train_ds, batch_size=batch_size, shuffle=True)
-            val_loader = make_streaming_batches(val_ds, batch_size=batch_size, shuffle=False)
+            train_loader = make_streaming_batches(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                shuffle_mode=shuffle_mode,
+                shuffle_block_rows=shuffle_block_rows,
+            )
+            val_loader = make_streaming_batches(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                shuffle_mode=shuffle_mode,
+                shuffle_block_rows=shuffle_block_rows,
+            )
         else:
-            print(f"Chunk-cached rows per chunk: {chunk_rows:,}")
+            print(
+                f"Chunk-cached rows per chunk: {chunk_rows:,} | "
+                f"prefetch chunks: {prefetch_chunks} | "
+                f"shuffle mode: {shuffle_mode} | "
+                f"adaptive prefetch: {adaptive_prefetch}"
+            )
             train_loader = make_chunk_cached_batches(
                 train_ds,
                 batch_size=batch_size,
                 shuffle=True,
                 chunk_rows=chunk_rows,
+                prefetch_chunks=prefetch_chunks,
+                shuffle_mode=shuffle_mode,
+                shuffle_block_rows=shuffle_block_rows,
+                adaptive_prefetch=adaptive_prefetch,
             )
             val_loader = make_chunk_cached_batches(
                 val_ds,
                 batch_size=batch_size,
                 shuffle=False,
                 chunk_rows=chunk_rows,
+                prefetch_chunks=prefetch_chunks,
+                shuffle_mode=shuffle_mode,
+                shuffle_block_rows=shuffle_block_rows,
+                adaptive_prefetch=adaptive_prefetch,
             )
     else:
         print("Loading training split (in-memory mode)...")
@@ -136,14 +166,26 @@ def train_encoder(
     params = list(encoder.parameters()) + list(aux_decoder.parameters())
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
-    total_steps = epochs * len(train_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    use_per_step_scheduler = data_mode == "in-memory"
+    if use_per_step_scheduler:
+        total_steps = epochs * len(train_loader)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+    else:
+        total_steps = None
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     amp = getattr(torch, "amp")
     scaler = amp.GradScaler("cuda", enabled=amp_enabled)
 
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
     print(f"AuxDecoder params: {sum(p.numel() for p in aux_decoder.parameters()):,}")
-    print(f"Total steps: {total_steps:,} | Epochs: {epochs}")
+    if total_steps is not None:
+        print(f"Total steps: {total_steps:,} | Epochs: {epochs}")
+    else:
+        print(
+            "Total steps: dynamic (streaming/chunk-cached loaders can emit more "
+            "batches than row_count/batch_size estimate) | "
+            f"Epochs: {epochs}"
+        )
 
     best_val_loss = float("inf")
     best_epoch = -1
@@ -154,6 +196,8 @@ def train_encoder(
         epoch_start = time.perf_counter()
         train_loss_sum = 0.0
         train_steps = 0
+        heartbeat_last_time = epoch_start
+        heartbeat_last_step = 0
 
         for step, batch in enumerate(train_loader):
             features = batch["features"].to(dev, non_blocking=use_pin)
@@ -173,18 +217,31 @@ def train_encoder(
             nn.utils.clip_grad_norm_(params, max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            if use_per_step_scheduler:
+                scheduler.step()
 
             train_loss_sum += loss.item()
             train_steps += 1
 
             if (step + 1) % HEARTBEAT_INTERVAL_STEPS == 0:
                 avg = train_loss_sum / train_steps
-                lr_now = scheduler.get_last_lr()[0]
-                print(
-                    f"  Epoch {epoch + 1}/{epochs} | step {step + 1}/{len(train_loader)} | "
-                    f"loss: {avg:.4f} | lr: {lr_now:.2e}"
-                )
+                lr_now = optimizer.param_groups[0]["lr"]
+                now = time.perf_counter()
+                step_delta = train_steps - heartbeat_last_step
+                seconds_delta = max(now - heartbeat_last_time, 1e-9)
+                steps_per_second = step_delta / seconds_delta
+                heartbeat_last_time = now
+                heartbeat_last_step = train_steps
+                if use_per_step_scheduler:
+                    print(
+                        f"  Epoch {epoch + 1}/{epochs} | step {step + 1}/{len(train_loader)} | "
+                        f"loss: {avg:.4f} | lr: {lr_now:.2e} | steps/s: {steps_per_second:.1f}"
+                    )
+                else:
+                    print(
+                        f"  Epoch {epoch + 1}/{epochs} | step {step + 1} | "
+                        f"loss: {avg:.4f} | lr: {lr_now:.2e} | steps/s: {steps_per_second:.1f}"
+                    )
 
         # Validation
         encoder.eval()
@@ -208,6 +265,9 @@ def train_encoder(
         train_avg = train_loss_sum / max(train_steps, 1)
         val_avg = val_loss_sum / max(val_steps, 1)
         epoch_seconds = time.perf_counter() - epoch_start
+
+        if not use_per_step_scheduler:
+            scheduler.step()
 
         improved = ""
         if val_avg < best_val_loss:

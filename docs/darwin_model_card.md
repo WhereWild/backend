@@ -114,8 +114,12 @@ Default settings:
 
 - embedding dim: 128,
 - mixed precision (bf16/fp16),
-- batch size: 16384 (current training CLI default; tune per memory budget),
+- batch size: 32768 (current training CLI default; tune per memory budget),
 - encoder data mode: chunk-cached (default bounded-RAM middle ground), streaming (lowest RAM), or in-memory (fastest when RAM allows),
+- chunk rows: 400000 (default),
+- prefetch chunks: 3 (default max depth),
+- adaptive prefetch: enabled by default (backs off queue depth under memory/swap pressure),
+- encoder shuffle mode: block (default) or global,
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads

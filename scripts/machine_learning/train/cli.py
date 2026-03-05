@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument("--data-root", type=Path, required=True, help="Preprocessed parquet dataset root.")
     shared.add_argument("--output-dir", type=Path, required=True, help="Output directory for checkpoints.")
     shared.add_argument("--device", type=str, default="auto", help="Device: auto, cuda, mps, cpu.")
-    shared.add_argument("--batch-size", type=int, default=16384, help="Mini-batch size.")
+    shared.add_argument("--batch-size", type=int, default=32768, help="Mini-batch size.")
 
     # Encoder-specific arguments
     encoder_args = argparse.ArgumentParser(add_help=False)
@@ -69,8 +69,33 @@ def parse_args() -> argparse.Namespace:
     encoder_args.add_argument(
         "--encoder-chunk-rows",
         type=int,
-        default=1_000_000,
+        default=400_000,
         help="Rows per chunk when --encoder-data-mode=chunk-cached.",
+    )
+    encoder_args.add_argument(
+        "--encoder-prefetch-chunks",
+        type=int,
+        default=3,
+        help="Number of chunk-cached chunks to prefetch in the background.",
+    )
+    encoder_args.add_argument(
+        "--encoder-adaptive-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt prefetch queue depth based on host memory/swap pressure (default: enabled).",
+    )
+    encoder_args.add_argument(
+        "--encoder-shuffle-mode",
+        type=str,
+        default="block",
+        choices=["global", "block"],
+        help="Shuffle mode for streaming/chunk-cached encoder batches.",
+    )
+    encoder_args.add_argument(
+        "--encoder-shuffle-block-rows",
+        type=int,
+        default=131_072,
+        help="Block size when --encoder-shuffle-mode=block.",
     )
 
     # Heads-specific arguments
@@ -117,6 +142,10 @@ def main() -> int:
             device=args.device,
             data_mode=args.encoder_data_mode,
             chunk_rows=args.encoder_chunk_rows,
+            prefetch_chunks=args.encoder_prefetch_chunks,
+            shuffle_mode=args.encoder_shuffle_mode,
+            shuffle_block_rows=args.encoder_shuffle_block_rows,
+            adaptive_prefetch=args.encoder_adaptive_prefetch,
         )
     else:
         encoder_path = None
