@@ -212,9 +212,7 @@ def generate_pooled_background_shards(
         pq.write_table(background_table, out_path, compression="zstd")
         generated_paths.append(out_path)
         generated_rows += int(background_table.num_rows)
-        print(
-            f"Background generation | split={split_name} | rows={background_table.num_rows:,} | path={out_path.name}"
-        )
+        print(f"Background generation | split={split_name} | rows={background_table.num_rows:,} | path={out_path.name}")
 
     return generated_paths, generated_rows
 
@@ -293,7 +291,6 @@ def run_preprocess(args) -> int:
     print(f"Background ratio: {args.background_ratio:.3f}")
     print(f"Warn min cells/species: {int(args.warn_min_cells_per_species)}")
     print(f"Partition mode: {args.partition_mode}")
-    print(f"Final write batch size (files): {int(args.final_write_batch_files)}")
     print(f"Final write use threads: {FINAL_WRITE_USE_THREADS}")
     if args.static_context_template:
         print(f"Static context template: {args.static_context_template}")
@@ -470,31 +467,31 @@ def run_preprocess(args) -> int:
         partition_fields = partition_field_map[args.partition_mode]
         partition_schema = pa.schema([pa.field(field_name, pa.string()) for field_name in partition_fields])
 
-        batch_size = max(1, int(args.final_write_batch_files))
-        total_batches = (len(staged_paths) + batch_size - 1) // batch_size
-        for batch_index, start_idx in enumerate(range(0, len(staged_paths), batch_size), start=1):
-            end_idx = min(start_idx + batch_size, len(staged_paths))
-            batch_paths = staged_paths[start_idx:end_idx]
-            staged_dataset = ds.dataset(batch_paths, format="parquet")
-            print(f"Final write batch {batch_index:,}/{total_batches:,} | files: {len(batch_paths):,}")
-            ds.write_dataset(
-                data=staged_dataset,
-                base_dir=output_root,
-                format="parquet",
-                partitioning=ds.partitioning(
-                    partition_schema,
-                    flavor="hive",
-                ),
-                # Use a batch-specific prefix so successive batches do
-                # not overwrite the files written by earlier batches.
-                basename_template=f"part-{batch_index}-{{i}}.parquet",
-                max_rows_per_file=args.max_rows_per_file,
-                max_rows_per_group=args.max_rows_per_file,
-                max_open_files=max(32, min(256, batch_size)),
-                max_partitions=8192,
-                use_threads=FINAL_WRITE_USE_THREADS,
-                existing_data_behavior="overwrite_or_ignore",
-            )
+        # Write all staged shards in a single pass so PyArrow can merge rows
+        # from different shards into the same output file.  This avoids the
+        # small-file explosion that arises when batching: each batch previously
+        # produced its own part-{batch}-{i}.parquet files per partition, leading
+        # to O(n_shards × n_partitions) tiny files that are slow to scan during
+        # training.  PyArrow's writer manages open file handles internally via
+        # max_open_files, so no batching is needed here.
+        staged_dataset = ds.dataset(staged_paths, format="parquet")
+        print(f"Final write | shards: {len(staged_paths):,}")
+        ds.write_dataset(
+            data=staged_dataset,
+            base_dir=output_root,
+            format="parquet",
+            partitioning=ds.partitioning(
+                partition_schema,
+                flavor="hive",
+            ),
+            basename_template="part-{i}.parquet",
+            max_rows_per_file=args.max_rows_per_file,
+            max_rows_per_group=args.max_rows_per_file,
+            max_open_files=512,
+            max_partitions=8192,
+            use_threads=FINAL_WRITE_USE_THREADS,
+            existing_data_behavior="overwrite_or_ignore",
+        )
     finally:
         write_heartbeat_stop.set()
         write_heartbeat_thread.join(timeout=2.0)

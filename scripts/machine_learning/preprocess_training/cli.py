@@ -109,12 +109,6 @@ def parse_args() -> argparse.Namespace:
         help="Warn when a species has fewer than this many unique cells in a transformed shard (0 = disabled).",
     )
     parser.add_argument(
-        "--final-write-batch-files",
-        type=int,
-        default=500,
-        help="Number of staged parquet shards to include in each final output write batch.",
-    )
-    parser.add_argument(
         "--static-context-template",
         type=str,
         default="",
