@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument("--data-root", type=Path, required=True, help="Preprocessed parquet dataset root.")
     shared.add_argument("--output-dir", type=Path, required=True, help="Output directory for checkpoints.")
     shared.add_argument("--device", type=str, default="auto", help="Device: auto, cuda, mps, cpu.")
-    shared.add_argument("--batch-size", type=int, default=4096, help="Mini-batch size.")
+    shared.add_argument("--batch-size", type=int, default=16384, help="Mini-batch size.")
 
     # Encoder-specific arguments
     encoder_args = argparse.ArgumentParser(add_help=False)
@@ -54,6 +54,17 @@ def parse_args() -> argparse.Namespace:
     encoder_args.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     encoder_args.add_argument("--recon-weight", type=float, default=1.0, help="Reconstruction loss weight.")
     encoder_args.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision.")
+    encoder_args.add_argument(
+        "--encoder-data-mode",
+        type=str,
+        default="streaming",
+        choices=["streaming", "in-memory"],
+        help=(
+            "Encoder Stage B data loading mode. "
+            "'streaming' lazily scans parquet from disk (lower RAM), "
+            "'in-memory' materializes split tensors first (higher RAM, often faster)."
+        ),
+    )
 
     # Heads-specific arguments
     heads_args = argparse.ArgumentParser(add_help=False)
@@ -97,6 +108,7 @@ def main() -> int:
             recon_weight=args.recon_weight,
             use_amp=not args.no_amp,
             device=args.device,
+            data_mode=args.encoder_data_mode,
         )
     else:
         encoder_path = None

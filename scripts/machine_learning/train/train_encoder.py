@@ -14,6 +14,8 @@ try:
 except ImportError:
     from _compat import import_local_symbol
 
+TrainingDataset = import_local_symbol("data", "TrainingDataset")
+make_batches = import_local_symbol("data", "make_batches")
 StreamingTrainingDataset = import_local_symbol("data", "StreamingTrainingDataset")
 make_streaming_batches = import_local_symbol("data", "make_streaming_batches")
 reconstruction_loss = import_local_symbol("losses", "reconstruction_loss")
@@ -30,12 +32,13 @@ def train_encoder(
     embed_dim: int = 128,
     hidden_dim: int = 256,
     epochs: int = 50,
-    batch_size: int = 4096,
+    batch_size: int = 16384,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
     recon_weight: float = 1.0,
     use_amp: bool = True,
     device: str = "auto",
+    data_mode: str = "streaming",
 ) -> Path:
     """Train shared encoder with masked reconstruction objective.
 
@@ -54,6 +57,8 @@ def train_encoder(
         recon_weight: loss weight for reconstruction term.
         use_amp: use automatic mixed precision (bf16/fp16).
         device: "auto", "cuda", "mps", or "cpu".
+        data_mode: "streaming" (lazy parquet scans) or "in-memory"
+            (materialize split tensors in RAM for faster iteration).
 
     Returns:
         Path to saved encoder checkpoint.
@@ -77,16 +82,32 @@ def train_encoder(
     use_pin = dev.type == "cuda"
 
     print(f"Device: {dev} | AMP: {amp_enabled} ({amp_dtype})")
-    print("Probing training split (streaming mode)...")
-    train_ds = StreamingTrainingDataset(data_root, split="train")
-    val_ds = StreamingTrainingDataset(data_root, split="val")
-    input_dim = train_ds.feature_dim
-    recon_dim = train_ds.recon_dim
+    if data_mode not in {"streaming", "in-memory"}:
+        raise ValueError(f"Unsupported data_mode={data_mode!r}. Expected 'streaming' or 'in-memory'.")
 
-    print(f"Train rows: {train_ds.row_count:,} | Val rows: {val_ds.row_count:,} | Input dim: {input_dim}")
+    if data_mode == "streaming":
+        print("Probing training split (streaming mode)...")
+        train_ds = StreamingTrainingDataset(data_root, split="train")
+        val_ds = StreamingTrainingDataset(data_root, split="val")
+        input_dim = train_ds.feature_dim
+        recon_dim = train_ds.recon_dim
+        print(f"Train rows: {train_ds.row_count:,} | Val rows: {val_ds.row_count:,} | Input dim: {input_dim}")
 
-    train_loader = make_streaming_batches(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = make_streaming_batches(val_ds, batch_size=batch_size, shuffle=False)
+        train_loader = make_streaming_batches(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = make_streaming_batches(val_ds, batch_size=batch_size, shuffle=False)
+    else:
+        print("Loading training split (in-memory mode)...")
+        train_ds = TrainingDataset(data_root, split="train")
+        val_ds = TrainingDataset(data_root, split="val")
+        if use_pin:
+            train_ds.pin()
+            val_ds.pin()
+        input_dim = train_ds.feature_dim
+        recon_dim = train_ds.recon_dim
+        print(f"Train rows: {train_ds.num_rows:,} | Val rows: {val_ds.num_rows:,} | Input dim: {input_dim}")
+
+        train_loader = make_batches(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = make_batches(val_ds, batch_size=batch_size, shuffle=False)
 
     encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(dev)
     aux_decoder = AuxDecoder(embed_dim, recon_dim).to(dev)

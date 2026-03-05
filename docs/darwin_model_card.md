@@ -114,7 +114,7 @@ Default settings:
 
 - embedding dim: 128,
 - mixed precision (bf16/fp16),
-- batch size: 4096,
+- batch size: 16384 (current training CLI default; tune per memory budget),
 - optimizer: AdamW, cosine decay.
 
 ### Stage C - Train per-species heads
