@@ -100,8 +100,8 @@ def parse_args() -> argparse.Namespace:
 
     # Heads-specific arguments
     heads_args = argparse.ArgumentParser(add_help=False)
-    heads_args.add_argument("--min-positives", type=int, default=5, help="Skip species with fewer positives.")
-    heads_args.add_argument("--head-epochs", type=int, default=100, help="Epochs per species head.")
+    heads_args.add_argument("--min-positives", type=int, default=50, help="Skip species with fewer positives.")
+    heads_args.add_argument("--head-epochs", type=int, default=50, help="Epochs per species head.")
     heads_args.add_argument("--head-lr", type=float, default=1e-2, help="Species head learning rate.")
     heads_args.add_argument("--head-weight-decay", type=float, default=1e-3, help="Species head weight decay.")
 

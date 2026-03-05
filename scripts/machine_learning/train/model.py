@@ -21,7 +21,8 @@ class ResidualBlock(nn.Module):
 class SharedEncoder(nn.Module):
     """Shared global encoder (model card Section 2.1).
 
-    3-layer MLP with residual connections: Linear → GELU → add residual → LayerNorm (post-norm).
+    4-linear-layer MLP stack with residual connections:
+    project_in + two residual block linears + project_out.
     Projects concatenated feature vector to a fixed-size embedding.
     """
 

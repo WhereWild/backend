@@ -26,7 +26,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 - `scripts/machine_learning/generate_training_schema_docs.py`
     - Regenerates `docs/training_observation_schema.md` from the schema contract.
 
-## 1) Preprocess data
+## 1. Preprocess data
 
 ### Basic smoke run
 
@@ -124,7 +124,28 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
 
 - Species-bucket partitioned view for per-species head training (`species_bucket`) is a separate derived-dataset step and is not implemented by the current preprocessing CLI.
 
-## 2) Validate output schema
+### Resume from staging after interrupted preprocess
+
+If a long preprocess run finished transforms but stopped during
+"Generating pooled unlabeled/background rows..." or final write, you can resume
+without reprocessing all occurrence files:
+
+```bash
+uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
+    --staging-dir ./data/.species_observation_canary_plants_staging \
+    --output-root ./data/species_observation_canary_plants \
+    --partition-mode split \
+    --background-ratio 1.0 \
+    --background-split-chunk-rows 500000 \
+    --overwrite-output
+```
+
+Notes:
+
+- Use `--regenerate-background` if `background_pooled_*.parquet` files already exist in staging and you want a clean background rebuild.
+- Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
+
+## 2. Validate output schema
 
 ```bash
 uv run python scripts/machine_learning/validate_training_schema.py \
@@ -140,7 +161,7 @@ Notes:
     `split=...`, `split=.../year_month=...`, or `split=.../year_month=.../region_id=...`.
 - `fixed_size_list<float>` vectors are accepted as compatible with schema `list<float>`.
 
-## 3) Regenerate schema docs
+## 3. Regenerate schema docs
 
 ```bash
 uv run python scripts/machine_learning/generate_training_schema_docs.py
@@ -156,7 +177,7 @@ Before starting model training, verify:
 - `year_month` coverage looks reasonable and not dominated by fallback timestamps.
 - Feature vectors are non-null and consistent in dimensionality.
 
-## 4) Train the model
+## 4. Train the model
 
 Requires the `ml` optional dependency group: `uv sync --extra ml`.
 
@@ -169,7 +190,6 @@ uv run python scripts/machine_learning/train/cli.py encoder \
     --data-root ./data/species_observation_canary \
     --output-dir ./checkpoints/encoder \
     --epochs 50 \
-    --batch-size 4096
 ```
 
 On CPU (slower, no AMP):
@@ -200,7 +220,7 @@ uv run python scripts/machine_learning/train/cli.py all \
     --data-root ./data/species_observation_canary \
     --output-dir ./checkpoints \
     --epochs 50 \
-    --head-epochs 100 \
+    --head-epochs 50 \
     --batch-size 4096
 ```
 
@@ -209,7 +229,7 @@ uv run python scripts/machine_learning/train/cli.py all \
 - `--embed-dim`: encoder embedding dimension (default 128).
 - `--hidden-dim`: encoder hidden layer dimension (default 256).
 - `--epochs`: encoder training epochs (default 50).
-- `--head-epochs`: epochs per species head (default 100).
+- `--head-epochs`: epochs per species head (default 50).
 - `--lr`: encoder peak learning rate (default 1e-3).
 - `--head-lr`: species head learning rate (default 1e-2).
 - `--recon-weight`: reconstruction loss weight for encoder pretraining.
@@ -222,7 +242,7 @@ uv run python scripts/machine_learning/train/cli.py all \
 - `encoder_best.pt`: shared encoder checkpoint (Stage B).
 - `species_heads.pt`: all per-species head weights + metadata (Stage C).
 
-## 5) Export inference bundle
+## 5. Export inference bundle
 
 Package the trained model into a single `.pt` file for server-side deployment:
 
@@ -246,7 +266,7 @@ The preprocessing step also writes `feature_template.json` under
 preprocessed datasets), export falls back to deriving feature names from the GIS
 catalog.
 
-## 6) Run inference / serve the API
+## 6. Run inference / serve the API
 
 ### Load the bundle and predict in Python
 
