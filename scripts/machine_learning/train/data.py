@@ -237,6 +237,31 @@ class StreamingTrainingDataset:
             yield _record_batch_to_tensors(record_batch.to_pandas())
 
 
+def _yield_batches_from_parts(
+    parts: list[dict[str, torch.Tensor]],
+    *,
+    batch_size: int,
+    shuffle: bool,
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Merge tensor parts, optionally shuffle, and yield mini-batches.
+
+    This helper clears ``parts`` in-place after concatenation so callers can
+    release references to chunk tensors promptly and keep peak RAM bounded.
+    """
+    if not parts:
+        return
+    merged = {key: torch.cat([part[key] for part in parts], dim=0) for key in parts[0]}
+    parts.clear()
+
+    n_rows = merged["features"].shape[0]
+    if shuffle:
+        perm = torch.randperm(n_rows)
+        merged = {key: value[perm] for key, value in merged.items()}
+
+    for start in range(0, n_rows, batch_size):
+        yield {key: value[start : start + batch_size] for key, value in merged.items()}
+
+
 class StreamingBatchIterator:
     """Batch iterator over a StreamingTrainingDataset.
 
@@ -267,27 +292,74 @@ class StreamingBatchIterator:
         buffer: list[dict[str, torch.Tensor]] = []
         buf_rows = 0
 
-        def _drain() -> Iterator[dict[str, torch.Tensor]]:
-            """Merge, optionally shuffle, and yield batches from the buffer."""
-            if not buffer:
-                return
-            merged = {key: torch.cat([b[key] for b in buffer], dim=0) for key in buffer[0]}
-            buffer.clear()
-            n = merged["features"].shape[0]
-            if self._shuffle:
-                perm = torch.randperm(n)
-                merged = {k: v[perm] for k, v in merged.items()}
-            for start in range(0, n, self._batch_size):
-                yield {k: v[start : start + self._batch_size] for k, v in merged.items()}
-
         for rb_tensors in self._dataset._iter_record_batches():
             buffer.append(rb_tensors)
             buf_rows += rb_tensors["features"].shape[0]
             if buf_rows >= self._shuffle_buffer_size:
-                yield from _drain()
+                yield from _yield_batches_from_parts(
+                    buffer,
+                    batch_size=self._batch_size,
+                    shuffle=self._shuffle,
+                )
                 buf_rows = 0
 
-        yield from _drain()
+        yield from _yield_batches_from_parts(
+            buffer,
+            batch_size=self._batch_size,
+            shuffle=self._shuffle,
+        )
+
+
+class ChunkCachedBatchIterator:
+    """Batch iterator with bounded in-memory chunk caching.
+
+    Reads one split lazily from parquet, but materializes larger row chunks
+    (for example 1-2M rows) into contiguous tensors before yielding batches.
+    This keeps memory bounded while reducing scanner and tensor-concatenation
+    overhead relative to small-buffer streaming.
+    """
+
+    def __init__(
+        self,
+        dataset: StreamingTrainingDataset,
+        batch_size: int = 4096,
+        shuffle: bool = True,
+        chunk_rows: int = 1_000_000,
+    ) -> None:
+        if chunk_rows < batch_size:
+            raise ValueError(
+                "chunk_rows must be >= batch_size "
+                f"(got chunk_rows={chunk_rows}, batch_size={batch_size})."
+            )
+        self._dataset = dataset
+        self._batch_size = batch_size
+        self._shuffle = shuffle
+        self._chunk_rows = chunk_rows
+
+    def __len__(self) -> int:
+        """Estimated batch count based on parquet footer row count."""
+        return max(1, math.ceil(self._dataset.row_count / self._batch_size))
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        chunk_parts: list[dict[str, torch.Tensor]] = []
+        chunk_size_rows = 0
+
+        for rb_tensors in self._dataset._iter_record_batches():
+            chunk_parts.append(rb_tensors)
+            chunk_size_rows += rb_tensors["features"].shape[0]
+            if chunk_size_rows >= self._chunk_rows:
+                yield from _yield_batches_from_parts(
+                    chunk_parts,
+                    batch_size=self._batch_size,
+                    shuffle=self._shuffle,
+                )
+                chunk_size_rows = 0
+
+        yield from _yield_batches_from_parts(
+            chunk_parts,
+            batch_size=self._batch_size,
+            shuffle=self._shuffle,
+        )
 
 
 def make_streaming_batches(
@@ -302,4 +374,19 @@ def make_streaming_batches(
         batch_size=batch_size,
         shuffle=shuffle,
         shuffle_buffer_size=shuffle_buffer_size,
+    )
+
+
+def make_chunk_cached_batches(
+    dataset: StreamingTrainingDataset,
+    batch_size: int = 4096,
+    shuffle: bool = True,
+    chunk_rows: int = 1_000_000,
+) -> ChunkCachedBatchIterator:
+    """Create a chunk-cached batch iterator for a StreamingTrainingDataset."""
+    return ChunkCachedBatchIterator(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        chunk_rows=chunk_rows,
     )

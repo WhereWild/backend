@@ -57,13 +57,20 @@ def parse_args() -> argparse.Namespace:
     encoder_args.add_argument(
         "--encoder-data-mode",
         type=str,
-        default="streaming",
-        choices=["streaming", "in-memory"],
+        default="chunk-cached",
+        choices=["streaming", "chunk-cached", "in-memory"],
         help=(
             "Encoder Stage B data loading mode. "
-            "'streaming' lazily scans parquet from disk (lower RAM), "
-            "'in-memory' materializes split tensors first (higher RAM, often faster)."
+            "'streaming' lazily scans parquet from disk (lowest RAM), "
+            "'chunk-cached' materializes bounded row chunks (default middle ground), "
+            "'in-memory' materializes full split tensors first (highest RAM, often fastest)."
         ),
+    )
+    encoder_args.add_argument(
+        "--encoder-chunk-rows",
+        type=int,
+        default=1_000_000,
+        help="Rows per chunk when --encoder-data-mode=chunk-cached.",
     )
 
     # Heads-specific arguments
@@ -109,6 +116,7 @@ def main() -> int:
             use_amp=not args.no_amp,
             device=args.device,
             data_mode=args.encoder_data_mode,
+            chunk_rows=args.encoder_chunk_rows,
         )
     else:
         encoder_path = None
