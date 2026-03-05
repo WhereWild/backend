@@ -87,6 +87,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--background-split-chunk-rows",
+        type=int,
+        default=2_000_000,
+        help=(
+            "Row cap per split chunk during pooled background generation. "
+            "Lower values reduce peak memory usage on very large datasets."
+        ),
+    )
+    parser.add_argument(
         "--overwrite-output",
         action="store_true",
         help="Delete output and staging directories before writing.",

@@ -187,8 +187,14 @@ def generate_pooled_background_shards(
     *,
     staging_dir: Path,
     background_ratio: float,
+    split_chunk_rows: int,
 ) -> tuple[list[Path], int]:
-    """Generate unlabeled rows from pooled other-species positives per split."""
+    """Generate unlabeled rows from pooled other-species positives per split.
+
+    To keep memory bounded on very large runs, each split is processed in
+    row chunks. Sampling semantics remain pooled-other-species within each
+    split chunk, and generated chunk outputs are concatenated.
+    """
     if background_ratio <= 0.0:
         return [], 0
 
@@ -198,21 +204,67 @@ def generate_pooled_background_shards(
     rng = np.random.default_rng(0)
 
     for split_name in ("train", "val", "test"):
-        split_table = dataset.to_table(filter=pc.field("split") == split_name, use_threads=True)
-        background_table = _build_background_table_for_split(
-            split_table,
-            split_name=split_name,
-            background_ratio=background_ratio,
-            rng=rng,
+        scanner = dataset.scanner(
+            filter=pc.field("split") == split_name,
+            use_threads=True,
+            batch_size=65_536,
         )
-        if background_table is None or background_table.num_rows == 0:
-            continue
+        split_generated_rows = 0
+        split_generated_shards = 0
+        chunk_batches: list[pa.RecordBatch] = []
+        chunk_rows = 0
 
-        out_path = staging_dir / f"background_pooled_{split_name}.parquet"
-        pq.write_table(background_table, out_path, compression="zstd")
-        generated_paths.append(out_path)
-        generated_rows += int(background_table.num_rows)
-        print(f"Background generation | split={split_name} | rows={background_table.num_rows:,} | path={out_path.name}")
+        def flush_chunk(
+            batches: list[pa.RecordBatch],
+            shard_index: int,
+        ) -> tuple[int, int]:
+            """Flush one split chunk and return (rows_written, next_shard_index).
+
+            The caller explicitly accumulates row counters and tracks shard
+            indices from this return value.
+            """
+            if not batches:
+                return 0, shard_index
+
+            chunk_table = pa.Table.from_batches(batches)
+            background_table = _build_background_table_for_split(
+                chunk_table,
+                split_name=split_name,
+                background_ratio=background_ratio,
+                rng=rng,
+            )
+            if background_table is None or background_table.num_rows == 0:
+                return 0, shard_index
+
+            out_path = staging_dir / f"background_pooled_{split_name}_{shard_index:05d}.parquet"
+            pq.write_table(background_table, out_path, compression="zstd")
+            generated_paths.append(out_path)
+            return int(background_table.num_rows), shard_index + 1
+
+        for batch in scanner.to_batches():
+            if batch.num_rows == 0:
+                continue
+            chunk_batches.append(batch)
+            chunk_rows += int(batch.num_rows)
+            if chunk_rows >= max(1, split_chunk_rows):
+                rows_written, split_generated_shards = flush_chunk(chunk_batches, split_generated_shards)
+                generated_rows += rows_written
+                split_generated_rows += rows_written
+                chunk_batches = []
+                chunk_rows = 0
+
+        rows_written, split_generated_shards = flush_chunk(chunk_batches, split_generated_shards)
+        generated_rows += rows_written
+        split_generated_rows += rows_written
+        chunk_batches = []
+        chunk_rows = 0
+
+        if split_generated_shards == 0:
+            continue
+        print(
+            f"Background generation | split={split_name} | rows={split_generated_rows:,} | "
+            f"shards={split_generated_shards:,}"
+        )
 
     return generated_paths, generated_rows
 
@@ -289,6 +341,7 @@ def run_preprocess(args) -> int:
     print(f"Missing feature sentinel: {MISSING_FEATURE_SENTINEL:.3f}")
     print("Include missing masks: True")
     print(f"Background ratio: {args.background_ratio:.3f}")
+    print(f"Background split chunk rows: {args.background_split_chunk_rows:,}")
     print(f"Warn min cells/species: {int(args.warn_min_cells_per_species)}")
     print(f"Partition mode: {args.partition_mode}")
     print(f"Final write use threads: {FINAL_WRITE_USE_THREADS}")
@@ -301,18 +354,18 @@ def run_preprocess(args) -> int:
     if args.temporal_context_path is not None:
         print(f"Temporal context path: {args.temporal_context_path}")
     print("Auto context discovery: True")
-    if float(args.background_ratio) <= 0.0:
+    if args.background_ratio <= 0.0:
         print("Warning: background ratio is 0.0; output will contain positives only (no unlabeled/background rows).")
 
     print("Starting feature-template schema scan...")
-    if int(args.template_scan_max_files) > 0:
-        print(f"Template schema scan cap: {int(args.template_scan_max_files):,} files")
+    if args.template_scan_max_files > 0:
+        print(f"Template schema scan cap: {args.template_scan_max_files:,} files")
     template_start = time.perf_counter()
     feature_template = build_feature_template(
         files,
         schema_log_interval_files=SCHEMA_LOG_INTERVAL_FILES,
         log_slow_read_seconds=LOG_SLOW_READ_SECONDS,
-        template_scan_max_files=int(args.template_scan_max_files),
+        template_scan_max_files=args.template_scan_max_files,
     )
     template_seconds = time.perf_counter() - template_start
     print(
@@ -434,13 +487,14 @@ def run_preprocess(args) -> int:
         raise SystemExit("No transformed shards were produced; aborting final write.")
 
     positive_rows = written
-    if float(args.background_ratio) > 0.0:
+    if args.background_ratio > 0.0:
         print("Generating pooled unlabeled/background rows from other-species observations...")
         bg_start = time.perf_counter()
         background_paths, background_rows = generate_pooled_background_shards(
             staged_paths,
             staging_dir=staging_dir,
-            background_ratio=float(args.background_ratio),
+            background_ratio=args.background_ratio,
+            split_chunk_rows=args.background_split_chunk_rows,
         )
         staged_paths.extend(background_paths)
         written += int(background_rows)
