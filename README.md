@@ -295,6 +295,15 @@ uv run python scripts/machine_learning/train/export.py \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
   uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
+# Optional runtime device controls
+# Inference compute: auto|cpu|cuda (default: auto)
+# Cell table placement: auto|cpu|cuda (default: auto -> cpu)
+# Note: cell-table cuda requires WHEREWILD_INFERENCE_DEVICE=cuda
+WHEREWILD_INFERENCE_DEVICE=cuda \
+WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
+  uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
 # Regenerate schema docs from JSON contract
 uv run python scripts/machine_learning/generate_training_schema_docs.py
 ```

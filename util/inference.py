@@ -1,4 +1,4 @@
-"""Lightweight CPU inference for the Darwin SDM.
+"""Lightweight inference for the Darwin SDM.
 
 Loads an inference bundle (exported by ``scripts/machine_learning/train/export.py``)
 and provides a single ``predict(lat, lon)`` function that returns ranked species
@@ -11,13 +11,15 @@ Typical startup flow (called once at import / FastAPI startup)::
     load_bundle("checkpoints/canary_cactus/inference_bundle.pt")
     results = predict(lat=25.0, lon=-100.0, top_k=10)
 
-The module is deliberately free of CUDA / AMP dependencies so it runs on
-CPU-only servers.
+By default, runtime inference prefers CUDA when available and otherwise
+falls back to CPU.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import logging
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Callable, Iterator, NamedTuple
@@ -41,9 +43,67 @@ _species_meta: dict[int, dict] = {}
 _feature_names: dict[str, list[str]] | None = None
 _input_dim: int = 0
 _model_uses_mask: bool = False
+_device: torch.device = torch.device("cpu")
 
 HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
+LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_inference_device() -> torch.device:
+    """Resolve runtime device from env config with safe CPU fallback."""
+    requested = os.environ.get("WHEREWILD_INFERENCE_DEVICE", "auto").strip().lower()
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("WHEREWILD_INFERENCE_DEVICE=cuda set, but CUDA is unavailable")
+        return torch.device("cuda")
+    if requested != "auto":
+        raise ValueError("WHEREWILD_INFERENCE_DEVICE must be one of: auto, cpu, cuda")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    LOGGER.info("CUDA unavailable; using CPU for inference (WHEREWILD_INFERENCE_DEVICE=auto)")
+    return torch.device("cpu")
+
+
+def _resolve_cell_table_device(inference_device: torch.device) -> torch.device:
+    """Resolve cell_table placement device.
+
+    Defaults to CPU. CUDA placement is opt-in and only allowed when
+    WHEREWILD_INFERENCE_DEVICE is explicitly set to ``cuda``.
+    """
+    requested = os.environ.get("WHEREWILD_INFERENCE_CELL_TABLE_DEVICE", "auto").strip().lower()
+    if requested in {"", "auto", "cpu"}:
+        return torch.device("cpu")
+    if requested != "cuda":
+        raise ValueError("WHEREWILD_INFERENCE_CELL_TABLE_DEVICE must be one of: auto, cpu, cuda")
+
+    inference_requested = os.environ.get("WHEREWILD_INFERENCE_DEVICE", "auto").strip().lower()
+    if inference_requested != "cuda":
+        raise ValueError("WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda requires WHEREWILD_INFERENCE_DEVICE=cuda")
+    if inference_device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda set, but CUDA is unavailable")
+    return torch.device("cuda")
+
+
+def _move_cell_table_to_device(
+    cell_table: dict[str, dict[str, torch.Tensor]], target_device: torch.device
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Move tensor payloads in cell_table to target device."""
+    if target_device.type == "cpu":
+        return cell_table
+
+    moved: dict[str, dict[str, torch.Tensor]] = {}
+    for cid, payload in cell_table.items():
+        moved_payload: dict[str, torch.Tensor] = {}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                moved_payload[key] = value.to(target_device)
+            else:
+                moved_payload[key] = value
+        moved[cid] = moved_payload
+    return moved
 
 
 def _raw_feature_dim_from_names() -> int | None:
@@ -103,8 +163,7 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
         weather_dim = len(_feature_names.get("weather", []))
         return (
             False,
-            "bundle sampled feature template is empty "
-            f"(env={env_dim}, habitat={habitat_dim}, weather={weather_dim})",
+            f"bundle sampled feature template is empty (env={env_dim}, habitat={habitat_dim}, weather={weather_dim})",
         )
 
     alignable = raw_dim == _input_dim or 2 * raw_dim == _input_dim
@@ -538,10 +597,15 @@ def load_bundle(path: str | Path) -> None:
     once during application startup.
     """
     global _bundle, _encoder, _heads, _cell_table, _cell_size_deg, _species_meta  # noqa: PLW0603
-    global _feature_names, _input_dim, _model_uses_mask  # noqa: PLW0603
+    global _feature_names, _input_dim, _model_uses_mask, _device  # noqa: PLW0603
 
     _lazy_import_models()
+    _device = _resolve_inference_device()
+    cell_table_device = _resolve_cell_table_device(_device)
 
+    # Keep bundle tensors on CPU at load time. The bundle includes a large
+    # cell_table; mapping the full payload directly to CUDA can exhaust GPU
+    # memory. We move only encoder/heads and runtime batches to _device.
     loaded = torch.load(str(path), map_location="cpu", weights_only=False)
     if not isinstance(loaded, dict):
         raise ValueError("Invalid inference bundle: expected dict payload.")
@@ -555,7 +619,7 @@ def load_bundle(path: str | Path) -> None:
     if SharedEncoder is None or SpeciesHead is None:
         raise RuntimeError("Training model classes are unavailable.")
 
-    encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim)
+    encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(_device)
     encoder.load_state_dict(loaded["encoder_state_dict"])
     encoder.eval()
     for p in encoder.parameters():
@@ -564,7 +628,7 @@ def load_bundle(path: str | Path) -> None:
 
     _heads = {}
     for sp_key, state in loaded["head_states"].items():
-        head = SpeciesHead(embed_dim=embed_dim)
+        head = SpeciesHead(embed_dim=embed_dim).to(_device)
         head.load_state_dict(state)
         head.eval()
         for p in head.parameters():
@@ -572,6 +636,7 @@ def load_bundle(path: str | Path) -> None:
         _heads[int(sp_key)] = head
 
     _cell_table = loaded.get("cell_table", {})
+    _cell_table = _move_cell_table_to_device(_cell_table, cell_table_device)
     _cell_size_deg = loaded.get("cell_size_deg", 0.25)
     _species_meta = loaded.get("species_meta", {})
     _feature_names = loaded.get("feature_names")
@@ -700,7 +765,7 @@ def predict(
     if cell is None:
         return []
 
-    features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0)
+    features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0).to(_device)
 
     with torch.no_grad():
         embedding = _encoder(features)  # (1, embed_dim)
@@ -855,10 +920,11 @@ def predict_heatmap(
     scores_list: list[float] = []
     with torch.no_grad():
         for start in range(0, len(valid_features), score_batch_size):
-            batch_features = torch.stack(valid_features[start : start + score_batch_size])
+            batch_slice = [feat.to(_device) for feat in valid_features[start : start + score_batch_size]]
+            batch_features = torch.stack(batch_slice)
             embeddings = _encoder(batch_features)
             logits = head(embeddings)
-            scores_list.extend(torch.sigmoid(logits).tolist())
+            scores_list.extend(torch.sigmoid(logits).cpu().tolist())
 
     cells_out: list[dict[str, Any]] = []
     for idx, score in zip(valid_indices, scores_list):
@@ -981,10 +1047,11 @@ def predict_heatmap_stream(
 
                 scores_list: list[float] = []
                 for start in range(0, len(valid_features), score_batch_size):
-                    batch_features = torch.stack(valid_features[start : start + score_batch_size])
+                    batch_slice = [feat.to(_device) for feat in valid_features[start : start + score_batch_size]]
+                    batch_features = torch.stack(batch_slice)
                     embeddings = encoder(batch_features)
                     logits = head(embeddings)
-                    scores_list.extend(torch.sigmoid(logits).tolist())
+                    scores_list.extend(torch.sigmoid(logits).cpu().tolist())
 
                 for idx, score in zip(valid_indices, scores_list):
                     if cancel_check is not None and cancel_check():
@@ -1048,7 +1115,7 @@ def predict_batch(
             if cell is None:
                 continue
 
-            features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0)
+            features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0).to(_device)
             embedding = _encoder(features)
 
             results = _score_heads(

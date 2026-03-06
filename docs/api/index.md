@@ -13,6 +13,14 @@ These endpoints require an inference bundle to be loaded at startup. Set the
 `WHEREWILD_INFERENCE_BUNDLE` env var, or place the bundle at
 `checkpoints/inference_bundle.pt`.
 
+Runtime device env vars:
+
+- `WHEREWILD_INFERENCE_DEVICE`: `auto` (default), `cpu`, `cuda`.
+  `auto` uses CUDA when available, else CPU.
+- `WHEREWILD_INFERENCE_CELL_TABLE_DEVICE`: `auto` (default), `cpu`, `cuda`.
+  `auto` keeps `cell_table` on CPU.
+  `cuda` is allowed only when `WHEREWILD_INFERENCE_DEVICE=cuda`.
+
 ### `GET /api/predict`
 
 Predict species suitability for a single coordinate.

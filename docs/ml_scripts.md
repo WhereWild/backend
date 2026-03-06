@@ -312,6 +312,23 @@ WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
     uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+Runtime device env vars:
+
+- `WHEREWILD_INFERENCE_DEVICE`: `auto` (default), `cpu`, `cuda`.
+    `auto` uses CUDA when available, else CPU.
+- `WHEREWILD_INFERENCE_CELL_TABLE_DEVICE`: `auto` (default), `cpu`, `cuda`.
+    `auto` keeps `cell_table` on CPU.
+    `cuda` is allowed only when `WHEREWILD_INFERENCE_DEVICE=cuda`.
+
+Example forcing both inference compute and cell table to CUDA:
+
+```bash
+WHEREWILD_INFERENCE_DEVICE=cuda \
+WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
+    uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
 If serving from the GDAL Docker container, rebuild after dependency changes in
 `requirements.txt` (for example `torch` updates):
 
