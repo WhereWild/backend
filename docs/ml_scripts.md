@@ -319,12 +319,24 @@ Runtime device env vars:
 - `WHEREWILD_INFERENCE_CELL_TABLE_DEVICE`: `auto` (default), `cpu`, `cuda`.
     `auto` keeps `cell_table` on CPU.
     `cuda` is allowed only when `WHEREWILD_INFERENCE_DEVICE=cuda`.
+- `WHEREWILD_INFERENCE_SAMPLE_WORKERS`: integer `>=1` (default: `1`).
+    Controls parallel raster-layer sampling for heatmaps.
+    Keep at `1` unless benchmarked on your deployment.
+- `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
+    Controls sampling chunk size for `GET /api/predict/heatmap/stream`.
+    Independent from model scoring batch size.
+- `WHEREWILD_INFERENCE_PROFILE`: `0` (default) or `1`.
+    When set, `GET /api/predict/heatmap` includes a `profile` object with
+    stage timings.
 
 Example forcing both inference compute and cell table to CUDA:
 
 ```bash
 WHEREWILD_INFERENCE_DEVICE=cuda \
 WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
+WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
+WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
+WHEREWILD_INFERENCE_PROFILE=0 \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
     uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```

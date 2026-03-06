@@ -20,6 +20,15 @@ Runtime device env vars:
 - `WHEREWILD_INFERENCE_CELL_TABLE_DEVICE`: `auto` (default), `cpu`, `cuda`.
   `auto` keeps `cell_table` on CPU.
   `cuda` is allowed only when `WHEREWILD_INFERENCE_DEVICE=cuda`.
+- `WHEREWILD_INFERENCE_SAMPLE_WORKERS`: integer `>=1` (default: `1`).
+  Controls parallel raster-layer sampling for heatmaps.
+  Keep at `1` unless benchmarked on your deployment.
+- `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
+  Controls sampling chunk size for `GET /api/predict/heatmap/stream`.
+  This is independent from model scoring batch size.
+- `WHEREWILD_INFERENCE_PROFILE`: `0` (default) or `1`.
+  When set, `GET /api/predict/heatmap` includes a `profile` object with
+  stage timings (`lookup_ms`, `sample_ms`, `fallback_ms`, `score_ms`, `total_ms`).
 
 ### `GET /api/predict`
 
@@ -66,10 +75,11 @@ Compute a probability grid for one species over a bounding box.
 | `max_cells` | int | 20000 | Hard cap on output cells; oversized requests return 400. |
 
 All requested cells in the bbox are scored in vectorized batches.
-`feature_mode=prefer_cell_table` is the default stability mode and avoids
-over-aggressive sampled fallback by using precomputed native-cell features when
-available. When `include_source=true`, each returned cell may include `source`
-as `sampled` or `cell_table`.
+`feature_mode=auto` is the endpoint default.
+In `auto`, cell-table features are preferred at native/coarser resolutions;
+for finer-than-native requests, sampled GIS features are preferred with
+cell-table fallback for missing samples. When `include_source=true`, each
+returned cell may include `source` as `sampled` or `cell_table`.
 
 ### `GET /api/predict/heatmap/stream`
 

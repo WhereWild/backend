@@ -298,9 +298,18 @@ WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
 # Optional runtime device controls
 # Inference compute: auto|cpu|cuda (default: auto)
 # Cell table placement: auto|cpu|cuda (default: auto -> cpu)
+# Raster sampling workers: integer >=1 (default: 1)
+#   Keep this at 1 unless benchmarked on your machine; higher values can be slower.
+# Stream sampling chunk size: integer >=1 (default: 8192)
+#   Controls how many coords are sampled per stream chunk (independent of score batch size).
+# Heatmap profiling: 0|1 (default: 0)
+#   When enabled, /api/predict/heatmap includes a profile block with stage timings.
 # Note: cell-table cuda requires WHEREWILD_INFERENCE_DEVICE=cuda
 WHEREWILD_INFERENCE_DEVICE=cuda \
 WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
+WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
+WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
+WHEREWILD_INFERENCE_PROFILE=0 \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
   uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 
