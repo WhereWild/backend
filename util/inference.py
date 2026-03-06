@@ -89,6 +89,50 @@ def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None
     )
 
 
+def _sampled_feature_support_status() -> tuple[bool, str | None]:
+    """Return whether sampled GIS features can produce model-aligned inputs."""
+    if _feature_names is None:
+        return False, "bundle does not include feature_names required for sampled features"
+
+    raw_dim = _raw_feature_dim_from_names()
+    if raw_dim is None:
+        return False, "bundle does not include feature_names required for sampled features"
+    if raw_dim <= 0:
+        env_dim = len(_feature_names.get("env", []))
+        habitat_dim = len(_feature_names.get("habitat", []))
+        weather_dim = len(_feature_names.get("weather", []))
+        return (
+            False,
+            "bundle sampled feature template is empty "
+            f"(env={env_dim}, habitat={habitat_dim}, weather={weather_dim})",
+        )
+
+    alignable = raw_dim == _input_dim or 2 * raw_dim == _input_dim
+    if not alignable:
+        return (
+            False,
+            "sampled feature template does not align with model input width "
+            f"(raw_dim={raw_dim}, input_dim={_input_dim})",
+        )
+
+    try:
+        import rasterio  # noqa: F401
+    except ImportError:
+        return False, "rasterio is not installed, so GIS sampling is unavailable"
+
+    return True, None
+
+
+def _ensure_sampled_only_available(config: _HeatmapFeatureConfig) -> None:
+    """Raise a clear error when sampled-only mode cannot run."""
+    sampled_only_mode = config.sample_missing and not config.use_cell_table and not config.fallback_to_cell_table
+    if not sampled_only_mode:
+        return
+    sampled_ok, sampled_reason = _sampled_feature_support_status()
+    if not sampled_ok:
+        raise ValueError(f"sampled_only mode unavailable: {sampled_reason}")
+
+
 class _HeatmapFeatureConfig(NamedTuple):
     use_cell_table: bool
     sample_missing: bool
@@ -753,11 +797,13 @@ def predict_heatmap(
     if not coords:
         return empty_result
 
-    use_cell_table, sample_missing, fallback_to_cell_table = _resolve_heatmap_feature_mode(
+    feature_config = _resolve_heatmap_feature_mode(
         feature_mode,
         res,
         native,
     )
+    _ensure_sampled_only_available(feature_config)
+    use_cell_table, sample_missing, fallback_to_cell_table = feature_config
 
     # Reuse precomputed native-cell features when resolution is native/coarser;
     # batch sample GIS features for uncovered coordinates.
@@ -875,11 +921,13 @@ def predict_heatmap_stream(
         raise ValueError("score_batch_size must be > 0")
 
     coords, requested_cells = _build_heatmap_coords(bbox, res, max_cells)
-    use_cell_table, sample_missing, fallback_to_cell_table = _resolve_heatmap_feature_mode(
+    feature_config = _resolve_heatmap_feature_mode(
         feature_mode,
         res,
         native,
     )
+    _ensure_sampled_only_available(feature_config)
+    use_cell_table, sample_missing, fallback_to_cell_table = feature_config
 
     head = _heads[species_key]
     sample_chunk_size = max(score_batch_size, 2048)

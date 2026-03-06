@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import pyarrow.dataset as ds
 
@@ -31,10 +32,141 @@ except ImportError:
     from transform import classify_feature_name, is_numeric_arrow_type  # type: ignore[no-redef]
 
 
+def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
+    return {
+        "env": len(template.get("env", [])),
+        "habitat": len(template.get("habitat", [])),
+        "weather": len(template.get("weather", [])),
+    }
+
+
+def _format_feature_dims(dims: dict[str, int] | None) -> str:
+    if dims is None:
+        return "unknown"
+    return f"env={dims.get('env', 0)}, habitat={dims.get('habitat', 0)}, weather={dims.get('weather', 0)}"
+
+
+def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
+    """Read one row to infer vector widths for env/habitat/weather columns."""
+    vector_columns = ["env_features", "habitat_features", "weather_features"]
+    present_columns = [name for name in vector_columns if name in dataset.schema.names]
+    if not present_columns:
+        return None
+
+    row = dataset.head(1, columns=present_columns)
+    if row.num_rows == 0:
+        return None
+
+    dims = {"env": 0, "habitat": 0, "weather": 0}
+    column_to_group = {
+        "env_features": "env",
+        "habitat_features": "habitat",
+        "weather_features": "weather",
+    }
+    for column_name in present_columns:
+        values = row.column(column_name)[0].as_py() or []
+        dims[column_to_group[column_name]] = len(values)
+    return dims
+
+
+def _template_matches_dims(template: dict[str, list[str]], dims: dict[str, int] | None) -> bool:
+    if dims is None:
+        return True
+    counts = _template_counts(template)
+    for key, expected in dims.items():
+        if expected > 0 and counts.get(key, 0) != expected:
+            return False
+    return True
+
+
+def _load_catalog_feature_template() -> dict[str, list[str]] | None:
+    """Derive feature names from GIS catalog layer ids using classifier rules."""
+    project_root = Path(__file__).resolve().parents[3]
+    catalog_candidates = [
+        project_root / "config" / "gis" / "catalog.json",
+        project_root / "data" / "gis" / "catalog.json",
+    ]
+    catalog_path = next((path for path in catalog_candidates if path.exists()), None)
+    if catalog_path is None:
+        return None
+
+    try:
+        with open(catalog_path) as handle:
+            catalog = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    env: set[str] = set()
+    habitat: set[str] = set()
+    weather: set[str] = set()
+    for category in catalog.get("categories", []):
+        for layer in category.get("layers", []):
+            layer_id = layer.get("id")
+            if not isinstance(layer_id, str) or not layer_id:
+                continue
+            group = classify_feature_name(layer_id)
+            if group == "env":
+                env.add(layer_id)
+            elif group == "habitat":
+                habitat.add(layer_id)
+            elif group == "weather":
+                weather.add(layer_id)
+
+    template = {
+        "env": sorted(env),
+        "habitat": sorted(habitat),
+        "weather": sorted(weather),
+    }
+    return template if any(_template_counts(template).values()) else None
+
+
+def _find_matching_template_in_sibling_datasets(
+    output_root: Path,
+    dims: dict[str, int] | None,
+) -> dict[str, list[str]] | None:
+    """Look for a non-empty template in other local datasets with matching dims."""
+    project_root = Path(__file__).resolve().parents[3]
+    data_root = project_root / "data"
+    if not data_root.exists():
+        return None
+
+    target_meta = (output_root / "_meta" / "feature_template.json").resolve()
+    candidates = sorted(data_root.glob("species_observation*/_meta/feature_template.json"))
+    for candidate in candidates:
+        try:
+            if candidate.resolve() == target_meta:
+                continue
+        except OSError:
+            continue
+        template = _read_existing_template(candidate)
+        if template is None:
+            continue
+        if _template_matches_dims(template, dims):
+            return template
+    return None
+
+
+def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
+    if not template_path.exists():
+        return None
+    try:
+        with open(template_path) as handle:
+            raw: dict[str, Any] = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    template = {
+        "env": sorted(str(v) for v in raw.get("env", []) if isinstance(v, str) and v),
+        "habitat": sorted(str(v) for v in raw.get("habitat", []) if isinstance(v, str) and v),
+        "weather": sorted(str(v) for v in raw.get("weather", []) if isinstance(v, str) and v),
+    }
+    return template if any(_template_counts(template).values()) else None
+
+
 def _write_feature_template_from_output(output_root: Path) -> Path:
     """Rebuild and save feature template metadata from a written output dataset."""
     dataset = ds.dataset(output_root, format="parquet", partitioning="hive")
     schema = dataset.schema
+    feature_dims = _feature_dims_from_vectors(dataset)
 
     env: set[str] = set()
     habitat: set[str] = set()
@@ -51,26 +183,44 @@ def _write_feature_template_from_output(output_root: Path) -> Path:
         elif group == "weather":
             weather.add(field.name)
 
+    rebuilt_template = {
+        "env": sorted(env),
+        "habitat": sorted(habitat),
+        "weather": sorted(weather),
+    }
+
     meta_dir = output_root / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
     template_path = meta_dir / "feature_template.json"
+
+    if any(_template_counts(rebuilt_template).values()) and _template_matches_dims(rebuilt_template, feature_dims):
+        template_to_write = rebuilt_template
+    else:
+        existing_template = _read_existing_template(template_path)
+        if existing_template is not None and _template_matches_dims(existing_template, feature_dims):
+            template_to_write = existing_template
+        else:
+            sibling_template = _find_matching_template_in_sibling_datasets(output_root, feature_dims)
+            if sibling_template is not None:
+                template_to_write = sibling_template
+            else:
+                catalog_template = _load_catalog_feature_template()
+                if catalog_template is not None and _template_matches_dims(catalog_template, feature_dims):
+                    template_to_write = catalog_template
+                else:
+                    dims_text = _format_feature_dims(feature_dims)
+                    raise ValueError(
+                        "Unable to rebuild feature_template.json from output schema and no valid fallback was found "
+                        f"for feature dims={dims_text}."
+                    )
+
     with open(template_path, "w") as handle:
-        json.dump(
-            {
-                "env": sorted(env),
-                "habitat": sorted(habitat),
-                "weather": sorted(weather),
-            },
-            handle,
-            indent=2,
-        )
+        json.dump(template_to_write, handle, indent=2)
     return template_path
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Resume preprocessing from staging shards with explicit actions."
-    )
+    parser = argparse.ArgumentParser(description="Resume preprocessing from staging shards with explicit actions.")
     parser.add_argument(
         "--staging-dir",
         type=Path,
@@ -147,14 +297,12 @@ def main() -> int:
 
     output_root = args.output_root.resolve()
 
-    if not any(
-        [
-            args.resume_base_files,
-            args.resume_background_files,
-            args.resume_output_files,
-            args.resume_feature_template_file,
-        ]
-    ):
+    if not any([
+        args.resume_base_files,
+        args.resume_background_files,
+        args.resume_output_files,
+        args.resume_feature_template_file,
+    ]):
         print(
             "No resume actions requested. "
             "Use one or more of: --resume-base-files, --resume-background-files, "
@@ -224,8 +372,7 @@ def main() -> int:
             split_chunk_rows=args.background_split_chunk_rows,
         )
         print(
-            f"Background generation complete | rows: {generated_background_rows:,} | "
-            f"shards: {len(background_paths):,}"
+            f"Background generation complete | rows: {generated_background_rows:,} | shards: {len(background_paths):,}"
         )
 
     if args.resume_output_files:
