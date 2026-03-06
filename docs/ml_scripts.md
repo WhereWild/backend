@@ -33,7 +33,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data \
-    --output-root ./data/training_observation_smoke \
+    --output-root ./data/species_observation_canary_plants \
     --max-files 100 \
     --threads 8 \
     --overwrite-output
@@ -48,7 +48,7 @@ with `(cell_id, year_month)` conflicts excluded.
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data \
-    --output-root ./data/training_observation_smoke \
+    --output-root ./data/species_observation_canary_plants \
     --max-files 1000 \
     --threads 16 \
     --overwrite-output \
@@ -61,7 +61,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data \
-    --output-root ./data/species_observation_canary \
+    --output-root ./data/species_observation_canary_plants \
     --max-files 10000 \
     --threads 8 \
     --overwrite-output \
@@ -76,7 +76,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data \
-    --output-root ./data/species_observation_canary \
+    --output-root ./data/species_observation_canary_plants \
     --max-files 0 \
     --template-scan-max-files 50000 \
     --threads 8 \
@@ -174,7 +174,7 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
 ```bash
 uv run python scripts/machine_learning/validate_training_schema.py \
     --schema schemas/training_observation.schema.json \
-    --data ./data/training_observation_smoke \
+    --data ./data/species_observation_canary_plants \
     --partitioning hive \
     --allow-extra-columns
 ```
@@ -211,8 +211,8 @@ Current Stage B objective is masked reconstruction of observed feature values.
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary \
-    --output-dir ./checkpoints/encoder \
+    --data-root ./data/species_observation_canary_plants \
+    --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 32768
 ```
@@ -221,8 +221,8 @@ On CPU (slower, no AMP):
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary \
-    --output-dir ./checkpoints/encoder \
+    --data-root ./data/species_observation_canary_plants \
+    --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 2048 \
     --device cpu \
@@ -233,17 +233,17 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py heads \
-    --data-root ./data/species_observation_canary \
-    --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
-    --output-dir ./checkpoints/heads
+    --data-root ./data/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --output-dir ./checkpoints/canary_plants/heads
 ```
 
 ### Both stages sequentially
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py all \
-    --data-root ./data/species_observation_canary \
-    --output-dir ./checkpoints \
+    --data-root ./data/species_observation_canary_plants \
+    --output-dir ./checkpoints/canary_plants \
     --epochs 50 \
     --head-epochs 50 \
     --batch-size 32768
@@ -276,10 +276,10 @@ Package the trained model into a single `.pt` file for server-side deployment:
 
 ```bash
 uv run python scripts/machine_learning/train/export.py \
-    --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
-    --heads-checkpoint ./checkpoints/heads/species_heads.pt \
-    --data-root ./data/species_observation_canary \
-    --output ./checkpoints/inference_bundle.pt
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
+    --data-root ./data/species_observation_canary_plants \
+    --output ./checkpoints/canary_plants/inference_bundle.pt
 ```
 
 The bundle contains:
@@ -301,14 +301,14 @@ catalog.
 ```python
 from util.inference import load_bundle, predict
 
-load_bundle("checkpoints/inference_bundle.pt")
+load_bundle("checkpoints/canary_plants/inference_bundle.pt")
 results = predict(lat=25.0, lon=-100.0, top_k=10)
 ```
 
 ### Start the FastAPI server
 
 ```bash
-WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
+WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
     uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -352,8 +352,8 @@ for each trial and ranking by median species validation loss:
 
 ```bash
 uv run python -m scripts.machine_learning.sweep_head_training \
-    --data-root ./data/species_observation_canary \
-    --encoder-checkpoint ./checkpoints/canary_cactus/encoder/encoder_best.pt \
+    --data-root ./data/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-root ./tmp/head_sweep \
     --head-lr-grid 0.01,0.005,0.001 \
     --head-weight-decay-grid 0.001,0.0003,0.0001 \
