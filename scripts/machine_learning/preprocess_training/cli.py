@@ -66,13 +66,6 @@ def parse_args() -> argparse.Namespace:
         help="Max rows per output parquet file in final partitioned dataset.",
     )
     parser.add_argument(
-        "--partition-mode",
-        type=str,
-        default="split/year_month/region_id",
-        choices=["split", "split/year_month", "split/year_month/region_id"],
-        help=("Partition columns for final dataset write. Coarser modes reduce file counts."),
-    )
-    parser.add_argument(
         "--drop-missing-time",
         action="store_true",
         help="Drop rows with missing/unparseable event time instead of keeping fallback 1970-01 timestamps.",

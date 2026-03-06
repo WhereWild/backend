@@ -50,16 +50,43 @@ def _raw_feature_dim_from_names() -> int | None:
     """Return raw feature dimension from feature names when available."""
     if _feature_names is None:
         return None
-    return len(_feature_names.get("env", [])) + len(_feature_names.get("habitat", [])) + len(
-        _feature_names.get("weather", [])
+    return (
+        len(_feature_names.get("env", []))
+        + len(_feature_names.get("habitat", []))
+        + len(_feature_names.get("weather", []))
     )
 
 
-def _encode_input_with_optional_mask(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Build encoder input tensor, concatenating masks when expected by model."""
-    if _model_uses_mask:
-        return torch.cat([features, mask], dim=0)
-    return features
+def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Coerce feature payload to the encoder input width.
+
+    Supports both bundle formats:
+    - already-concatenated model inputs (features width == input_dim),
+    - raw features plus a separate mask (features+mask width == input_dim).
+
+    Raises ``ValueError`` when the payload cannot be aligned to ``_input_dim``.
+    """
+    if _input_dim <= 0:
+        raise ValueError("_input_dim not set; call load_bundle() first")
+    if not isinstance(features, torch.Tensor) or features.ndim != 1:
+        raise ValueError(
+            f"model features must be a 1-d torch.Tensor; got {type(features).__name__} "
+            f"with ndim={getattr(features, 'ndim', '?')}"
+        )
+
+    feat = features.to(dtype=torch.float32)
+    if int(feat.shape[0]) == _input_dim:
+        return feat
+
+    if isinstance(mask, torch.Tensor) and mask.ndim == 1:
+        mask_t = mask.to(dtype=torch.float32)
+        if int(feat.shape[0] + mask_t.shape[0]) == _input_dim:
+            return torch.cat([feat, mask_t], dim=0)
+
+    raise ValueError(
+        f"cannot align features ({feat.shape[0]}) + mask ({mask.shape[0] if isinstance(mask, torch.Tensor) else 'None'}) "
+        f"to input_dim={_input_dim}"
+    )
 
 
 class _HeatmapFeatureConfig(NamedTuple):
@@ -306,7 +333,7 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
     feat_t = torch.tensor(features, dtype=torch.float32)
     mask_t = torch.tensor(mask, dtype=torch.float32)
     feat_t[mask_t > 0.5] = 0.0
-    model_input = _encode_input_with_optional_mask(feat_t, mask_t)
+    model_input = _coerce_model_input(feat_t, mask_t)
     return {"features": model_input, "mask": mask_t}
 
 
@@ -449,13 +476,13 @@ def _batch_sample_features(
         ft = torch.tensor(features, dtype=torch.float32)
         mt = torch.tensor(mask, dtype=torch.float32)
         ft[mt > 0.5] = 0.0
-        model_input = _encode_input_with_optional_mask(ft, mt)
 
         # Skip if every static feature is missing (e.g. ocean).
         static_missing = sum(mask[: len(env_names) + len(habitat_names)])
         if static_missing == len(env_names) + len(habitat_names):
             out.append(None)
         else:
+            model_input = _coerce_model_input(ft, mt)
             out.append({"features": model_input, "mask": mt})
     return out
 
@@ -525,6 +552,25 @@ def load_bundle(path: str | Path) -> None:
             else:
                 normalized_table[cid] = payload
         _cell_table = normalized_table
+
+    # Validate every cell in the table can be coerced to _input_dim.
+    bad_cells: list[str] = []
+    for cid, payload in _cell_table.items():
+        cell_feat = payload.get("features")
+        if not isinstance(cell_feat, torch.Tensor) or cell_feat.ndim != 1:
+            bad_cells.append(cid)
+            continue
+        width = int(cell_feat.shape[0])
+        if width != _input_dim:
+            cell_mask = payload.get("mask")
+            mask_width = int(cell_mask.shape[0]) if isinstance(cell_mask, torch.Tensor) and cell_mask.ndim == 1 else 0
+            if width + mask_width != _input_dim:
+                bad_cells.append(cid)
+    if bad_cells:
+        raise ValueError(
+            f"{len(bad_cells):,} cell(s) in bundle have incompatible feature width "
+            f"(expected {_input_dim}); first bad cell: {bad_cells[0]}"
+        )
 
 
 def is_loaded() -> bool:
@@ -610,7 +656,7 @@ def predict(
     if cell is None:
         return []
 
-    features = cell["features"].unsqueeze(0)  # (1, input_dim)
+    features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0)
 
     with torch.no_grad():
         embedding = _encoder(features)  # (1, embed_dim)
@@ -724,7 +770,7 @@ def predict_heatmap(
         if use_cell_table:
             cell = _cell_table.get(_bin_id(lat, lon, native))
             if cell is not None:
-                features_per_coord[i] = cell["features"]
+                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
                 feature_source_per_coord[i] = "cell_table"
                 continue
         missing_indices.append(i)
@@ -747,20 +793,14 @@ def predict_heatmap(
             lat, lon = coords[i]
             cell = _cell_table.get(_bin_id(lat, lon, native))
             if cell is not None:
-                features_per_coord[i] = cell["features"]
+                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
                 feature_source_per_coord[i] = "cell_table"
 
     valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
     if not valid_indices:
         return empty_result
 
-    valid_features: list[torch.Tensor] = []
-    for i in valid_indices:
-        feat = features_per_coord[i]
-        if feat is None:
-            continue
-        valid_features.append(feat)
-
+    valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
     if not valid_features:
         return empty_result
 
@@ -860,7 +900,7 @@ def predict_heatmap_stream(
                     if use_cell_table:
                         cell = _cell_table.get(_bin_id(lat, lon, native))
                         if cell is not None:
-                            features_per_coord[i] = cell["features"]
+                            features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
                             feature_source_per_coord[i] = "cell_table"
                             continue
                     missing_indices.append(i)
@@ -880,19 +920,14 @@ def predict_heatmap_stream(
                         lat, lon = chunk_coords[i]
                         cell = _cell_table.get(_bin_id(lat, lon, native))
                         if cell is not None:
-                            features_per_coord[i] = cell["features"]
+                            features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
                             feature_source_per_coord[i] = "cell_table"
 
                 valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
                 if not valid_indices:
                     continue
 
-                valid_features: list[torch.Tensor] = []
-                for i in valid_indices:
-                    feat = features_per_coord[i]
-                    if feat is not None:
-                        valid_features.append(feat)
-
+                valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
                 if not valid_features:
                     continue
 
@@ -965,7 +1000,7 @@ def predict_batch(
             if cell is None:
                 continue
 
-            features = cell["features"].unsqueeze(0)
+            features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0)
             embedding = _encoder(features)
 
             results = _score_heads(

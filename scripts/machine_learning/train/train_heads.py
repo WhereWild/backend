@@ -232,6 +232,9 @@ def train_species_heads(
     Returns:
         Path to saved heads checkpoint.
     """
+    if min_positives < 1:
+        raise ValueError("min_positives must be >= 1")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -333,10 +336,8 @@ def train_species_heads(
     total_start = time.perf_counter()
 
     for idx, sp_key in enumerate(eligible):
-        train_range = train_ranges.get(int(sp_key))
-        if train_range is None:
-            continue
-        train_start, train_end = train_range
+        assert int(sp_key) in train_ranges, "eligible species must exist in train_ranges"
+        train_start, train_end = train_ranges[int(sp_key)]
         train_idx = train_order[train_start:train_end]
 
         sp_z_np = np.asarray(train_z[train_idx], dtype=np.float32)
@@ -352,7 +353,7 @@ def train_species_heads(
         n_pos = int(pos_mask.sum().item())
         n_unl = int(unl_mask.sum().item())
 
-        if n_pos == 0 or n_unl == 0:
+        if n_unl == 0:
             continue
 
         n_species_rows = n_pos + n_unl

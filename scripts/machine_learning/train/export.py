@@ -22,6 +22,8 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 import torch
 
 try:
@@ -29,7 +31,12 @@ try:
 except ImportError:
     from _compat import import_local_symbol
 
-TrainingDataset = import_local_symbol("data", "TrainingDataset")
+FEATURE_COLUMNS = import_local_symbol("data", "FEATURE_COLUMNS")
+MASK_COLUMNS = import_local_symbol("data", "MASK_COLUMNS")
+_list_column_to_2d_numpy = import_local_symbol("data", "_list_column_to_2d_numpy")
+
+_EXPORT_SCAN_BATCH_ROWS = 65_536
+_EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
 
 
 def build_cell_table(
@@ -41,39 +48,63 @@ def build_cell_table(
     model was trained on.  For cells with multiple observations the
     feature values are averaged, giving a representative "cell profile".
     """
+    dataset = ds.dataset(str(data_root), format="parquet", partitioning="hive")
+
     # Accumulate per-cell sums across all splits.
-    cell_feat_sum: dict[str, np.ndarray] = defaultdict(lambda: np.zeros(0))
-    cell_mask_sum: dict[str, np.ndarray] = defaultdict(lambda: np.zeros(0))
+    cell_feat_sum: dict[str, np.ndarray] = {}
+    cell_mask_sum: dict[str, np.ndarray] = {}
     cell_count: dict[str, int] = defaultdict(int)
+    total_processed_rows = 0
+
+    columns = [*FEATURE_COLUMNS, *MASK_COLUMNS, "cell_id"]
 
     for split in ("train", "val", "test"):
-        try:
-            ds = TrainingDataset(data_root, split=split)
-        except (FileNotFoundError, OSError, ValueError, RuntimeError):
+        split_ds = dataset.filter(pc.field("split") == split)
+        split_rows = split_ds.count_rows()
+        if split_rows <= 0:
             continue
 
-        features = ds.recon_target.numpy().astype(np.float64, copy=False)
-        masks = ds.masks.numpy().astype(np.float64, copy=False)
-        cell_ids = np.asarray(ds.cell_ids, dtype=str)
+        print(f"  Split {split}: scanning {split_rows:,} rows...")
+        scanner = split_ds.scanner(columns=columns, batch_size=_EXPORT_SCAN_BATCH_ROWS)
+        split_seen_rows = 0
 
-        if len(cell_ids) == 0:
-            continue
+        for record_batch in scanner.to_batches():
+            if record_batch.num_rows == 0:
+                continue
 
-        unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
-        split_feat_sum = np.zeros((len(unique_ids), features.shape[1]), dtype=np.float64)
-        split_mask_sum = np.zeros((len(unique_ids), masks.shape[1]), dtype=np.float64)
-        split_count = np.bincount(inverse, minlength=len(unique_ids)).astype(np.int64)
+            feats: list[np.ndarray] = []
+            msks: list[np.ndarray] = []
+            for feat_col, mask_col in zip(FEATURE_COLUMNS, MASK_COLUMNS, strict=True):
+                feats.append(_list_column_to_2d_numpy(record_batch.column(feat_col), feat_col))
+                msks.append(_list_column_to_2d_numpy(record_batch.column(mask_col), mask_col))
+            features = np.concatenate(feats, axis=1).astype(np.float64, copy=False)
+            masks = np.concatenate(msks, axis=1).astype(np.float64, copy=False)
 
-        np.add.at(split_feat_sum, inverse, features)
-        np.add.at(split_mask_sum, inverse, masks)
+            cell_ids = np.asarray(record_batch.column("cell_id").to_numpy(zero_copy_only=False), dtype=str)
+            if cell_ids.size == 0:
+                continue
 
-        for idx, cid in enumerate(unique_ids):
-            if cell_feat_sum[cid].shape[0] == 0:
-                cell_feat_sum[cid] = np.zeros(features.shape[1], dtype=np.float64)
-                cell_mask_sum[cid] = np.zeros(masks.shape[1], dtype=np.float64)
-            cell_feat_sum[cid] += split_feat_sum[idx]
-            cell_mask_sum[cid] += split_mask_sum[idx]
-            cell_count[cid] += int(split_count[idx])
+            unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
+            batch_feat_sum = np.zeros((len(unique_ids), features.shape[1]), dtype=np.float64)
+            batch_mask_sum = np.zeros((len(unique_ids), masks.shape[1]), dtype=np.float64)
+            batch_count = np.bincount(inverse, minlength=len(unique_ids)).astype(np.int64)
+            np.add.at(batch_feat_sum, inverse, features)
+            np.add.at(batch_mask_sum, inverse, masks)
+
+            for idx, cid in enumerate(unique_ids.tolist()):
+                if cid not in cell_feat_sum:
+                    cell_feat_sum[cid] = np.zeros(features.shape[1], dtype=np.float64)
+                    cell_mask_sum[cid] = np.zeros(masks.shape[1], dtype=np.float64)
+                cell_feat_sum[cid] += batch_feat_sum[idx]
+                cell_mask_sum[cid] += batch_mask_sum[idx]
+                cell_count[cid] += int(batch_count[idx])
+
+            split_seen_rows += int(record_batch.num_rows)
+            total_processed_rows += int(record_batch.num_rows)
+            if total_processed_rows % _EXPORT_PROGRESS_EVERY_ROWS < int(record_batch.num_rows):
+                print(f"    Processed rows so far: {total_processed_rows:,}")
+
+        print(f"  Split {split}: processed {split_seen_rows:,} rows")
 
     result: dict[str, dict[str, torch.Tensor]] = {}
     for cid in cell_feat_sum:
@@ -128,15 +159,19 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
                 lid = layer.get("id", "")
                 name = lid.lower()
                 if name.startswith(("bio_", "climate_")) or name in {
-                    "elevation", "slope", "aspect", "aspect_deg",
+                    "elevation",
+                    "slope",
+                    "aspect",
+                    "aspect_deg",
                 }:
                     env.add(lid)
                 elif name.startswith(("habitat_", "landcover_", "ndvi", "canopy_", "terrain_")) or name in {
-                    "landcover", "koppen_geiger",
+                    "landcover",
+                    "koppen_geiger",
                 }:
                     habitat.add(lid)
         return {"env": sorted(env), "habitat": sorted(habitat), "weather": []}
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return None
 
 

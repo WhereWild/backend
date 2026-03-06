@@ -67,7 +67,6 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
     --overwrite-output \
     --background-ratio 1.0 \
     --template-scan-max-files 50000 \
-    --partition-mode split/year_month \
     --max-rows-per-file 500000 \
     --keep-staging
 ```
@@ -83,7 +82,6 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
     --threads 8 \
     --overwrite-output \
     --background-ratio 1.0 \
-    --partition-mode split/year_month \
     --max-rows-per-file 500000 \
     --keep-staging
 ```
@@ -103,10 +101,6 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Set `0.0` for positives-only debug runs.
 - `--template-scan-max-files`
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).
-- `--partition-mode`
-    - `split`: fewest partitions, usually fewest output files.
-    - `split/year_month`: good training default to reduce file counts while preserving time partitions.
-    - `split/year_month/region_id`: most granular; usually highest file counts.
 - `--warn-min-cells-per-species`
     - Logs warning lines when a species has too few unique cells in a shard (helps detect split brittleness).
 - `--final-write-batch-files`
@@ -128,22 +122,52 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
 
 If a long preprocess run finished transforms but stopped during
 "Generating pooled unlabeled/background rows..." or final write, you can resume
-without reprocessing all occurrence files:
+without reprocessing all occurrence files.
+
+`resume_from_staging` is explicit-action: by default it performs no work unless
+you pass one or more `--resume-*` flags.
+
+Resume base + background shards, write output partitions, then write template:
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
     --staging-dir ./data/.species_observation_canary_plants_staging \
     --output-root ./data/species_observation_canary_plants \
-    --partition-mode split \
+    --resume-base-files \
+    --resume-background-files \
+    --resume-output-files \
+    --resume-feature-template-file \
     --background-ratio 1.0 \
-    --background-split-chunk-rows 500000 \
-    --overwrite-output
+    --background-split-chunk-rows 500000
 ```
 
 Notes:
 
-- Use `--regenerate-background` if `background_pooled_*.parquet` files already exist in staging and you want a clean background rebuild.
+- `--resume-output-files` always clears the output directory before writing (full rewrite from staging).
+- Use `--regenerate-background` with `--resume-background-files` to delete and rebuild existing `background_pooled_*.parquet` shards.
 - Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
+- `--resume-output-files` requires selecting at least one staging file type via `--resume-base-files` and/or `--resume-background-files`.
+
+If you only need to (re)create metadata after a completed write:
+
+```bash
+uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
+    --output-root ./data/species_observation_canary_plants \
+    --resume-feature-template-file
+```
+
+If you only want to rebuild pooled background shards in staging (no final write):
+
+```bash
+uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
+    --staging-dir ./data/.species_observation_canary_plants_staging \
+    --output-root ./data/species_observation_canary_plants \
+    --resume-base-files \
+    --resume-background-files \
+    --regenerate-background \
+    --background-ratio 1.0 \
+    --background-split-chunk-rows 500000
+```
 
 ## 2. Validate output schema
 
@@ -179,7 +203,7 @@ Before starting model training, verify:
 
 ## 4. Train the model
 
-Requires the `ml` optional dependency group: `uv sync --extra ml`.
+Install training dependencies with: `uv sync --extra ml`.
 
 ### Stage B: Train shared encoder (self-supervised)
 
@@ -190,6 +214,7 @@ uv run python scripts/machine_learning/train/cli.py encoder \
     --data-root ./data/species_observation_canary \
     --output-dir ./checkpoints/encoder \
     --epochs 50 \
+    --batch-size 32768
 ```
 
 On CPU (slower, no AMP):
@@ -221,7 +246,7 @@ uv run python scripts/machine_learning/train/cli.py all \
     --output-dir ./checkpoints \
     --epochs 50 \
     --head-epochs 50 \
-    --batch-size 4096
+    --batch-size 32768
 ```
 
 ### Training flags
@@ -230,6 +255,9 @@ uv run python scripts/machine_learning/train/cli.py all \
 - `--hidden-dim`: encoder hidden layer dimension (default 256).
 - `--epochs`: encoder training epochs (default 50).
 - `--head-epochs`: epochs per species head (default 50).
+- `--batch-size`: shared batch-size flag.
+    - Stage B (`encoder`): encoder training mini-batch size (default 32768).
+    - Stage C (`heads`): embedding pass chunk size only; per-species head optimization is full-batch.
 - `--lr`: encoder peak learning rate (default 1e-3).
 - `--head-lr`: species head learning rate (default 1e-2).
 - `--recon-weight`: reconstruction loss weight for encoder pretraining.

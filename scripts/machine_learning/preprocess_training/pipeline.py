@@ -296,6 +296,39 @@ def print_failure_summary(failures: list[tuple[Path, str]], *, limit: int = 20) 
         print(f"  ... and {len(failures) - limit} more")
 
 
+def write_partitioned_dataset(
+    shard_paths: list[Path],
+    output_root: Path,
+    max_rows_per_file: int,
+) -> None:
+    """Write staging shards into a hive-partitioned parquet dataset."""
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    partition_schema = pa.schema([pa.field("split", pa.string())])
+
+    heartbeat_stop, heartbeat_thread = start_phase_heartbeat(
+        "Final write", PROGRESS_INTERVAL_SECONDS
+    )
+    try:
+        staged_dataset = ds.dataset(shard_paths, format="parquet")
+        ds.write_dataset(
+            data=staged_dataset,
+            base_dir=output_root,
+            format="parquet",
+            partitioning=ds.partitioning(partition_schema, flavor="hive"),
+            basename_template="part-{i}.parquet",
+            max_rows_per_file=max_rows_per_file,
+            max_rows_per_group=max_rows_per_file,
+            max_open_files=512,
+            max_partitions=8192,
+            use_threads=FINAL_WRITE_USE_THREADS,
+            existing_data_behavior="overwrite_or_ignore",
+        )
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
+
+
 def start_phase_heartbeat(label: str, interval_seconds: float) -> tuple[threading.Event, threading.Thread]:
     """Start a daemon heartbeat thread for long single-phase operations."""
     stop_event = threading.Event()
@@ -343,7 +376,6 @@ def run_preprocess(args) -> int:
     print(f"Background ratio: {args.background_ratio:.3f}")
     print(f"Background split chunk rows: {args.background_split_chunk_rows:,}")
     print(f"Warn min cells/species: {int(args.warn_min_cells_per_species)}")
-    print(f"Partition mode: {args.partition_mode}")
     print(f"Final write use threads: {FINAL_WRITE_USE_THREADS}")
     if args.static_context_template:
         print(f"Static context template: {args.static_context_template}")
@@ -506,49 +538,12 @@ def run_preprocess(args) -> int:
 
     print(f"Starting final dataset write from staging: {staging_dir}")
     write_start = time.perf_counter()
-    write_heartbeat_stop, write_heartbeat_thread = start_phase_heartbeat(
-        "Final write",
-        PROGRESS_INTERVAL_SECONDS,
+    print(f"Final write | shards: {len(staged_paths):,}")
+    write_partitioned_dataset(
+        staged_paths,
+        output_root=output_root,
+        max_rows_per_file=args.max_rows_per_file,
     )
-    try:
-        output_root.mkdir(parents=True, exist_ok=True)
-
-        partition_field_map = {
-            "split": ["split"],
-            "split/year_month": ["split", "year_month"],
-            "split/year_month/region_id": ["split", "year_month", "region_id"],
-        }
-        partition_fields = partition_field_map[args.partition_mode]
-        partition_schema = pa.schema([pa.field(field_name, pa.string()) for field_name in partition_fields])
-
-        # Write all staged shards in a single pass so PyArrow can merge rows
-        # from different shards into the same output file.  This avoids the
-        # small-file explosion that arises when batching: each batch previously
-        # produced its own part-{batch}-{i}.parquet files per partition, leading
-        # to O(n_shards × n_partitions) tiny files that are slow to scan during
-        # training.  PyArrow's writer manages open file handles internally via
-        # max_open_files, so no batching is needed here.
-        staged_dataset = ds.dataset(staged_paths, format="parquet")
-        print(f"Final write | shards: {len(staged_paths):,}")
-        ds.write_dataset(
-            data=staged_dataset,
-            base_dir=output_root,
-            format="parquet",
-            partitioning=ds.partitioning(
-                partition_schema,
-                flavor="hive",
-            ),
-            basename_template="part-{i}.parquet",
-            max_rows_per_file=args.max_rows_per_file,
-            max_rows_per_group=args.max_rows_per_file,
-            max_open_files=512,
-            max_partitions=8192,
-            use_threads=FINAL_WRITE_USE_THREADS,
-            existing_data_behavior="overwrite_or_ignore",
-        )
-    finally:
-        write_heartbeat_stop.set()
-        write_heartbeat_thread.join(timeout=2.0)
     write_seconds = time.perf_counter() - write_start
 
     print(f"Final dataset written to {output_root}")
