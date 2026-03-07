@@ -20,9 +20,11 @@ from __future__ import annotations
 import math
 import os
 import logging
+import queue
 import time
 from importlib import import_module
 from pathlib import Path
+from threading import Event, Thread
 from typing import Any, Callable, Iterator, NamedTuple
 
 import torch
@@ -48,6 +50,7 @@ _device: torch.device = torch.device("cpu")
 
 HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
+_QUEUE_PUT_POLL_SECONDS = 0.1
 LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
 
@@ -117,6 +120,18 @@ def _resolve_sample_chunk_size(score_batch_size: int) -> int:
     if requested < 1:
         raise ValueError("WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE must be >= 1")
     return max(score_batch_size, requested)
+
+
+def _resolve_stream_prefetch_chunks() -> int:
+    """Resolve how many prepared stream chunks can queue ahead."""
+    raw = os.environ.get("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS", "2").strip()
+    try:
+        requested = int(raw)
+    except ValueError as exc:
+        raise ValueError("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS must be an integer >= 1") from exc
+    if requested < 1:
+        raise ValueError("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS must be >= 1")
+    return requested
 
 
 def _close_dataset_cache(cache: dict[tuple[str, str], Any]) -> None:
@@ -1174,82 +1189,148 @@ def predict_heatmap_stream(
 
     head = _heads[species_key]
     sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
+    prefetch_chunks = _resolve_stream_prefetch_chunks()
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
     dem_dataset_cache: dict[tuple[str, str], Any] = {}
+
+    def _prepare_stream_chunk(
+        chunk_coords: list[tuple[float, float]],
+    ) -> tuple[list[tuple[float, float]], list[int], list[torch.Tensor], list[str | None]]:
+        """Resolve features for one stream chunk before model scoring."""
+        features_per_coord: list[torch.Tensor | None] = [None] * len(chunk_coords)
+        feature_source_per_coord: list[str | None] = [None] * len(chunk_coords)
+        missing_indices: list[int] = []
+        missing_coords: list[tuple[float, float]] = []
+
+        for i, (lat, lon) in enumerate(chunk_coords):
+            if use_cell_table:
+                cell = _cell_table.get(_bin_id(lat, lon, native))
+                if cell is not None:
+                    features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
+                    feature_source_per_coord[i] = "cell_table"
+                    continue
+            missing_indices.append(i)
+            missing_coords.append((lat, lon))
+
+        if sample_missing and missing_coords:
+            sampled = _batch_sample_features(
+                missing_coords,
+                raster_dataset_cache=raster_dataset_cache,
+                dem_dataset_cache=dem_dataset_cache,
+            )
+            for i, cell in zip(missing_indices, sampled):
+                if cell is not None:
+                    features_per_coord[i] = cell["features"]
+                    feature_source_per_coord[i] = "sampled"
+
+        if fallback_to_cell_table:
+            for i, feat in enumerate(features_per_coord):
+                if feat is not None:
+                    continue
+                lat, lon = chunk_coords[i]
+                cell = _cell_table.get(_bin_id(lat, lon, native))
+                if cell is not None:
+                    features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
+                    feature_source_per_coord[i] = "cell_table"
+
+        valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
+        valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
+        return chunk_coords, valid_indices, valid_features, feature_source_per_coord
 
     def _iter_cells() -> Iterator[dict[str, Any]]:
         """Yield scored cells chunk-by-chunk to keep streaming memory-bounded."""
         try:
             with torch.no_grad():
-                for chunk_start in range(0, len(coords), sample_chunk_size):
-                    if cancel_check is not None and cancel_check():
-                        return
-                    chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
-                    features_per_coord: list[torch.Tensor | None] = [None] * len(chunk_coords)
-                    feature_source_per_coord: list[str | None] = [None] * len(chunk_coords)
-                    missing_indices: list[int] = []
-                    missing_coords: list[tuple[float, float]] = []
+                # Producer/consumer queue allows multiple prepared chunks to
+                # stay ahead so raster reads overlap scoring and streaming.
+                chunk_queue: queue.Queue[
+                    tuple[list[tuple[float, float]], list[int], list[torch.Tensor], list[str | None]] | Exception | None
+                ] = queue.Queue(maxsize=prefetch_chunks)
+                stop_event = Event()
 
-                    for i, (lat, lon) in enumerate(chunk_coords):
-                        if use_cell_table:
-                            cell = _cell_table.get(_bin_id(lat, lon, native))
-                            if cell is not None:
-                                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                                feature_source_per_coord[i] = "cell_table"
-                                continue
-                        missing_indices.append(i)
-                        missing_coords.append((lat, lon))
-
-                    if sample_missing and missing_coords:
-                        sampled = _batch_sample_features(
-                            missing_coords,
-                            raster_dataset_cache=raster_dataset_cache,
-                            dem_dataset_cache=dem_dataset_cache,
-                        )
-                        for i, cell in zip(missing_indices, sampled):
-                            if cell is not None:
-                                features_per_coord[i] = cell["features"]
-                                feature_source_per_coord[i] = "sampled"
-
-                    if fallback_to_cell_table:
-                        for i, feat in enumerate(features_per_coord):
-                            if feat is not None:
-                                continue
-                            lat, lon = chunk_coords[i]
-                            cell = _cell_table.get(_bin_id(lat, lon, native))
-                            if cell is not None:
-                                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                                feature_source_per_coord[i] = "cell_table"
-
-                    valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
-                    if not valid_indices:
-                        continue
-
-                    valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
-                    if not valid_features:
-                        continue
-
-                    scores_list: list[float] = []
-                    for start in range(0, len(valid_features), score_batch_size):
-                        batch_slice = [feat.to(_device) for feat in valid_features[start : start + score_batch_size]]
-                        batch_features = torch.stack(batch_slice)
-                        embeddings = encoder(batch_features)
-                        logits = head(embeddings)
-                        scores_list.extend(torch.sigmoid(logits).cpu().tolist())
-
-                    for idx, score in zip(valid_indices, scores_list):
-                        if cancel_check is not None and cancel_check():
+                def _put_queue_item(item: Any) -> None:
+                    while True:
+                        if stop_event.is_set():
                             return
-                        lat, lon = chunk_coords[idx]
-                        cell_entry: dict[str, Any] = {
-                            "lat": round(lat, 4),
-                            "lon": round(lon, 4),
-                            "score": round(score, 6),
-                            "n_native": 1,
-                        }
-                        if include_source:
-                            cell_entry["source"] = feature_source_per_coord[idx] or "unknown"
-                        yield cell_entry
+                        try:
+                            chunk_queue.put(item, timeout=_QUEUE_PUT_POLL_SECONDS)
+                            return
+                        except queue.Full:
+                            continue
+
+                def _prefetch_chunks() -> None:
+                    try:
+                        for chunk_start in range(0, len(coords), sample_chunk_size):
+                            if stop_event.is_set():
+                                return
+                            if cancel_check is not None and cancel_check():
+                                return
+                            prepared = _prepare_stream_chunk(coords[chunk_start : chunk_start + sample_chunk_size])
+                            _put_queue_item(prepared)
+                    except Exception as exc:  # pragma: no cover - runtime guard
+                        _put_queue_item(exc)
+                    finally:
+                        _put_queue_item(None)
+
+                # Daemon so a stuck raster read can't prevent process exit
+                # under SIGTERM; normal path joins explicitly in the finally block.
+                prefetch_thread = Thread(target=_prefetch_chunks, name="wherewild-heatmap-prefetch", daemon=True)
+                prefetch_thread.start()
+                try:
+                    while True:
+                        if cancel_check is not None and cancel_check():
+                            stop_event.set()
+                            return
+
+                        item = chunk_queue.get()
+                        if item is None:
+                            return
+                        if isinstance(item, Exception):
+                            raise item
+
+                        chunk_coords, valid_indices, valid_features, feature_source_per_coord = item
+                        if not valid_features:
+                            continue
+
+                        scores_list: list[float] = []
+                        for start in range(0, len(valid_features), score_batch_size):
+                            batch_slice = [
+                                feat.to(_device) for feat in valid_features[start : start + score_batch_size]
+                            ]
+                            batch_features = torch.stack(batch_slice)
+                            embeddings = encoder(batch_features)
+                            logits = head(embeddings)
+                            scores_list.extend(torch.sigmoid(logits).cpu().tolist())
+
+                        for idx, score in zip(valid_indices, scores_list):
+                            if cancel_check is not None and cancel_check():
+                                stop_event.set()
+                                return
+                            lat, lon = chunk_coords[idx]
+                            cell_entry: dict[str, Any] = {
+                                "lat": round(lat, 4),
+                                "lon": round(lon, 4),
+                                "score": round(score, 6),
+                                "n_native": 1,
+                            }
+                            if include_source:
+                                cell_entry["source"] = feature_source_per_coord[idx] or "unknown"
+                            yield cell_entry
+                finally:
+                    stop_event.set()
+                    prefetch_thread.join(timeout=1.0)
+                    if prefetch_thread.is_alive():
+                        logging.warning(
+                            "wherewild-heatmap-prefetch thread did not terminate within 1s; "
+                            "waiting up to 5s more before closing dataset caches."
+                        )
+                        prefetch_thread.join(timeout=5.0)
+                        if prefetch_thread.is_alive():
+                            logging.error(
+                                "wherewild-heatmap-prefetch thread is still running after "
+                                "extended shutdown wait; proceeding to close dataset caches "
+                                "anyway."
+                            )
         finally:
             _close_dataset_cache(raster_dataset_cache)
             _close_dataset_cache(dem_dataset_cache)

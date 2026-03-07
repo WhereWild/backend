@@ -26,6 +26,9 @@ Runtime device env vars:
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
   Controls sampling chunk size for `GET /api/predict/heatmap/stream`.
   This is independent from model scoring batch size.
+- `WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS`: integer `>=1` (default: `2`).
+  Controls how many prepared stream chunks can queue ahead.
+  Increase for more read-ahead overlap (uses more memory).
 - `WHEREWILD_INFERENCE_PROFILE`: `0` (default) or `1`.
   When set, `GET /api/predict/heatmap` includes a `profile` object with
   stage timings (`lookup_ms`, `sample_ms`, `fallback_ms`, `score_ms`, `total_ms`).
