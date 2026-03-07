@@ -839,6 +839,12 @@ def load_bundle(path: str | Path) -> None:
             f"(expected {_input_dim}); first bad cell: {bad_cells[0]}"
         )
 
+    # Set up and auto-load reinforced heads.
+    from util import reinforcement
+
+    reinforcement.set_reinforced_dir(Path(path).resolve().parent / "reinforced_heads")
+    reinforcement.autoload_reinforced_heads()
+
 
 def is_loaded() -> bool:
     """True when a bundle has been successfully loaded."""
@@ -953,6 +959,7 @@ def predict_heatmap(
     feature_mode: str = "auto",
     max_cells: int | None = HEATMAP_DEFAULT_MAX_CELLS,
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
+    head_variant: str = "original",
 ) -> dict[str, Any]:
     """Compute a probability grid for a single species over a bounding box.
 
@@ -993,6 +1000,7 @@ def predict_heatmap(
         raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
     if species_key not in _heads:
         raise KeyError(f"Species {species_key} not in loaded bundle.")
+    head = get_head(species_key, head_variant)
 
     native = _cell_size_deg
     res = resolution if resolution is not None else native
@@ -1088,8 +1096,6 @@ def predict_heatmap(
     if not valid_features:
         return empty_result
 
-    head = _heads[species_key]
-
     scores_list: list[float] = []
     scoring_t0 = time.perf_counter() if profiling else 0.0
     with torch.no_grad():
@@ -1153,6 +1159,7 @@ def predict_heatmap_stream(
     max_cells: int | None = HEATMAP_DEFAULT_MAX_CELLS,
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
     cancel_check: Callable[[], bool] | None = None,
+    head_variant: str = "original",
 ) -> dict[str, Any]:
     """Stream a species heatmap as an iterator of scored cells.
 
@@ -1164,6 +1171,7 @@ def predict_heatmap_stream(
     if species_key not in _heads:
         raise KeyError(f"Species {species_key} not in loaded bundle.")
     encoder = _encoder
+    head = get_head(species_key, head_variant)
 
     native = _cell_size_deg
     res = resolution if resolution is not None else native
@@ -1186,8 +1194,6 @@ def predict_heatmap_stream(
     )
     _ensure_sampled_only_available(feature_config)
     use_cell_table, sample_missing, fallback_to_cell_table = feature_config
-
-    head = _heads[species_key]
     sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
     prefetch_chunks = _resolve_stream_prefetch_chunks()
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
@@ -1398,3 +1404,25 @@ def predict_batch(
                 output[idx] = results
 
     return output
+
+
+def get_head(species_key: int, variant: str = "original") -> torch.nn.Module:
+    """Return the requested head variant for a species.
+
+    Args:
+        species_key: GBIF species key.
+        variant: ``"original"`` or ``"reinforced"``.
+
+    Raises ValueError when ``variant`` is not ``original`` or ``reinforced``.
+    Raises KeyError when the species or requested reinforced head doesn't exist.
+    """
+    normalized_variant = variant.strip().lower()
+    if normalized_variant not in {"original", "reinforced"}:
+        raise ValueError("head_variant must be either 'original' or 'reinforced'")
+    if normalized_variant == "reinforced":
+        from util.reinforcement import get_reinforced_head
+
+        return get_reinforced_head(species_key)
+    if species_key not in _heads:
+        raise KeyError(f"Species {species_key} not in loaded bundle.")
+    return _heads[species_key]

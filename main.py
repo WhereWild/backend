@@ -7,7 +7,7 @@ import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, inference
+from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, inference, reinforcement
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -1150,6 +1150,7 @@ class HeatmapJobCreateRequest(BaseModel):
     include_source: bool = False
     feature_mode: str = "auto"
     max_cells: int = 20000
+    head_variant: Literal["original", "reinforced"] = "original"
 
 
 class HeatmapJobResponse(BaseModel):
@@ -1163,6 +1164,28 @@ class HeatmapJobResponse(BaseModel):
 class HeatmapJobDeleteResponse(BaseModel):
     job_id: str
     status: str
+
+
+class ReinforceFeedbackRequest(BaseModel):
+    species_key: int
+    lat: float
+    lon: float
+    present: bool
+    lr: float = 0.05
+    steps: int = 5
+
+
+class ReinforceFeedbackResponse(BaseModel):
+    species_key: int
+    feedback_count: int
+    point: dict
+    original_score: float
+    reinforced_score: float
+
+
+class ReinforcedSpeciesInfo(BaseModel):
+    species_key: int
+    feedback_count: int
 
 
 _heatmap_jobs_lock = threading.Lock()
@@ -1418,6 +1441,10 @@ def predict_species_heatmap(
         le=2_000_000,
         description="Hard cap on output heatmap cells to avoid OOM.",
     ),
+    head_variant: Literal["original", "reinforced"] = Query(
+        "original",
+        description="Head variant to score with: 'original' or 'reinforced'.",
+    ),
 ) -> PredictHeatmapResponse:
     """Compute a probability grid for one species over a bounding box.
 
@@ -1432,6 +1459,7 @@ def predict_species_heatmap(
         max_lat: Northern edge latitude.
         max_lon: Eastern edge longitude.
         resolution: Grid cell size in degrees (default: model native).
+        head_variant: 'original' or 'reinforced'.
 
     Returns:
         A dict containing species_key, bbox, resolution, cell count, and
@@ -1449,6 +1477,7 @@ def predict_species_heatmap(
             include_source=include_source,
             feature_mode=feature_mode,
             max_cells=max_cells,
+            head_variant=head_variant,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1480,6 +1509,10 @@ def predict_species_heatmap_stream(
         le=2_000_000,
         description="Hard cap on output heatmap cells to avoid OOM.",
     ),
+    head_variant: Literal["original", "reinforced"] = Query(
+        "original",
+        description="Head variant to score with: 'original' or 'reinforced'.",
+    ),
 ) -> StreamingResponse:
     """Stream heatmap cells as NDJSON.
 
@@ -1500,6 +1533,7 @@ def predict_species_heatmap_stream(
             include_source=include_source,
             feature_mode=feature_mode,
             max_cells=max_cells,
+            head_variant=head_variant,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1572,6 +1606,7 @@ def stream_predict_heatmap_job(job_id: str) -> StreamingResponse:
             feature_mode=params.get("feature_mode", "prefer_cell_table"),
             max_cells=params.get("max_cells", 20000),
             cancel_check=cancel_event.is_set,
+            head_variant=params.get("head_variant", "original"),
         )
     except KeyError as exc:
         with _heatmap_jobs_lock:
@@ -1648,6 +1683,107 @@ def predict_model_info() -> PredictInfoResponse:
         n_cells=inference.cell_count(),
         species_keys=inference.known_species(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Evaluative reinforcement endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/predict/reinforce", response_model=ReinforceFeedbackResponse)
+def submit_reinforcement_feedback(payload: ReinforceFeedbackRequest) -> ReinforceFeedbackResponse:
+    """Submit evaluative feedback to nudge a species head.
+
+    Creates a cloned head (or re-trains the existing clone from scratch on all
+    accumulated feedback) without touching the original weights.
+
+    Args:
+        payload: Species key, coordinate, present/absent label, and
+            optional learning rate / step count.
+
+    Returns:
+        Feedback count and comparative scores at the feedback point.
+    """
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    try:
+        result = reinforcement.reinforce_head(
+            payload.species_key,
+            payload.lat,
+            payload.lon,
+            payload.present,
+            lr=payload.lr,
+            steps=payload.steps,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ReinforceFeedbackResponse(**result)
+
+
+@app.get("/api/predict/reinforced")
+def list_reinforced_heads() -> list[ReinforcedSpeciesInfo]:
+    """List all species that have reinforced heads in memory."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    return [ReinforcedSpeciesInfo(**s) for s in reinforcement.list_reinforced_species()]
+
+
+@app.get("/api/predict/reinforced/{species_key}/feedback")
+def get_reinforcement_feedback(species_key: int) -> dict[str, Any]:
+    """Return the accumulated feedback log for a species."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    if species_key not in inference.known_species():
+        raise HTTPException(status_code=404, detail=f"Species {species_key} not in loaded bundle.")
+    fb = reinforcement.get_reinforcement_feedback(species_key)
+    return {"species_key": species_key, "feedback_count": len(fb), "feedback": fb}
+
+
+@app.delete("/api/predict/reinforced/{species_key}")
+def delete_reinforced_head(species_key: int) -> dict[str, Any]:
+    """Discard the reinforced head and all feedback for a species."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    existed = reinforcement.clear_reinforced_head(species_key)
+    if not existed:
+        raise HTTPException(status_code=404, detail=f"No reinforced head for species {species_key}.")
+    return {"species_key": species_key, "status": "cleared"}
+
+
+@app.post("/api/predict/reinforced/{species_key}/save")
+def save_reinforced_head(species_key: int) -> dict[str, Any]:
+    """Persist a reinforced head to the auto-persist location."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    path = reinforcement.default_reinforced_head_path(species_key)
+    if path is None:
+        raise HTTPException(status_code=500, detail="Reinforced head save directory not configured.")
+    try:
+        out = reinforcement.save_reinforced_head(species_key, path)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"species_key": species_key, "path": str(out), "status": "saved"}
+
+
+@app.post("/api/predict/reinforced/{species_key}/load")
+def load_reinforced_head(species_key: int) -> dict[str, Any]:
+    """Load a reinforced head from the auto-persist location."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    path = reinforcement.default_reinforced_head_path(species_key)
+    if path is None or not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No saved reinforced head found for species {species_key}.",
+        )
+    try:
+        result = reinforcement.load_reinforced_head(species_key, path)
+    except (KeyError, FileNotFoundError, ValueError) as exc:
+        status = 404 if isinstance(exc, (KeyError, FileNotFoundError)) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return {**result, "status": "loaded"}
 
 
 if __name__ == "__main__":
