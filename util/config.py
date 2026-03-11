@@ -114,6 +114,7 @@ class GlobalConfig:
 
     # API + aggregation behavior
     skip_description_outliers: bool = False
+    sdm_tile_size: int = 256
 
     # Enrichment
 
