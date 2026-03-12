@@ -1016,6 +1016,8 @@ def species_environment_slice(
         )
     value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
     raw_units = variable_entry.get("units")
+    min_value = units.convert_value_from_display(min_value, variable_id)
+    max_value = units.convert_value_from_display(max_value, variable_id)
     resolved_unit_system = units.normalize_unit_system(unit_system)
     if resolved_unit_system and raw_units:
         min_value = units.convert_value_from_system(min_value, raw_units, resolved_unit_system)

@@ -18,7 +18,7 @@ from rasterio.warp import reproject
 from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
 
 from util.config import load_config
-from util import gis_lookup
+from util import gis_lookup, units
 
 
 CONFIG = load_config("global")
@@ -382,19 +382,28 @@ def _finalize_layer_values(
     transform: rasterio.Affine,
     crs: Any,
 ) -> np.ndarray:
-    if layer_id not in DERIVED_FROM_DEM_IDS:
-        return layer_values
+    output_values = layer_values
 
-    slope_degrees, aspect_degrees = _derive_slope_aspect(
-        layer_values,
-        transform=transform,
-        crs=crs,
-    )
-    if layer_id == DERIVED_SLOPE_ID:
-        return slope_degrees
-    if layer_id == DERIVED_ASPECT_DEG_ID:
-        return aspect_degrees
-    return _aspect_degrees_to_bins(aspect_degrees)
+    if layer_id in DERIVED_FROM_DEM_IDS:
+        slope_degrees, aspect_degrees = _derive_slope_aspect(
+            layer_values,
+            transform=transform,
+            crs=crs,
+        )
+        if layer_id == DERIVED_SLOPE_ID:
+            output_values = slope_degrees
+        elif layer_id == DERIVED_ASPECT_DEG_ID:
+            output_values = aspect_degrees
+        else:
+            output_values = _aspect_degrees_to_bins(aspect_degrees)
+
+    scale = units.variable_display_scale(layer_id)
+    if scale != 1.0:
+        finite = np.isfinite(output_values)
+        if np.any(finite):
+            output_values = output_values.copy()
+            output_values[finite] = output_values[finite] * scale
+    return output_values
 
 
 def _render_layer_values(
@@ -633,6 +642,8 @@ def _units_default_numeric_range(units: str) -> tuple[float, float] | None:
         return (0.0, 360.0)
     if normalized in {"pa", "pascal", "pascals"}:
         return (0.0, 8000.0)
+    if normalized in {"w/m2", "wm-2", "w/m^2", "wattsperm2"}:
+        return (0.0, 400.0)
     if normalized in {"m/s", "ms⁻¹", "ms-1"}:
         return (0.0, 30.0)
     if normalized in {"kpa"}:
@@ -717,16 +728,23 @@ def _iter_layer_region_sources(
 
 @lru_cache(maxsize=128)
 def _global_numeric_range(layer_id: str) -> tuple[float, float] | None:
+    scale = units.variable_display_scale(layer_id)
     override = NUMERIC_RANGE_OVERRIDES.get(layer_id)
     if override is not None:
-        return _normalize_numeric_range(float(override[0]), float(override[1]))
+        lo, hi = _normalize_numeric_range(float(override[0]), float(override[1]))
+        if scale != 1.0:
+            lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+        return lo, hi
 
     layer_meta = _layer_metadata(layer_id)
     explicit_min = layer_meta.get("render_min")
     explicit_max = layer_meta.get("render_max")
     if explicit_min is not None and explicit_max is not None:
         try:
-            return _normalize_numeric_range(float(explicit_min), float(explicit_max))
+            lo, hi = _normalize_numeric_range(float(explicit_min), float(explicit_max))
+            if scale != 1.0:
+                lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+            return lo, hi
         except (TypeError, ValueError):
             pass
 
@@ -780,9 +798,16 @@ def _global_numeric_range(layer_id: str) -> tuple[float, float] | None:
         except Exception:
             continue
     if range_min is not None and range_max is not None:
-        return _normalize_numeric_range(range_min, range_max)
+        lo, hi = _normalize_numeric_range(range_min, range_max)
+        if scale != 1.0:
+            lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+        return lo, hi
 
-    return _units_default_numeric_range(str(layer_meta.get("units") or ""))
+    fallback = _units_default_numeric_range(str(layer_meta.get("units") or ""))
+    if fallback is None:
+        return None
+    lo, hi = _normalize_numeric_range(float(fallback[0]), float(fallback[1]))
+    return lo, hi
 
 
 def _colorize_numeric(values: np.ndarray, layer_id: str) -> np.ndarray:
