@@ -2687,6 +2687,135 @@ def _precipitation_status_rows(
     ]
 
 
+def _soil_texture_status_rows(
+    taxon: dict[str, Any],
+    taxon_dir: Path,
+    *,
+    taxon_id: Optional[int] = None,
+    location_gid: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
+) -> list[dict[str, Any]]:
+    _ = (taxon, unit_system)
+
+    def _mean_percent(variable_id: str) -> Optional[float]:
+        summary = _numeric_summary_for_context(
+            taxon_id=taxon_id,
+            taxon_dir=taxon_dir,
+            variable_id=variable_id,
+            location_gid=location_gid,
+        )
+        try:
+            mean_value = float(summary.get("mean"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(mean_value):
+            return None
+        scale = units.variable_display_scale(variable_id)
+        return mean_value * scale
+
+    def _nitrogen_phrase(percent_value: float) -> Optional[str]:
+        if percent_value < 0.05:
+            return "extremely nutrient poor"
+        if percent_value < 0.10:
+            return "very nutrient poor"
+        if percent_value < 0.20:
+            return "nutrient poor"
+        if percent_value < 0.50:
+            return None
+        if percent_value < 1.00:
+            return "nutrient rich"
+        if percent_value <= 2.00:
+            return "very nutrient rich"
+        return "extremely nutrient rich"
+
+    def _ph_label(ph_value: float) -> str:
+        if ph_value < 3.5:
+            return "ultra-acidic"
+        if ph_value <= 4.4:
+            return "extremely acidic"
+        if ph_value <= 5.0:
+            return "very strongly acidic"
+        if ph_value <= 5.5:
+            return "strongly acidic"
+        if ph_value <= 6.0:
+            return "moderately acidic"
+        if ph_value <= 6.5:
+            return "slightly acidic"
+        if ph_value <= 7.3:
+            return "neutral"
+        if ph_value <= 7.8:
+            return "slightly alkaline"
+        if ph_value <= 8.4:
+            return "moderately alkaline"
+        if ph_value <= 9.0:
+            return "strongly alkaline"
+        return "very strongly alkaline"
+
+    sand_pct = _mean_percent("sand")
+    silt_pct = _mean_percent("silt")
+    clay_pct = _mean_percent("clay")
+    coarse_fragments_pct = _mean_percent("cfvo")
+    nitrogen_pct = _mean_percent("nitrogen")
+    ph_value = _mean_percent("phh2o")
+    if sand_pct is None or silt_pct is None or clay_pct is None:
+        return []
+
+    components = [
+        ("sand", sand_pct),
+        ("silt", silt_pct),
+        ("clay", clay_pct),
+    ]
+    ranked = sorted(components, key=lambda item: item[1], reverse=True)
+    dominant_name, dominant_value = ranked[0]
+    second_value = ranked[1][1]
+    dominant_gap = dominant_value - second_value
+
+    descriptor = "balanced"
+    if dominant_value > 40 and dominant_gap >= 5:
+        intensity = "somewhat"
+        if dominant_value > 60:
+            intensity = "extremely"
+        elif dominant_value > 50:
+            intensity = "very"
+        adjective = {
+            "sand": "sandy",
+            "silt": "silty",
+            "clay": "clay-rich",
+        }.get(dominant_name, dominant_name)
+        descriptor = f"{intensity} {adjective}"
+
+    coarse_descriptor: Optional[str] = None
+    if coarse_fragments_pct is not None:
+        if coarse_fragments_pct > 28:
+            coarse_descriptor = "extremely coarse"
+        elif coarse_fragments_pct > 25:
+            coarse_descriptor = "very coarse"
+        elif coarse_fragments_pct > 20:
+            coarse_descriptor = "quite coarse"
+        elif coarse_fragments_pct > 17:
+            coarse_descriptor = "somewhat coarse"
+
+    texture_phrase = descriptor
+    if coarse_descriptor:
+        texture_phrase = f"{texture_phrase} with {coarse_descriptor} fragments"
+    detail_lines: list[str] = [f"Typically {texture_phrase} soil"]
+    if nitrogen_pct is not None:
+        nitrogen_phrase = _nitrogen_phrase(nitrogen_pct)
+        if nitrogen_phrase:
+            detail_lines.append(f"Typically {nitrogen_phrase} soil")
+    if ph_value is not None:
+        detail_lines.append(f"Typically {_ph_label(ph_value)} soil")
+    detail = "\n".join(detail_lines)
+    return [
+        {
+            "category": "soil",
+            "notable": False,
+            "level": None,
+            "detail": detail,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Annotation
 # ---------------------------------------------------------------------------
@@ -2931,6 +3060,13 @@ def build_taxon_description(
             unit_system=resolved_unit_system,
         )
         + _precipitation_status_rows(
+            taxon,
+            taxon_dir,
+            taxon_id=taxon_id,
+            location_gid=location_gid,
+            unit_system=resolved_unit_system,
+        )
+        + _soil_texture_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,
