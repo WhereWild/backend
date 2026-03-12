@@ -6,21 +6,21 @@ training, export, and inference.
 Optional shell shortcuts:
 
 ```bash
-alias ww-preprocess='uv run python scripts/machine_learning/preprocess_training/cli.py'
-alias ww-train='uv run python scripts/machine_learning/train/cli.py'
+alias ww-preprocess='uv run python -m scripts.machine_learning.preprocess_training.cli'
+alias ww-train='uv run python -m scripts.machine_learning.train.cli'
 ```
 
 ## Scripts
 
 - `scripts/machine_learning/preprocess_training/cli.py`
-    - Builds partitioned training parquet dataset from occurrence parquet files.
+    - Builds a split-partitioned training parquet dataset from occurrence parquet files.
     - Entry script for the split implementation in `pipeline.py` and `transform.py`.
 - `scripts/machine_learning/train/cli.py`
     - Trains the shared encoder (Stage B) and per-species PU heads (Stage C).
     - Entry script for `train_encoder.py`, `train_heads.py`, `model.py`, `losses.py`, `data.py`.
 - `scripts/machine_learning/train/export.py`
     - Packages the encoder, species heads, and a pre-computed geocell feature table into a single `.pt` inference bundle.
-    - Also embeds feature names so the inference engine can sample GIS rasters on the fly.
+    - Also embeds feature names so the inference engine can sample GIS rasters on the fly for catalog-backed groups and preserve the unsampleable `temporal` and `other` group widths.
 - `scripts/machine_learning/validate_training_schema.py`
     - Validates dataset schema compatibility against `schemas/training_observation.schema.json`.
 - `scripts/machine_learning/generate_training_schema_docs.py`
@@ -31,9 +31,9 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 ### Basic smoke run
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
-    --output-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
+    --input-root ./data/species/taxonomy/Plantae_6 \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 100 \
     --threads 8 \
     --overwrite-output
@@ -46,9 +46,9 @@ donor rows are sampled from other-species positives in the same split,
 with `(cell_id, year_month)` conflicts excluded.
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
-    --output-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
+    --input-root ./data/species/taxonomy/Plantae_6 \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 1000 \
     --threads 16 \
     --overwrite-output \
@@ -59,9 +59,9 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ### Large run (OOM-safer schema scan)
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
-    --output-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
+    --input-root ./data/species/taxonomy/Plantae_6 \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 10000 \
     --threads 8 \
     --overwrite-output \
@@ -74,9 +74,9 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ### Full-data run in WSL (OOM-aware)
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
-    --output-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
+    --input-root ./data/species/taxonomy/Plantae_6 \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 0 \
     --template-scan-max-files 50000 \
     --threads 8 \
@@ -113,10 +113,19 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Fail fast when a configured join source is missing or lacks required keys.
 - Auto context discovery
     - When explicit templates/paths are not set, the preprocessor looks for nearby context files in each occurrence directory.
+- Uncatalogued numeric columns
+    - Numeric columns from occurrence parquet files that are not represented in the GIS catalog are retained in `other_features`.
+    - Numeric columns from context parquet files that are not represented in the GIS catalog are skipped.
+    - The preprocessor logs warnings when uncatalogued numeric columns are encountered.
+    - The preprocessor also writes `_meta/uncatalogued_columns.json` under the dataset root with kept/skipped examples.
+- Feature grouping
+    - Catalog-backed numeric columns are grouped into `bioclimate_features`, `landclass_features`, `terrain_features`, `edaphic_features`, and `temporal_features`.
+    - Within each group, vector order comes from the discovered feature template written to `_meta/feature_template.json`.
+    - `other_features` retains uncatalogued numeric columns from occurrence parquet files only.
 
 ### Not implemented yet
 
-- Species-bucket partitioned view for per-species head training (`species_bucket`) is a separate derived-dataset step and is not implemented by the current preprocessing CLI.
+- Species-bucket or species-partitioned derived views for per-species head training (`species_bucket`) are separate derived-dataset steps and are not implemented by the current preprocessing CLI.
 
 ### Resume from staging after interrupted preprocess
 
@@ -131,10 +140,11 @@ Resume base + background shards, write output partitions, then write template:
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --staging-dir ./data/.species_observation_canary_plants_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --staging-dir ./data_ml/.species_observation_canary_plants_staging \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
+    --reuse-existing-background \
     --resume-output-files \
     --resume-feature-template-file \
     --background-ratio 1.0 \
@@ -145,6 +155,7 @@ Notes:
 
 - `--resume-output-files` always clears the output directory before writing (full rewrite from staging).
 - Use `--regenerate-background` with `--resume-background-files` to delete and rebuild existing `background_pooled_*.parquet` shards.
+- If background shards already exist in staging, the resume CLI requires either `--reuse-existing-background` or `--regenerate-background` when `--resume-background-files` is set.
 - Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
 - `--resume-output-files` requires selecting at least one staging file type via `--resume-base-files` and/or `--resume-background-files`.
 
@@ -152,7 +163,7 @@ If you only need to (re)create metadata after a completed write:
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-feature-template-file
 ```
 
@@ -160,8 +171,8 @@ If you only want to rebuild pooled background shards in staging (no final write)
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --staging-dir ./data/.species_observation_canary_plants_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --staging-dir ./data_ml/.species_observation_canary_plants_staging \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
     --regenerate-background \
@@ -172,23 +183,21 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
 ## 2. Validate output schema
 
 ```bash
-uv run python scripts/machine_learning/validate_training_schema.py \
+uv run python -m scripts.machine_learning.validate_training_schema \
     --schema schemas/training_observation.schema.json \
-    --data ./data/species_observation_canary_plants \
-    --partitioning hive \
+    --data ./data_ml/species_observation_canary_plants \
     --allow-extra-columns
 ```
 
 Notes:
 
-- Use `--partitioning hive` for partitioned datasets written as
-    `split=...`, `split=.../year_month=...`, or `split=.../year_month=.../region_id=...`.
+- The validator reads split-partitioned datasets written under `split=...` directories.
 - `fixed_size_list<float>` vectors are accepted as compatible with schema `list<float>`.
 
 ## 3. Regenerate schema docs
 
 ```bash
-uv run python scripts/machine_learning/generate_training_schema_docs.py
+uv run python -m scripts.machine_learning.generate_training_schema_docs
 ```
 
 ## Trainability checklist
@@ -200,6 +209,8 @@ Before starting model training, verify:
 - `train/val/test` splits are all present.
 - `year_month` coverage looks reasonable and not dominated by fallback timestamps.
 - Feature vectors are non-null and consistent in dimensionality.
+- Catalog-group widths in `_meta/feature_template.json` look reasonable for the source schemas you expect.
+- `other_features` width looks reasonable for the occurrence schema you expect.
 
 ## 4. Train the model
 
@@ -210,8 +221,8 @@ Install training dependencies with: `uv sync --extra ml`.
 Current Stage B objective is masked reconstruction of observed feature values.
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.train.cli encoder \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 32768
@@ -220,8 +231,8 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 On CPU (slower, no AMP):
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.train.cli encoder \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 2048 \
@@ -232,8 +243,8 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 ### Stage C: Train per-species PU heads
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py heads \
-    --data-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.train.cli heads \
+    --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-dir ./checkpoints/canary_plants/heads
 ```
@@ -241,8 +252,8 @@ uv run python scripts/machine_learning/train/cli.py heads \
 ### Both stages sequentially
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py all \
-    --data-root ./data/species_observation_canary_plants \
+uv run python -m scripts.machine_learning.train.cli all \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants \
     --epochs 50 \
     --head-epochs 50 \
@@ -275,10 +286,10 @@ uv run python scripts/machine_learning/train/cli.py all \
 Package the trained model into a single `.pt` file for server-side deployment:
 
 ```bash
-uv run python scripts/machine_learning/train/export.py \
+uv run python -m scripts.machine_learning.train.export \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output ./checkpoints/canary_plants/inference_bundle.pt
 ```
 
@@ -287,12 +298,12 @@ The bundle contains:
 - Encoder architecture config and weights.
 - Per-species head weights and metadata (prior, val_loss, counts).
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
-- Feature names per group (env, habitat, weather) so the inference engine can sample GIS rasters on the fly for arbitrary coordinates.
+- Feature names per group (env, habitat, weather, other). GIS sampling only reconstructs catalog-backed env/habitat features; weather and other are emitted as missing in sampled-only paths.
 
 The preprocessing step also writes `feature_template.json` under
 `<output-root>/_meta/`. Export reads this file automatically. If it is missing (e.g. older
-preprocessed datasets), export falls back to deriving feature names from the GIS
-catalog.
+preprocessed datasets), export falls back to deriving catalog-backed feature names from the GIS
+catalog; uncatalogued `other` names require the saved template.
 
 ## 6. Run inference / serve the API
 
@@ -385,7 +396,7 @@ for each trial and ranking by median species validation loss:
 
 ```bash
 uv run python -m scripts.machine_learning.sweep_head_training \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-root ./tmp/head_sweep \
     --head-lr-grid 0.01,0.005,0.001 \
@@ -396,7 +407,7 @@ uv run python -m scripts.machine_learning.sweep_head_training \
 The summary file is written to `./tmp/head_sweep/sweep_results.json`, including
 ranked trials and `best_trial`.
 
-Current best (canary_cactus, latest recorded `pass_f`):
+Current best (canary_plants, latest recorded `pass_f`):
 
 - `head_lr=0.0088`
 - `head_weight_decay=0.00055`

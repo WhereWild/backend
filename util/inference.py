@@ -29,6 +29,10 @@ from typing import Any, Callable, Iterator, NamedTuple
 
 import torch
 
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+_SAMPLED_FEATURE_GROUPS = _feature_contract.SAMPLED_FEATURE_GROUPS
+_UNSAMPLED_FEATURE_GROUPS = _feature_contract.UNSAMPLED_FEATURE_GROUPS
+
 # ---------------------------------------------------------------------------
 # Lazy import of model classes — avoids hard-wiring sys.path at module level.
 # The first call to ``load_bundle`` patches sys.path once.
@@ -53,6 +57,21 @@ HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
 _QUEUE_PUT_POLL_SECONDS = 0.1
 LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
+
+
+def _feature_group_names(group_name: str) -> list[str]:
+    """Return ordered feature names for one stored feature group."""
+    if _feature_names is None:
+        return []
+    return list(_feature_names.get(group_name, []))
+
+
+def _sampled_static_feature_names() -> list[str]:
+    """Return the concatenated GIS-sampleable feature names in model order."""
+    names: list[str] = []
+    for group_name in _SAMPLED_FEATURE_GROUPS:
+        names.extend(_feature_group_names(group_name))
+    return names
 
 
 def _resolve_inference_device() -> torch.device:
@@ -167,11 +186,8 @@ def _raw_feature_dim_from_names() -> int | None:
     """Return raw feature dimension from feature names when available."""
     if _feature_names is None:
         return None
-    return (
-        len(_feature_names.get("env", []))
-        + len(_feature_names.get("habitat", []))
-        + len(_feature_names.get("weather", []))
-    )
+    groups = (*_SAMPLED_FEATURE_GROUPS, *_UNSAMPLED_FEATURE_GROUPS)
+    return sum(len(_feature_names.get(group_name, [])) for group_name in groups)
 
 
 def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -215,12 +231,19 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
     if raw_dim is None:
         return False, "bundle does not include feature_names required for sampled features"
     if raw_dim <= 0:
-        env_dim = len(_feature_names.get("env", []))
-        habitat_dim = len(_feature_names.get("habitat", []))
-        weather_dim = len(_feature_names.get("weather", []))
+        bioclimate_dim = len(_feature_names.get("bioclimate", []))
+        landclass_dim = len(_feature_names.get("landclass", []))
+        terrain_dim = len(_feature_names.get("terrain", []))
+        edaphic_dim = len(_feature_names.get("edaphic", []))
+        temporal_dim = len(_feature_names.get("temporal", []))
+        other_dim = len(_feature_names.get("other", []))
         return (
             False,
-            f"bundle sampled feature template is empty (env={env_dim}, habitat={habitat_dim}, weather={weather_dim})",
+            "bundle sampled feature template is empty "
+            "("
+            f"bioclimate={bioclimate_dim}, landclass={landclass_dim}, terrain={terrain_dim}, "
+            f"edaphic={edaphic_dim}, temporal={temporal_dim}, other={other_dim}"
+            ")",
         )
 
     alignable = raw_dim == _input_dim or 2 * raw_dim == _input_dim
@@ -445,9 +468,9 @@ def _compute_dem_derived_single(lat: float, lon: float) -> dict[str, float]:
 def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | None:
     """Build a feature + mask vector for an arbitrary point from GIS rasters.
 
-    Static (env + habitat) features are sampled from local COG tiles.
-    Weather features are filled with zeros and marked entirely missing so
-    the model relies only on environmental context.
+    Static catalog-backed features are sampled from local COG tiles.
+    Temporal and other features are filled with zeros and marked entirely
+    missing so the model relies only on GIS-backed context.
     Returns ``None`` when feature names are unavailable or rasterio is
     not installed.
     """
@@ -458,37 +481,29 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
     except ImportError:
         return None
 
-    env_names: list[str] = _feature_names["env"]
-    habitat_names: list[str] = _feature_names["habitat"]
-    weather_dim: int = len(_feature_names.get("weather", []))
+    sampled_group_names = {group_name: _feature_group_names(group_name) for group_name in _SAMPLED_FEATURE_GROUPS}
+    temporal_dim: int = len(_feature_names.get("temporal", []))
+    other_dim: int = len(_feature_names.get("other", []))
 
-    needs_dem = _DEM_DERIVED & set(env_names)
+    needs_dem = _DEM_DERIVED & set(_sampled_static_feature_names())
     dem_vals = _compute_dem_derived_single(lat, lon) if needs_dem else {}
 
-    env_v: list[float] = []
-    env_m: list[float] = []
-    for name in env_names:
-        val = dem_vals.get(name) if name in _DEM_DERIVED else _sample_raster_value(name, lat, lon)
-        if val is None:
-            env_v.append(0.0)
-            env_m.append(1.0)
-        else:
-            env_v.append(val)
-            env_m.append(0.0)
+    features: list[float] = []
+    mask: list[float] = []
+    for group_name in _SAMPLED_FEATURE_GROUPS:
+        for name in sampled_group_names[group_name]:
+            val = dem_vals.get(name) if name in _DEM_DERIVED else _sample_raster_value(name, lat, lon)
+            if val is None:
+                features.append(0.0)
+                mask.append(1.0)
+            else:
+                features.append(val)
+                mask.append(0.0)
 
-    hab_v: list[float] = []
-    hab_m: list[float] = []
-    for name in habitat_names:
-        val = _sample_raster_value(name, lat, lon)
-        if val is None:
-            hab_v.append(0.0)
-            hab_m.append(1.0)
-        else:
-            hab_v.append(val)
-            hab_m.append(0.0)
-
-    features = env_v + hab_v + [0.0] * weather_dim
-    mask = env_m + hab_m + [1.0] * weather_dim
+    features.extend([0.0] * temporal_dim)
+    mask.extend([1.0] * temporal_dim)
+    features.extend([0.0] * other_dim)
+    mask.extend([1.0] * other_dim)
 
     feat_t = torch.tensor(features, dtype=torch.float32)
     mask_t = torch.tensor(mask, dtype=torch.float32)
@@ -640,13 +655,14 @@ def _batch_sample_features(
     except ImportError:
         return [None] * len(coords)
 
-    env_names: list[str] = _feature_names["env"]
-    habitat_names: list[str] = _feature_names["habitat"]
-    weather_dim: int = len(_feature_names.get("weather", []))
+    sampled_group_names = {group_name: _feature_group_names(group_name) for group_name in _SAMPLED_FEATURE_GROUPS}
+    temporal_dim: int = len(_feature_names.get("temporal", []))
+    other_dim: int = len(_feature_names.get("other", []))
     n_coords = len(coords)
 
     layer_vals: dict[str, list[float | None]] = {}
-    layer_names = [name for name in env_names if name not in _DEM_DERIVED] + list(habitat_names)
+    sampled_static_names = _sampled_static_feature_names()
+    layer_names = [name for name in sampled_static_names if name not in _DEM_DERIVED]
     sampling_workers = _resolve_sampling_workers()
 
     def _sample_layers(target_coords: list[tuple[float, float]], names: list[str]) -> dict[str, list[float | None]]:
@@ -702,7 +718,7 @@ def _batch_sample_features(
                 full_vals[global_idx] = vals[pos]
             layer_vals[name] = full_vals
 
-    needs_dem = _DEM_DERIVED & set(env_names)
+    needs_dem = _DEM_DERIVED & set(sampled_static_names)
     dem_results: list[dict[str, float]] = [{} for _ in range(n_coords)]
     if needs_dem and active_indices:
         dem_active = _batch_compute_dem_derived(active_coords, dem_dataset_cache=dem_dataset_cache)
@@ -711,36 +727,30 @@ def _batch_sample_features(
 
     out: list[dict[str, torch.Tensor] | None] = []
     for i in range(n_coords):
-        ev: list[float] = []
-        em: list[float] = []
-        for name in env_names:
-            val = dem_results[i].get(name) if name in _DEM_DERIVED else layer_vals[name][i]
-            if val is None:
-                ev.append(0.0)
-                em.append(1.0)
-            else:
-                ev.append(val)
-                em.append(0.0)
-        hv: list[float] = []
-        hm: list[float] = []
-        for name in habitat_names:
-            val = layer_vals[name][i]
-            if val is None:
-                hv.append(0.0)
-                hm.append(1.0)
-            else:
-                hv.append(val)
-                hm.append(0.0)
+        features: list[float] = []
+        mask: list[float] = []
+        for group_name in _SAMPLED_FEATURE_GROUPS:
+            for name in sampled_group_names[group_name]:
+                val = dem_results[i].get(name) if name in _DEM_DERIVED else layer_vals[name][i]
+                if val is None:
+                    features.append(0.0)
+                    mask.append(1.0)
+                else:
+                    features.append(val)
+                    mask.append(0.0)
 
-        features = ev + hv + [0.0] * weather_dim
-        mask = em + hm + [1.0] * weather_dim
+        features.extend([0.0] * temporal_dim)
+        mask.extend([1.0] * temporal_dim)
+        features.extend([0.0] * other_dim)
+        mask.extend([1.0] * other_dim)
         ft = torch.tensor(features, dtype=torch.float32)
         mt = torch.tensor(mask, dtype=torch.float32)
         ft[mt > 0.5] = 0.0
 
         # Skip if every static feature is missing (e.g. ocean).
-        static_missing = sum(mask[: len(env_names) + len(habitat_names)])
-        if static_missing == len(env_names) + len(habitat_names):
+        static_width = len(sampled_static_names)
+        static_missing = sum(mask[:static_width])
+        if static_missing == static_width:
             out.append(None)
         else:
             model_input = _coerce_model_input(ft, mt)

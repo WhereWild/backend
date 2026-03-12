@@ -7,12 +7,12 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 ## Storage
 
 - Format: `parquet`
-- Partition keys: `split`, `year_month`, `region_id`
+- Partition key: `split`
 - Compression: `zstd`
 
 ## Partitioning Guidance
 
-- Primary partitions are split/year_month/region_id for efficient spatiotemporal slicing and leakage-safe evaluation. Species partitioning is optional for derived head-training datasets (e.g., species_bucket) but not recommended as the base layout due to high cardinality and small-file risk.
+- Datasets use a split-only partition layout.
 
 ## Sampling Semantics
 
@@ -33,20 +33,26 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 | `presence_label` | `int8` | yes | `metadata` | 1 for positive, 0 for unlabeled/background sample. |
 | `sample_weight` | `float32` | yes | `metadata` | Row weight for PU learning / sampling correction. |
 | `cell_id` | `string` | yes | `metadata` | Spatial index cell id used to join environmental context. |
-| `region_id` | `string` | yes | `metadata` | Region/biome partition id for stratified splits and sampling. |
+| `region_id` | `string` | yes | `metadata` | Region/biome identifier retained for stratified analysis and sampling. |
 | `lat` | `float64` | yes | `metadata` | Latitude in WGS84 decimal degrees. |
 | `lon` | `float64` | yes | `metadata` | Longitude in WGS84 decimal degrees. |
 | `event_time_utc` | `timestamp_ms_utc` | yes | `metadata` | Observation/background timestamp in UTC used for weather alignment. |
-| `year_month` | `string` | yes | `metadata` | YYYY-MM partition key derived from event_time_utc. |
+| `year_month` | `string` | yes | `metadata` | YYYY-MM value derived from event_time_utc. |
 | `split` | `string` | yes | `metadata` | Dataset split label (train/val/test) from spatiotemporal splitter. |
 | `source` | `string` | yes | `metadata` | Data source tag (e.g., gbif, inat, generated_background). |
 | `feature_version` | `string` | yes | `metadata` | Version of feature engineering order and normalization. |
-| `env_features` | `list<float32>` | no | `input` | Dense static environmental feature vector (BIO, elevation, etc.). |
-| `env_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to env_features (1=missing, 0=observed). |
-| `habitat_features` | `list<float32>` | no | `input` | Dense habitat/landcover neighborhood feature vector. |
-| `habitat_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to habitat_features (1=missing, 0=observed). |
-| `weather_features` | `list<float32>` | no | `input` | Dense recent weather feature vector aligned to event_time_utc. |
-| `weather_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to weather_features (1=missing, 0=observed). |
+| `bioclimate_features` | `list<float32>` | no | `input` | Dense feature vector for catalog bioclimate layers observed in the source data. |
+| `bioclimate_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to bioclimate_features (1=missing, 0=observed). |
+| `landclass_features` | `list<float32>` | no | `input` | Dense feature vector for catalog landclass layers observed in the source data. |
+| `landclass_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to landclass_features (1=missing, 0=observed). |
+| `terrain_features` | `list<float32>` | no | `input` | Dense feature vector for catalog terrain layers observed in the source data. |
+| `terrain_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to terrain_features (1=missing, 0=observed). |
+| `edaphic_features` | `list<float32>` | no | `input` | Dense feature vector for catalog edaphic layers observed in the source data. |
+| `edaphic_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to edaphic_features (1=missing, 0=observed). |
+| `temporal_features` | `list<float32>` | no | `input` | Dense feature vector for catalog temporal layers observed in the source data. |
+| `temporal_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to temporal_features (1=missing, 0=observed). |
+| `other_features` | `list<float32>` | no | `input` | Dense feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files. |
+| `other_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to other_features (1=missing, 0=observed). |
 
 ## Validation
 

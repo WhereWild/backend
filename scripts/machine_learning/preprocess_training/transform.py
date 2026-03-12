@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import hashlib
+from importlib import import_module
 import re
 import threading
 import time
@@ -45,13 +47,27 @@ _EXCLUDED_FEATURE_COLUMNS = {
 _EXCLUDED_FEATURE_COLUMNS_LOWER = {name.lower() for name in _EXCLUDED_FEATURE_COLUMNS}
 _CONTEXT_LOAD_LOCKS: dict[str, threading.Lock] = {}
 _CONTEXT_LOAD_LOCKS_GUARD = threading.Lock()
+_WARNING_KEYS: set[str] = set()
+_WARNING_KEYS_GUARD = threading.Lock()
+_UNCATALOGUED_SUMMARY = {
+    "kept_occurrence": {},
+    "skipped_context": {},
+}
+_UNCATALOGUED_SUMMARY_GUARD = threading.Lock()
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+GROUP_TO_FEATURE_COLUMN = _feature_contract.GROUP_TO_FEATURE_COLUMN
+GROUP_TO_MASK_COLUMN = _feature_contract.GROUP_TO_MASK_COLUMN
 
 
 @dataclass(frozen=True)
 class FeatureGroups:
-    env: list[str]
-    habitat: list[str]
-    weather: list[str]
+    bioclimate: list[str]
+    landclass: list[str]
+    terrain: list[str]
+    edaphic: list[str]
+    temporal: list[str]
+    other: list[str]
 
 
 @dataclass(frozen=True)
@@ -63,6 +79,63 @@ class TransformResult:
     low_cell_warnings: list[str]
     static_context_rows: int
     temporal_context_rows: int
+
+
+@dataclass(frozen=True)
+class CatalogFeatureRules:
+    bioclimate_exact: frozenset[str]
+    landclass_exact: frozenset[str]
+    terrain_exact: frozenset[str]
+    edaphic_exact: frozenset[str]
+    temporal_exact: frozenset[str]
+    temporal_prefixes: tuple[str, ...]
+
+
+def warn_once(key: str, message: str) -> None:
+    """Print a warning message once per process for a stable warning key."""
+    with _WARNING_KEYS_GUARD:
+        if key in _WARNING_KEYS:
+            return
+        _WARNING_KEYS.add(key)
+    print(f"Warning: {message}")
+
+
+def reset_uncatalogued_summary() -> None:
+    """Clear process-local uncatalogued column warnings and summary state."""
+    with _WARNING_KEYS_GUARD:
+        _WARNING_KEYS.clear()
+    with _UNCATALOGUED_SUMMARY_GUARD:
+        _UNCATALOGUED_SUMMARY["kept_occurrence"].clear()
+        _UNCATALOGUED_SUMMARY["skipped_context"].clear()
+
+
+def record_uncatalogued_column(
+    *,
+    group: Literal["kept_occurrence", "skipped_context"],
+    column: str,
+    example_path: Path,
+) -> None:
+    """Store one uncatalogued column example for later metadata export."""
+    column_key = column.lower()
+    with _UNCATALOGUED_SUMMARY_GUARD:
+        entries: dict[str, dict[str, str]] = _UNCATALOGUED_SUMMARY[group]
+        if column_key in entries:
+            return
+        entries[column_key] = {
+            "column": column,
+            "example_path": str(example_path),
+        }
+
+
+def get_uncatalogued_summary() -> dict[str, list[dict[str, str]]]:
+    """Return a JSON-serializable summary of uncatalogued column handling."""
+    with _UNCATALOGUED_SUMMARY_GUARD:
+        kept = sorted(_UNCATALOGUED_SUMMARY["kept_occurrence"].values(), key=lambda item: item["column"].lower())
+        skipped = sorted(_UNCATALOGUED_SUMMARY["skipped_context"].values(), key=lambda item: item["column"].lower())
+    return {
+        "kept_occurrence": kept,
+        "skipped_context": skipped,
+    }
 
 
 def choose_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
@@ -180,6 +253,85 @@ def _context_lock_for_path(path_text: str) -> threading.Lock:
         return lock
 
 
+@lru_cache(maxsize=1)
+def _load_catalog_feature_rules() -> CatalogFeatureRules:
+    """Load GIS catalog-derived feature classification rules.
+
+    Catalog rules are the only source of truth for feature grouping.
+    """
+    project_root = Path(__file__).resolve().parents[3]
+    catalog_candidates = [
+        project_root / "config" / "gis" / "catalog.json",
+        project_root / "data" / "gis" / "catalog.json",
+    ]
+    catalog_path = next((path for path in catalog_candidates if path.exists()), None)
+    if catalog_path is None:
+        raise FileNotFoundError(
+            "Missing GIS catalog.json. Expected one of: " + ", ".join(str(path) for path in catalog_candidates)
+        )
+
+    try:
+        payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"Failed reading GIS catalog: {catalog_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in GIS catalog: {catalog_path}") from exc
+
+    bioclimate_exact: set[str] = set()
+    landclass_exact: set[str] = set()
+    terrain_exact: set[str] = set()
+    edaphic_exact: set[str] = set()
+    temporal_exact: set[str] = set()
+    temporal_prefixes: set[str] = set()
+
+    for category in payload.get("categories", []):
+        if not isinstance(category, dict):
+            continue
+        category_name = str(category.get("name", "")).strip().lower()
+        layers = category.get("layers", [])
+        if not isinstance(layers, list):
+            continue
+
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            layer_id = str(layer.get("id", "")).strip().lower()
+            if not layer_id:
+                continue
+
+            if category_name == "bioclimate":
+                bioclimate_exact.add(layer_id)
+            elif category_name == "landclass":
+                landclass_exact.add(layer_id)
+            elif category_name == "terrain":
+                terrain_exact.add(layer_id)
+            elif category_name == "temporal":
+                temporal_exact.add(layer_id)
+                temporal_prefixes.add(f"{layer_id}_")
+            elif category_name == "edaphic":
+                edaphic_exact.add(layer_id)
+
+    rules = CatalogFeatureRules(
+        bioclimate_exact=frozenset(bioclimate_exact),
+        landclass_exact=frozenset(landclass_exact),
+        terrain_exact=frozenset(terrain_exact),
+        edaphic_exact=frozenset(edaphic_exact),
+        temporal_exact=frozenset(temporal_exact),
+        temporal_prefixes=tuple(sorted(temporal_prefixes)),
+    )
+
+    if not (
+        rules.bioclimate_exact
+        or rules.landclass_exact
+        or rules.terrain_exact
+        or rules.edaphic_exact
+        or rules.temporal_exact
+    ):
+        raise ValueError(f"GIS catalog produced no feature rules: {catalog_path}")
+
+    return rules
+
+
 def load_context_features(
     context_path: Path,
     *,
@@ -210,6 +362,17 @@ def load_context_features(
         if not pd.api.types.is_numeric_dtype(frame[column]):
             continue
         if classify_feature_name(column) is None:
+            column_name = column.lower()
+            if column_name not in _EXCLUDED_FEATURE_COLUMNS_LOWER:
+                record_uncatalogued_column(
+                    group="skipped_context",
+                    column=column,
+                    example_path=context_path,
+                )
+                warn_once(
+                    key=f"uncatalogued-context:{column_name}",
+                    message=(f"uncatalogued numeric context column skipped | column={column} | example={context_path}"),
+                )
             continue
         selected.append(column)
 
@@ -394,47 +557,43 @@ def vector_from_columns(
     return values_array, mask_array
 
 
+def build_feature_group_arrays(
+    frame: pd.DataFrame,
+    *,
+    feature_template: FeatureGroups,
+    missing_sentinel: float,
+) -> tuple[list[pa.Array], list[str]]:
+    """Build feature-vector arrays and names in canonical group order."""
+    arrays: list[pa.Array] = []
+    names: list[str] = []
+    for group_name in FEATURE_GROUPS:
+        values, missing_mask = vector_from_columns(
+            frame,
+            getattr(feature_template, group_name),
+            missing_sentinel=missing_sentinel,
+        )
+        arrays.extend([values, missing_mask])
+        names.extend([GROUP_TO_FEATURE_COLUMN[group_name], GROUP_TO_MASK_COLUMN[group_name]])
+    return arrays, names
+
+
 def classify_feature_name(column_name: str) -> str | None:
-    """Classify numeric source column into env/habitat/weather feature groups."""
+    """Classify numeric source column into catalog-native feature groups."""
     name = column_name.lower()
     if name in _EXCLUDED_FEATURE_COLUMNS_LOWER:
         return None
 
-    if name.startswith(("bio_", "climate_")) or name in {
-        "elevation",
-        "slope",
-        "aspect",
-        "aspect_deg",
-    }:
-        return "env"
-
-    if name.startswith(("habitat_", "landcover_", "ndvi", "canopy_", "terrain_")) or name in {
-        "landcover",
-        "koppen_geiger",
-    }:
-        return "habitat"
-
-    if (
-        name.startswith((
-            "weather_",
-            "temp_",
-            "temperature_",
-            "precip_",
-            "precipitation_",
-            "wind_",
-            "humidity_",
-            "pressure_",
-            "cloud_cover_",
-            "snowfall_",
-            "snow_depth_",
-            "dew_point_",
-            "vapor_pressure_",
-            "soil_moisture_",
-            "soil_temperature_",
-        ))
-        or name == "weather_code_simple"
-    ):
-        return "weather"
+    catalog_rules = _load_catalog_feature_rules()
+    if name in catalog_rules.bioclimate_exact:
+        return "bioclimate"
+    if name in catalog_rules.landclass_exact:
+        return "landclass"
+    if name in catalog_rules.terrain_exact:
+        return "terrain"
+    if name in catalog_rules.edaphic_exact:
+        return "edaphic"
+    if name in catalog_rules.temporal_exact or any(name.startswith(prefix) for prefix in catalog_rules.temporal_prefixes):
+        return "temporal"
 
     return None
 
@@ -450,19 +609,60 @@ def build_feature_template(
     schema_log_interval_files: int,
     log_slow_read_seconds: float,
     template_scan_max_files: int,
+    static_context_template: str,
+    static_context_path: Path | None,
+    temporal_context_template: str,
+    temporal_context_path: Path | None,
 ) -> FeatureGroups:
     """Build one global feature layout to keep vector sizes consistent."""
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
+    other: set[str] = set()
 
     scan_files = files
     if template_scan_max_files > 0:
         scan_files = files[:template_scan_max_files]
         print(f"Schema scan selection | using {len(scan_files):,}/{len(files):,} files for feature template")
 
+    schema_paths: list[tuple[Path, str]] = []
+    seen_schema_paths: set[tuple[Path, str]] = set()
+
+    def add_schema_path(path: Path | None, source_kind: str) -> None:
+        if path is None or not path.exists():
+            return
+        resolved = path.resolve()
+        key = (resolved, source_kind)
+        if key in seen_schema_paths:
+            return
+        seen_schema_paths.add(key)
+        schema_paths.append((resolved, source_kind))
+
+    for path in scan_files:
+        add_schema_path(path, "occurrence")
+        add_schema_path(
+            resolve_context_path(
+                path,
+                template=static_context_template,
+                fixed_path=static_context_path,
+                context_kind="static",
+            ),
+            "static_context",
+        )
+        add_schema_path(
+            resolve_context_path(
+                path,
+                template=temporal_context_template,
+                fixed_path=temporal_context_path,
+                context_kind="temporal",
+            ),
+            "temporal_context",
+        )
+
     scan_start = time.perf_counter()
-    for index, path in enumerate(scan_files, start=1):
+    for index, (path, source_kind) in enumerate(schema_paths, start=1):
         schema_start = time.perf_counter()
         schema = pq.read_schema(path)
         schema_seconds = time.perf_counter() - schema_start
@@ -474,21 +674,53 @@ def build_feature_template(
             if not is_numeric_arrow_type(field.type):
                 continue
             feature_group = classify_feature_name(field.name)
-            if feature_group == "env":
-                env.add(field.name)
-            elif feature_group == "habitat":
-                habitat.add(field.name)
-            elif feature_group == "weather":
-                weather.add(field.name)
+            if feature_group == "bioclimate":
+                bioclimate.add(field.name)
+            elif feature_group == "landclass":
+                landclass.add(field.name)
+            elif feature_group == "terrain":
+                terrain.add(field.name)
+            elif feature_group == "edaphic":
+                edaphic.add(field.name)
+            elif feature_group == "temporal":
+                temporal.add(field.name)
+            elif field.name.lower() not in _EXCLUDED_FEATURE_COLUMNS_LOWER:
+                if source_kind == "occurrence":
+                    other.add(field.name)
+                    record_uncatalogued_column(
+                        group="kept_occurrence",
+                        column=field.name,
+                        example_path=path,
+                    )
+                    warn_once(
+                        key=f"uncatalogued-occurrence:{field.name.lower()}",
+                        message=(
+                            "uncatalogued numeric observation column kept in other_features "
+                            f"| column={field.name} | example={path}"
+                        ),
+                    )
+                else:
+                    record_uncatalogued_column(
+                        group="skipped_context",
+                        column=field.name,
+                        example_path=path,
+                    )
+                    warn_once(
+                        key=f"uncatalogued-context-schema:{field.name.lower()}",
+                        message=(f"uncatalogued numeric context column skipped | column={field.name} | example={path}"),
+                    )
 
         if schema_log_interval_files > 0 and index % schema_log_interval_files == 0:
             elapsed = time.perf_counter() - scan_start
-            print(f"Schema scan progress | files: {index:,}/{len(scan_files):,} | elapsed: {elapsed:.1f}s")
+            print(f"Schema scan progress | files: {index:,}/{len(schema_paths):,} | elapsed: {elapsed:.1f}s")
 
     return FeatureGroups(
-        env=sorted(env),
-        habitat=sorted(habitat),
-        weather=sorted(weather),
+        bioclimate=sorted(bioclimate),
+        landclass=sorted(landclass),
+        terrain=sorted(terrain),
+        edaphic=sorted(edaphic),
+        temporal=sorted(temporal),
+        other=sorted(other),
     )
 
 
@@ -626,19 +858,9 @@ def transform_frame(
         dtype="object",
     )
 
-    env_values, env_missing_mask = vector_from_columns(
+    feature_arrays, feature_names = build_feature_group_arrays(
         filtered,
-        feature_template.env,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    habitat_values, habitat_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.habitat,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    weather_values, weather_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.weather,
+        feature_template=feature_template,
         missing_sentinel=missing_feature_sentinel,
     )
 
@@ -659,12 +881,7 @@ def transform_frame(
                 pa.array(splits, type=pa.string()),
                 pa.array(source.tolist(), type=pa.string()),
                 pa.array([feature_version] * len(filtered), type=pa.string()),
-                env_values,
-                env_missing_mask,
-                habitat_values,
-                habitat_missing_mask,
-                weather_values,
-                weather_missing_mask,
+                *feature_arrays,
             ],
             names=[
                 "sample_id",
@@ -681,12 +898,7 @@ def transform_frame(
                 "split",
                 "source",
                 "feature_version",
-                "env_features",
-                "env_missing_mask",
-                "habitat_features",
-                "habitat_missing_mask",
-                "weather_features",
-                "weather_missing_mask",
+                *feature_names,
             ],
         ),
         low_cell_warnings,

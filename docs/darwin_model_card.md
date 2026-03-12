@@ -138,7 +138,7 @@ Expected outcome: most compute spent once in shared encoder; species updates are
 ### 5.1 Export format
 
 - The trained encoder + per-species heads + geocell feature table are packaged into a single `.pt` inference bundle via `scripts/machine_learning/train/export.py`.
-- The bundle also stores feature names (env, habitat, weather) so the server can sample GIS rasters on the fly.
+- The bundle also stores feature names (bioclimate, landclass, terrain, edaphic, temporal, other). The catalog-backed static groups are directly sampleable from GIS rasters; temporal and other are filled as missing in sampled-only inference paths.
 
 ### 5.2 Runtime
 
@@ -203,9 +203,9 @@ Remaining gaps to close full policy alignment are documented in Sections 3.3 and
     - positives from observations,
     - unlabeled/background rows sampled from other-species positives in the same split, filtered to avoid `(cell_id, year_month)` conflicts for the target species.
 6. Build vectors:
-    - `env_features`, `habitat_features`, `weather_features` with fixed order by `feature_version`.
+    - `bioclimate_features`, `landclass_features`, `terrain_features`, `edaphic_features`, `temporal_features`, `other_features` with fixed order by `feature_version`.
 7. Keep leakage-prone fields (`lat`, `lon`, `event_time_utc`, `source`) as metadata only; exclude from model input tensors.
-8. Write partitioned Parquet by `split/year_month/region_id`.
+8. Write split-partitioned Parquet by `split`.
 
 Notes:
 
@@ -216,18 +216,18 @@ Notes:
 
 ## 9. Partition Strategy: Time vs Species
 
-- Base dataset should stay partitioned by `split/year_month/region_id`.
+- Base dataset should keep a split-only partition layout.
 - Why this base partitioning:
-    - efficient spatiotemporal slices for training/validation,
-    - clean support for blocked time/space evaluation,
-    - avoids extreme small-file proliferation.
-- Can it be partitioned by species? Yes, but usually as a derived dataset/view for head training jobs.
+    - simple, stable layout for training/validation,
+    - avoids over-partitioning and small-file proliferation,
+    - keeps time and region available as metadata without making them directory keys.
+- Can it be partitioned by species? Yes, but usually only as a derived dataset or view for head training jobs.
 - Why not species as primary partition:
     - very high species cardinality creates many tiny partitions,
     - severe skew (common species huge, rare species tiny),
     - expensive global scans for encoder training.
 - Practical compromise:
-    - keep base table time/region partitioned,
+    - keep the base table split-partitioned,
     - optionally materialize species-bucket shards (e.g., hash buckets) for per-species training throughput.
 
 ## 10. Future Upgrades

@@ -4,19 +4,19 @@ Usage:
 
   # Stage B: Train shared encoder (self-supervised)
   uv run python scripts/machine_learning/train/cli.py encoder \
-      --data-root ./data/species_observation_canary \
-      --output-dir ./checkpoints/encoder
+      --data-root ./data/species_observation_canary_plants \
+      --output-dir ./checkpoints/canary_plants/encoder
 
   # Stage C: Train per-species PU heads
   uv run python scripts/machine_learning/train/cli.py heads \
-      --data-root ./data/species_observation_canary \
-      --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
-      --output-dir ./checkpoints/heads
+      --data-root ./data/species_observation_canary_plants \
+      --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+      --output-dir ./checkpoints/canary_plants/heads
 
   # Both stages sequentially
   uv run python scripts/machine_learning/train/cli.py all \
-      --data-root ./data/species_observation_canary \
-      --output-dir ./checkpoints
+      --data-root ./data/species_observation_canary_plants \
+      --output-dir ./checkpoints/canary_plants
 """
 
 from __future__ import annotations

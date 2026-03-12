@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/data/training_observation"),
+        default=Path("/data_ml/training_observation"),
         help="Partitioned output dataset root.",
     )
     parser.add_argument(

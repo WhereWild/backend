@@ -4,6 +4,7 @@
 .python-version
 /data
 !tests/data/
+data_ml/
 processed/
 cache/
 tmp/

@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -17,10 +18,19 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+feature_template_dict = _feature_contract.feature_template_dict
+format_feature_group_counts = _feature_contract.format_feature_group_counts
+
 try:
-    from .transform import build_feature_template, transform_file
+    from .transform import build_feature_template, get_uncatalogued_summary, reset_uncatalogued_summary, transform_file
 except ImportError:
-    from transform import build_feature_template, transform_file  # type: ignore[no-redef]
+    from transform import (  # type: ignore[no-redef]
+        build_feature_template,
+        get_uncatalogued_summary,
+        reset_uncatalogued_summary,
+        transform_file,
+    )
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -301,14 +311,12 @@ def write_partitioned_dataset(
     output_root: Path,
     max_rows_per_file: int,
 ) -> None:
-    """Write staging shards into a hive-partitioned parquet dataset."""
+    """Write staging shards into a split-partitioned hive-style parquet dataset."""
     output_root.mkdir(parents=True, exist_ok=True)
 
     partition_schema = pa.schema([pa.field("split", pa.string())])
 
-    heartbeat_stop, heartbeat_thread = start_phase_heartbeat(
-        "Final write", PROGRESS_INTERVAL_SECONDS
-    )
+    heartbeat_stop, heartbeat_thread = start_phase_heartbeat("Final write", PROGRESS_INTERVAL_SECONDS)
     try:
         staged_dataset = ds.dataset(shard_paths, format="parquet")
         ds.write_dataset(
@@ -389,6 +397,8 @@ def run_preprocess(args) -> int:
     if args.background_ratio <= 0.0:
         print("Warning: background ratio is 0.0; output will contain positives only (no unlabeled/background rows).")
 
+    reset_uncatalogued_summary()
+
     print("Starting feature-template schema scan...")
     if args.template_scan_max_files > 0:
         print(f"Template schema scan cap: {args.template_scan_max_files:,} files")
@@ -398,14 +408,13 @@ def run_preprocess(args) -> int:
         schema_log_interval_files=SCHEMA_LOG_INTERVAL_FILES,
         log_slow_read_seconds=LOG_SLOW_READ_SECONDS,
         template_scan_max_files=args.template_scan_max_files,
+        static_context_template=str(args.static_context_template or ""),
+        static_context_path=args.static_context_path,
+        temporal_context_template=str(args.temporal_context_template or ""),
+        temporal_context_path=args.temporal_context_path,
     )
     template_seconds = time.perf_counter() - template_start
-    print(
-        "Feature template sizes | "
-        f"env={len(feature_template.env):,}, "
-        f"habitat={len(feature_template.habitat):,}, "
-        f"weather={len(feature_template.weather):,}"
-    )
+    print(f"Feature template sizes | {format_feature_group_counts(feature_template)}")
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -413,11 +422,7 @@ def run_preprocess(args) -> int:
     meta_dir.mkdir(parents=True, exist_ok=True)
     template_json_path = meta_dir / "feature_template.json"
     with open(template_json_path, "w") as _ft_fh:
-        json.dump(
-            {"env": feature_template.env, "habitat": feature_template.habitat, "weather": feature_template.weather},
-            _ft_fh,
-            indent=2,
-        )
+        json.dump(feature_template_dict(feature_template), _ft_fh, indent=2)
     print(f"Saved feature template to {template_json_path}")
 
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -552,6 +557,12 @@ def run_preprocess(args) -> int:
     print(f"Static context merged rows: {static_join_rows_total:,}")
     print(f"Temporal context merged rows: {temporal_join_rows_total:,}")
     print(f"Final write duration: {write_seconds:.1f}s")
+
+    uncatalogued_summary = get_uncatalogued_summary()
+    uncatalogued_summary_path = meta_dir / "uncatalogued_columns.json"
+    with open(uncatalogued_summary_path, "w") as handle:
+        json.dump(uncatalogued_summary, handle, indent=2)
+    print(f"Saved uncatalogued column summary to {uncatalogued_summary_path}")
 
     if failures:
         print_failure_summary(failures)

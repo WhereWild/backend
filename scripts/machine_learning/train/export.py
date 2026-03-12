@@ -7,10 +7,10 @@ access to the original training parquet or GIS tiles.
 Usage:
 
   uv run python scripts/machine_learning/train/export.py \
-      --data-root ./data/species_observation_canary_cactus \
-      --encoder-checkpoint ./checkpoints/canary_cactus/encoder/encoder_best.pt \
-      --heads-checkpoint ./checkpoints/canary_cactus/heads/species_heads.pt \
-      --output ./checkpoints/canary_cactus/inference_bundle.pt
+    --data-root ./data/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
+    --output ./checkpoints/canary_plants/inference_bundle.pt
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,10 @@ except ImportError:
 FEATURE_COLUMNS = import_local_symbol("data", "FEATURE_COLUMNS")
 MASK_COLUMNS = import_local_symbol("data", "MASK_COLUMNS")
 _list_column_to_2d_numpy = import_local_symbol("data", "_list_column_to_2d_numpy")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+format_feature_group_counts = _feature_contract.format_feature_group_counts
+normalize_feature_template = _feature_contract.normalize_feature_template
 
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
@@ -134,7 +139,7 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         if template_path.exists():
             with open(template_path) as f:
                 raw = json.load(f)
-            return {"env": raw["env"], "habitat": raw["habitat"], "weather": raw.get("weather", [])}
+            return normalize_feature_template(raw)
 
     # Fallback: derive from the GIS catalog using the same classification rules
     # the preprocessing pipeline uses.
@@ -150,27 +155,23 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         with open(catalog_path) as f:
             catalog = json.load(f)
 
-        env: set[str] = set()
-        habitat: set[str] = set()
+        grouped: dict[str, set[str]] = {group: set() for group in FEATURE_GROUPS if group != "other"}
         for category in catalog.get("categories", []):
-            if category.get("name") == "temporal":
-                continue
             for layer in category.get("layers", []):
-                lid = layer.get("id", "")
-                name = lid.lower()
-                if name.startswith(("bio_", "climate_")) or name in {
-                    "elevation",
-                    "slope",
-                    "aspect",
-                    "aspect_deg",
-                }:
-                    env.add(lid)
-                elif name.startswith(("habitat_", "landcover_", "ndvi", "canopy_", "terrain_")) or name in {
-                    "landcover",
-                    "koppen_geiger",
-                }:
-                    habitat.add(lid)
-        return {"env": sorted(env), "habitat": sorted(habitat), "weather": []}
+                lid = layer.get("id")
+                if not isinstance(lid, str) or not lid:
+                    continue
+                category_name = str(category.get("name", "")).strip().lower()
+                if category_name in grouped:
+                    grouped[category_name].add(lid)
+        return {
+            "bioclimate": sorted(grouped["bioclimate"]),
+            "landclass": sorted(grouped["landclass"]),
+            "terrain": sorted(grouped["terrain"]),
+            "edaphic": sorted(grouped["edaphic"]),
+            "temporal": sorted(grouped["temporal"]),
+            "other": [],
+        }
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return None
 
@@ -192,11 +193,7 @@ def export_bundle(
 
     feature_names = _load_feature_names(data_root)
     if feature_names is not None:
-        print(
-            f"Feature names: env={len(feature_names['env'])}, "
-            f"habitat={len(feature_names['habitat'])}, "
-            f"weather={len(feature_names.get('weather', []))}"
-        )
+        print(f"Feature names: {format_feature_group_counts(feature_names)}")
     else:
         print("Warning: could not determine feature names; on-the-fly GIS sampling will be unavailable.")
 

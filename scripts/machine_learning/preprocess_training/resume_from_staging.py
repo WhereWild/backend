@@ -8,10 +8,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 import pyarrow.dataset as ds
+
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+FEATURE_COLUMNS = _feature_contract.FEATURE_COLUMNS
+FEATURE_COLUMN_TO_GROUP = _feature_contract.FEATURE_COLUMN_TO_GROUP
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+empty_feature_template = _feature_contract.empty_feature_template
+format_feature_group_counts = _feature_contract.format_feature_group_counts
+normalize_feature_template = _feature_contract.normalize_feature_template
 
 try:
     from .pipeline import (
@@ -33,22 +42,18 @@ except ImportError:
 
 
 def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
-    return {
-        "env": len(template.get("env", [])),
-        "habitat": len(template.get("habitat", [])),
-        "weather": len(template.get("weather", [])),
-    }
+    return {group: len(template.get(group, [])) for group in FEATURE_GROUPS}
 
 
 def _format_feature_dims(dims: dict[str, int] | None) -> str:
     if dims is None:
         return "unknown"
-    return f"env={dims.get('env', 0)}, habitat={dims.get('habitat', 0)}, weather={dims.get('weather', 0)}"
+    return format_feature_group_counts(dims)
 
 
 def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
-    """Read one row to infer vector widths for env/habitat/weather columns."""
-    vector_columns = ["env_features", "habitat_features", "weather_features"]
+    """Read one row to infer vector widths for feature-vector columns."""
+    vector_columns = list(FEATURE_COLUMNS)
     present_columns = [name for name in vector_columns if name in dataset.schema.names]
     if not present_columns:
         return None
@@ -57,15 +62,10 @@ def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
     if row.num_rows == 0:
         return None
 
-    dims = {"env": 0, "habitat": 0, "weather": 0}
-    column_to_group = {
-        "env_features": "env",
-        "habitat_features": "habitat",
-        "weather_features": "weather",
-    }
+    dims = {group: 0 for group in FEATURE_GROUPS}
     for column_name in present_columns:
         values = row.column(column_name)[0].as_py() or []
-        dims[column_to_group[column_name]] = len(values)
+        dims[FEATURE_COLUMN_TO_GROUP[column_name]] = len(values)
     return dims
 
 
@@ -96,27 +96,34 @@ def _load_catalog_feature_template() -> dict[str, list[str]] | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
     for category in catalog.get("categories", []):
         for layer in category.get("layers", []):
             layer_id = layer.get("id")
             if not isinstance(layer_id, str) or not layer_id:
                 continue
             group = classify_feature_name(layer_id)
-            if group == "env":
-                env.add(layer_id)
-            elif group == "habitat":
-                habitat.add(layer_id)
-            elif group == "weather":
-                weather.add(layer_id)
+            if group == "bioclimate":
+                bioclimate.add(layer_id)
+            elif group == "landclass":
+                landclass.add(layer_id)
+            elif group == "terrain":
+                terrain.add(layer_id)
+            elif group == "edaphic":
+                edaphic.add(layer_id)
+            elif group == "temporal":
+                temporal.add(layer_id)
 
-    template = {
-        "env": sorted(env),
-        "habitat": sorted(habitat),
-        "weather": sorted(weather),
-    }
+    template = empty_feature_template()
+    template["bioclimate"] = sorted(bioclimate)
+    template["landclass"] = sorted(landclass)
+    template["terrain"] = sorted(terrain)
+    template["edaphic"] = sorted(edaphic)
+    template["temporal"] = sorted(temporal)
     return template if any(_template_counts(template).values()) else None
 
 
@@ -126,12 +133,21 @@ def _find_matching_template_in_sibling_datasets(
 ) -> dict[str, list[str]] | None:
     """Look for a non-empty template in other local datasets with matching dims."""
     project_root = Path(__file__).resolve().parents[3]
-    data_root = project_root / "data"
-    if not data_root.exists():
-        return None
-
     target_meta = (output_root / "_meta" / "feature_template.json").resolve()
-    candidates = sorted(data_root.glob("species_observation*/_meta/feature_template.json"))
+    search_roots: list[Path] = []
+    for candidate_root in (output_root.parent, project_root / "data_ml", project_root / "data"):
+        try:
+            resolved = candidate_root.resolve()
+        except OSError:
+            continue
+        if not resolved.exists() or resolved in search_roots:
+            continue
+        search_roots.append(resolved)
+
+    candidates: list[Path] = []
+    for search_root in search_roots:
+        candidates.extend(sorted(search_root.glob("species_observation*/_meta/feature_template.json")))
+
     for candidate in candidates:
         try:
             if candidate.resolve() == target_meta:
@@ -154,11 +170,7 @@ def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
             raw: dict[str, Any] = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
-    template = {
-        "env": sorted(str(v) for v in raw.get("env", []) if isinstance(v, str) and v),
-        "habitat": sorted(str(v) for v in raw.get("habitat", []) if isinstance(v, str) and v),
-        "weather": sorted(str(v) for v in raw.get("weather", []) if isinstance(v, str) and v),
-    }
+    template = normalize_feature_template(raw)
     return template if any(_template_counts(template).values()) else None
 
 
@@ -168,26 +180,33 @@ def _write_feature_template_from_output(output_root: Path) -> Path:
     schema = dataset.schema
     feature_dims = _feature_dims_from_vectors(dataset)
 
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
 
     for field in schema:
         if not is_numeric_arrow_type(field.type):
             continue
         group = classify_feature_name(field.name)
-        if group == "env":
-            env.add(field.name)
-        elif group == "habitat":
-            habitat.add(field.name)
-        elif group == "weather":
-            weather.add(field.name)
+        if group == "bioclimate":
+            bioclimate.add(field.name)
+        elif group == "landclass":
+            landclass.add(field.name)
+        elif group == "terrain":
+            terrain.add(field.name)
+        elif group == "edaphic":
+            edaphic.add(field.name)
+        elif group == "temporal":
+            temporal.add(field.name)
 
-    rebuilt_template = {
-        "env": sorted(env),
-        "habitat": sorted(habitat),
-        "weather": sorted(weather),
-    }
+    rebuilt_template = empty_feature_template()
+    rebuilt_template["bioclimate"] = sorted(bioclimate)
+    rebuilt_template["landclass"] = sorted(landclass)
+    rebuilt_template["terrain"] = sorted(terrain)
+    rebuilt_template["edaphic"] = sorted(edaphic)
+    rebuilt_template["temporal"] = sorted(temporal)
 
     meta_dir = output_root / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +299,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete existing background_pooled_*.parquet files and regenerate them (requires --resume-background-files).",
     )
+    parser.add_argument(
+        "--reuse-existing-background",
+        action="store_true",
+        help="Acknowledge and reuse existing background_pooled_*.parquet files without regenerating them.",
+    )
     return parser.parse_args()
 
 
@@ -290,6 +314,25 @@ def _list_staging_paths(staging_dir: Path) -> tuple[list[Path], list[Path]]:
     base_paths = [path for path in all_paths if not path.name.startswith("background_pooled_")]
     background_paths = [path for path in all_paths if path.name.startswith("background_pooled_")]
     return base_paths, background_paths
+
+
+def _ensure_background_selection_is_explicit(
+    *,
+    existing_background_paths: list[Path],
+    resume_background_files: bool,
+    regenerate_background: bool,
+    reuse_existing_background: bool,
+) -> None:
+    """Refuse to silently reuse existing background shards during resume runs."""
+    if not resume_background_files or not existing_background_paths:
+        return
+    if regenerate_background or reuse_existing_background:
+        return
+    raise SystemExit(
+        "Existing background_pooled_*.parquet shards were found in staging. "
+        "Refusing to silently reuse them because they may not match the requested background ratio. "
+        "Pass --reuse-existing-background to keep them as-is, or --regenerate-background to rebuild them."
+    )
 
 
 def main() -> int:
@@ -312,6 +355,10 @@ def main() -> int:
 
     if args.regenerate_background and not args.resume_background_files:
         raise SystemExit("--regenerate-background requires --resume-background-files.")
+    if args.reuse_existing_background and not args.resume_background_files:
+        raise SystemExit("--reuse-existing-background requires --resume-background-files.")
+    if args.regenerate_background and args.reuse_existing_background:
+        raise SystemExit("Use only one of --regenerate-background or --reuse-existing-background.")
 
     if args.resume_feature_template_file and not args.resume_output_files:
         if not output_root.exists():
@@ -338,6 +385,13 @@ def main() -> int:
     base_paths, existing_background_paths = _list_staging_paths(staging_dir)
     if args.resume_base_files and not base_paths:
         raise SystemExit(f"No base staging parquet shards found in: {staging_dir}")
+
+    _ensure_background_selection_is_explicit(
+        existing_background_paths=existing_background_paths,
+        resume_background_files=args.resume_background_files,
+        regenerate_background=args.regenerate_background,
+        reuse_existing_background=args.reuse_existing_background,
+    )
 
     if args.regenerate_background and existing_background_paths:
         # Allow deterministic rebuilds when previous background generation was

@@ -310,7 +310,7 @@ Quick commands:
 # 1. Build training dataset shards (smoke run)
 uv run python scripts/machine_learning/preprocess_training/cli.py \
   --input-root ./data \
-  --output-root ./data/training_observation_smoke \
+  --output-root ./data_ml/training_observation_smoke \
   --max-files 100 \
   --threads 8 \
   --overwrite-output
@@ -318,13 +318,12 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 # 2. Validate output schema contract
 uv run python scripts/machine_learning/validate_training_schema.py \
   --schema schemas/training_observation.schema.json \
-  --data ./data/training_observation_smoke \
-  --partitioning hive \
+  --data ./data_ml/training_observation_smoke \
   --allow-extra-columns
 
 # 3. Train encoder + species heads
 uv run python scripts/machine_learning/train/cli.py all \
-  --data-root ./data/training_observation_smoke \
+  --data-root ./data_ml/training_observation_smoke \
   --output-dir ./checkpoints \
   --epochs 50 \
   --batch-size 4096
@@ -333,7 +332,7 @@ uv run python scripts/machine_learning/train/cli.py all \
 uv run python scripts/machine_learning/train/export.py \
   --encoder-checkpoint ./checkpoints/encoder/encoder_best.pt \
   --heads-checkpoint ./checkpoints/heads/species_heads.pt \
-  --data-root ./data/training_observation_smoke \
+  --data-root ./data_ml/training_observation_smoke \
   --output ./checkpoints/inference_bundle.pt
 
 # 5. Serve the prediction API
