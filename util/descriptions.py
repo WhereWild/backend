@@ -2382,8 +2382,18 @@ def _terrain_status_rows(
         taxon_id=taxon_id,
         location_gid=location_gid,
     )
+    landform_outlier = _categorical_outlier_text(
+        taxon,
+        taxon_dir,
+        variable_id="landform",
+        taxon_id=taxon_id,
+        location_gid=location_gid,
+    )
     if landform_phrase:
-        detail_parts.append(_sentence_case(landform_phrase.lower()))
+        line = _sentence_case(landform_phrase.lower())
+        if landform_outlier:
+            line = f"{line}\n{landform_outlier}."
+        detail_parts.append(line)
     if slope_grade is not None:
         if slope_p10_grade is not None:
             low_grade = min(slope_p10_grade, slope_grade)
@@ -2561,6 +2571,48 @@ def _weather_status_rows(
     typically_snowy = _swe_typically_snowy(swe_median)
     sometimes_snowy = _swe_sometimes_snowy(swe_max)
 
+    # Median outlier — suppressed if near-zero snow (low polarity not meaningful)
+    swe_median_candidate = (
+        _select_variable_outlier_candidate(
+            variable_id="swe",
+            taxon=taxon,
+            taxon_dir=taxon_dir,
+            preferred_metrics=("median",),
+            location_gid=location_gid,
+        )
+        if not location_gid
+        else None
+    )
+    if swe_median_candidate and str(swe_median_candidate.get("polarity") or "") == "low":
+        if not typically_snowy:
+            swe_median_candidate = None
+
+    # Max outlier — only used as fallback when median outlier didn't fire
+    swe_max_candidate = (
+        _select_variable_outlier_candidate(
+            variable_id="swe",
+            taxon=taxon,
+            taxon_dir=taxon_dir,
+            preferred_metrics=("max",),
+            location_gid=location_gid,
+        )
+        if not location_gid and not swe_median_candidate
+        else None
+    )
+
+    swe_outlier_candidate = swe_median_candidate or swe_max_candidate
+    swe_outlier_text = (
+        _select_variable_outlier_text(
+            variable_id="swe",
+            taxon=taxon,
+            taxon_dir=taxon_dir,
+            preferred_metrics=("median",) if swe_median_candidate else ("max",),
+            location_gid=location_gid,
+        )
+        if swe_outlier_candidate
+        else None
+    )
+
     detail_parts: list[str] = []
     # --- Summer line: "[rain label] summers, highs up to [temp]" ---
     if hottest is not None:
@@ -2606,10 +2658,13 @@ def _weather_status_rows(
         elif sometimes_snowy:
             line = f"Typically snow-free winters, lows down to {temp_with_outlier}, can tolerate snowpack up to {swe_max_formatted}"
         else:
+            snow_free_qualifier = "Always" if (swe_max is None or swe_max < 1) else "Typically"
             if winter_precip_label:
-                line = f"Typically snow-free, {winter_precip_label} winters, lows down to {temp_with_outlier}"
+                line = f"{snow_free_qualifier} snow-free, {winter_precip_label} winters, lows down to {temp_with_outlier}"
             else:
-                line = f"Typically snow-free winters, lows down to {temp_with_outlier}"
+                line = f"{snow_free_qualifier} snow-free winters, lows down to {temp_with_outlier}"
+        if swe_outlier_text:
+            line += f" ({swe_outlier_text})"
         detail_parts.append(line)
     elif sometimes_snowy and swe_max_formatted:
         # No temp data but we have snow info
