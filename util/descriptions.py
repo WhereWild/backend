@@ -2375,6 +2375,15 @@ def _terrain_status_rows(
         detail_parts.append(elevation_text)
     elif elevation_outlier_text:
         detail_parts.append(f"Elevation: {elevation_outlier_text}")
+    landform_phrase = _top_categorical_phrase(
+        taxon_dir,
+        variable_id="landform",
+        label="landform",
+        taxon_id=taxon_id,
+        location_gid=location_gid,
+    )
+    if landform_phrase:
+        detail_parts.append(_sentence_case(landform_phrase.lower()))
     if slope_grade is not None:
         if slope_p10_grade is not None:
             low_grade = min(slope_p10_grade, slope_grade)
