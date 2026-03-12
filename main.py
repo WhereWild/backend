@@ -848,16 +848,6 @@ def species_environment_stats(
             status_code=404,
             detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
         )
-    if location_gid:
-        baseline_samples = summary_stats.gather_numeric_records(
-            taxon_id,
-            taxon_dir,
-            variable_id,
-            location_gid=None,
-        )
-        baseline_values = [sample["value"] for sample in baseline_samples]
-        if baseline_values:
-            baseline_numeric_summary = summary_stats.summarize_values(baseline_values)
     summary = summary_stats.summarize_values(values)
     density_curve = indexing.build_density_curve(values, point_count=density_points)
     ranks = []

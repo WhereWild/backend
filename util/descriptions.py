@@ -143,6 +143,23 @@ def _to_natural_climate_name(text: str) -> str:
     return stripped
 
 
+def _to_natural_landform_name(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return lowered
+    if "plain" in lowered:
+        return "plains"
+    if "hill" in lowered:
+        return "hills"
+    if "mountain" in lowered:
+        return "mountains"
+    if "plateau" in lowered:
+        return "plateaus"
+    if "valley" in lowered:
+        return "valleys"
+    return lowered
+
+
 def _strip_phrase(phrase: str) -> tuple[str, str]:
     for prefix in ("often in ", "primarily in ", "across a broad range of "):
         if phrase.startswith(prefix):
@@ -1421,6 +1438,10 @@ def _select_variable_outlier_candidate(
     config = load_config("global")
     if bool(getattr(config, "skip_description_outliers", False)):
         return None
+    # Location-filtered descriptions should use direct local-vs-global comparisons,
+    # not expensive relative-rank scans.
+    if location_gid:
+        return None
 
     entries = indexing.load_relative_ranks(
         taxon_dir,
@@ -1800,6 +1821,8 @@ def _categorical_display_label(
     group_label: str,
     legend_entry: Optional[dict[str, Any]],
 ) -> str:
+    if variable_id == "landform":
+        return _to_natural_landform_name(class_name)
     if style == "group_map":
         if group_value == "forest":
             traits = _extract_legend_traits(legend_entry)
@@ -2309,6 +2332,67 @@ def _precip_location_compare_text(
     return f"{degree} {direction} in {location_name}"
 
 
+def _swe_location_compare_text(
+    *,
+    local_mean: Any,
+    global_mean: Any,
+    location_name: str,
+) -> Optional[str]:
+    try:
+        local_value = float(local_mean)
+        global_value = float(global_mean)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(local_value) and math.isfinite(global_value)):
+        return None
+    diff = local_value - global_value
+    magnitude = abs(diff)
+    if magnitude < 5:
+        return f"about the same in {location_name}"
+    if magnitude < 20:
+        degree = "slightly"
+    elif magnitude < 60:
+        degree = "a bit"
+    elif magnitude < 150:
+        degree = "noticeably"
+    else:
+        degree = "much"
+    direction = "snowier" if diff > 0 else "less snowy"
+    return f"{degree} {direction} in {location_name}"
+
+
+def _soil_location_compare_text(
+    *,
+    dominant_name: str,
+    local_pct: Any,
+    global_pct: Any,
+    location_name: str,
+) -> Optional[str]:
+    try:
+        local_value = float(local_pct)
+        global_value = float(global_pct)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(local_value) and math.isfinite(global_value)):
+        return None
+    diff = local_value - global_value
+    magnitude = abs(diff)
+    if magnitude < 2:
+        return None
+    if magnitude < 5:
+        degree = "slightly"
+    elif magnitude < 10:
+        degree = "a bit"
+    elif magnitude < 20:
+        degree = "noticeably"
+    else:
+        degree = "much"
+    adjective_more = {"sand": "sandier", "silt": "siltier", "clay": "more clay-rich"}.get(dominant_name, f"more {dominant_name}")
+    adjective_less = {"sand": "less sandy", "silt": "less silty", "clay": "less clay-rich"}.get(dominant_name, f"less {dominant_name}")
+    direction = adjective_more if diff > 0 else adjective_less
+    return f"{degree} {direction} in {location_name}"
+
+
 # ---------------------------------------------------------------------------
 # Status rows
 # ---------------------------------------------------------------------------
@@ -2652,7 +2736,10 @@ def _weather_status_rows(
         temp_str = f"{coldest_winter} {temp_display_units}" if temp_display_units else coldest_winter
         temp_with_outlier = f"{temp_str} ({low_outlier_text})" if low_outlier_text else temp_str
         if typically_snowy:
-            line = f"Snowy winters, lows down to {temp_with_outlier}"
+            if swe_outlier_text:
+                line = f"Snowy winters ({swe_outlier_text}), lows down to {temp_with_outlier}"
+            else:
+                line = f"Snowy winters, lows down to {temp_with_outlier}"
             if swe_max_formatted:
                 line += f", can tolerate snowpack up to {swe_max_formatted}"
         elif sometimes_snowy:
@@ -2663,7 +2750,7 @@ def _weather_status_rows(
                 line = f"{snow_free_qualifier} snow-free, {winter_precip_label} winters, lows down to {temp_with_outlier}"
             else:
                 line = f"{snow_free_qualifier} snow-free winters, lows down to {temp_with_outlier}"
-        if swe_outlier_text:
+        if swe_outlier_text and not typically_snowy:
             line += f" ({swe_outlier_text})"
         detail_parts.append(line)
     elif sometimes_snowy and swe_max_formatted:
@@ -2696,7 +2783,6 @@ def _weather_status_rows(
                 detail_parts.append(
                     f"Mean temperature: {comparison} ({local_mean_value} vs {global_mean_value})."
                 )
-
     # --- Precipitation (bio_12 = annual) ---
     bio12 = _numeric_summary_for_context(
         taxon_id=taxon_id,
@@ -2937,6 +3023,33 @@ def _soil_texture_status_rows(
     texture_line = f"Typically {texture_phrase} soil"
     if texture_outlier:
         texture_line += f" ({texture_outlier})"
+
+    if location_gid:
+        dominant_global_summary = _numeric_summary_for_context(
+            taxon_id=taxon_id,
+            taxon_dir=taxon_dir,
+            variable_id=dominant_name,
+            location_gid=None,
+        )
+        try:
+            global_dominant_pct_value = float(dominant_global_summary.get("mean"))
+            global_dominant_pct = (
+                global_dominant_pct_value if math.isfinite(global_dominant_pct_value) else None
+            )
+        except (TypeError, ValueError):
+            global_dominant_pct = None
+        scale = units.variable_display_scale(dominant_name)
+        global_dominant_pct_scaled = global_dominant_pct * scale if global_dominant_pct is not None else None
+        location_name = _location_label(location_gid)
+        soil_comparison = _soil_location_compare_text(
+            dominant_name=dominant_name,
+            local_pct=dominant_value,
+            global_pct=global_dominant_pct_scaled,
+            location_name=location_name,
+        )
+        if soil_comparison:
+            texture_line += f", {soil_comparison}"
+
     detail_lines: list[str] = [texture_line]
 
     nutrient_phrase: Optional[str] = None
