@@ -2799,12 +2799,20 @@ def _soil_texture_status_rows(
     if coarse_descriptor:
         texture_phrase = f"{texture_phrase} with {coarse_descriptor} fragments"
     detail_lines: list[str] = [f"Typically {texture_phrase} soil"]
+
+    nutrient_phrase: Optional[str] = None
     if nitrogen_pct is not None:
-        nitrogen_phrase = _nitrogen_phrase(nitrogen_pct)
-        if nitrogen_phrase:
-            detail_lines.append(f"Typically {nitrogen_phrase} soil")
+        nutrient_phrase = _nitrogen_phrase(nitrogen_pct)
+    ph_phrase: Optional[str] = None
     if ph_value is not None:
-        detail_lines.append(f"Typically {_ph_label(ph_value)} soil")
+        ph_phrase = _ph_label(ph_value)
+
+    if nutrient_phrase and ph_phrase:
+        detail_lines.append(f"Typically {nutrient_phrase} and {ph_phrase} soil")
+    elif ph_phrase:
+        detail_lines.append(f"Typically {ph_phrase} soil")
+    elif nutrient_phrase:
+        detail_lines.append(f"Typically {nutrient_phrase} soil")
     detail = "\n".join(detail_lines)
     return [
         {
