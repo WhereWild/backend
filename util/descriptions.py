@@ -2451,14 +2451,14 @@ def _terrain_status_rows(
     )
     if min_value and max_value:
         if display_units:
-            elevation_text = f"Elevation {min_value}-{max_value} {display_units}"
+            elevation_text = f"Found from {min_value}-{max_value} {display_units}"
         else:
-            elevation_text = f"Elevation {min_value}-{max_value}"
+            elevation_text = f"Found from {min_value}-{max_value}"
         if elevation_outlier_text:
             elevation_text += f" ({elevation_outlier_text})"
         detail_parts.append(elevation_text)
     elif elevation_outlier_text:
-        detail_parts.append(f"Elevation {elevation_outlier_text}")
+        detail_parts.append(f"Found at elevations {elevation_outlier_text}")
     landform_phrase = _top_categorical_phrase(
         taxon_dir,
         variable_id="landform",
