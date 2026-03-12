@@ -1373,7 +1373,7 @@ def _aspect_preference_text(taxon_dir: Path) -> Optional[str]:
         return None
     preferred_facing = [f"{direction}-facing" for direction in preferred]
     facing_text = _join_names(preferred_facing)
-    return f"Aspect: prefers {facing_text} slopes"
+    return f"Prefers {facing_text} slopes"
 
 
 # ---------------------------------------------------------------------------
@@ -2451,14 +2451,14 @@ def _terrain_status_rows(
     )
     if min_value and max_value:
         if display_units:
-            elevation_text = f"Elevation: {min_value}-{max_value} {display_units}"
+            elevation_text = f"Elevation {min_value}-{max_value} {display_units}"
         else:
-            elevation_text = f"Elevation: {min_value}-{max_value}"
+            elevation_text = f"Elevation {min_value}-{max_value}"
         if elevation_outlier_text:
             elevation_text += f" ({elevation_outlier_text})"
         detail_parts.append(elevation_text)
     elif elevation_outlier_text:
-        detail_parts.append(f"Elevation: {elevation_outlier_text}")
+        detail_parts.append(f"Elevation {elevation_outlier_text}")
     landform_phrase = _top_categorical_phrase(
         taxon_dir,
         variable_id="landform",
@@ -2487,13 +2487,13 @@ def _terrain_status_rows(
             low_pct = int(round(low_grade))
             high_pct = int(round(high_grade))
             slope_text = (
-                f"Slope: often {_slope_range_phrase(low_band, high_band)} "
+                f"Often {_slope_range_phrase(low_band, high_band)} "
                 f"({low_pct} to {high_pct} percent grade)"
             )
         else:
             slope_band = _slope_band_from_grade(slope_grade)
             slope_pct = int(round(slope_grade))
-            slope_text = f"Slope: often {_slope_phrase_for_band(slope_band)} ({slope_pct} percent grade)"
+            slope_text = f"Often {_slope_phrase_for_band(slope_band)} ({slope_pct} percent grade)"
         detail_parts.append(slope_text)
     aspect_text = _aspect_preference_text(taxon_dir)
     if aspect_text:
@@ -2777,11 +2777,11 @@ def _weather_status_rows(
         if comparison and local_mean_value and global_mean_value:
             if temp_display_units:
                 detail_parts.append(
-                    f"Mean temperature: {comparison} ({local_mean_value} {temp_display_units} vs {global_mean_value} {temp_display_units})."
+                    f"Mean temperature {comparison} ({local_mean_value} {temp_display_units} vs {global_mean_value} {temp_display_units})."
                 )
             else:
                 detail_parts.append(
-                    f"Mean temperature: {comparison} ({local_mean_value} vs {global_mean_value})."
+                    f"Mean temperature {comparison} ({local_mean_value} vs {global_mean_value})."
                 )
     # --- Precipitation (bio_12 = annual) ---
     bio12 = _numeric_summary_for_context(
