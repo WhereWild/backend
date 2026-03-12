@@ -163,11 +163,27 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
                     "slope",
                     "aspect",
                     "aspect_deg",
+                    "cfvo",
+                    "clay",
+                    "clt",
+                    "nitrogen",
+                    "phh20",
+                    "rsds",
+                    "sand",
+                    "scd",
+                    "sfc",
+                    "silt",
+                    "soc",
+                    "swe",
+                    "vpd",
                 }:
                     env.add(lid)
                 elif name.startswith(("habitat_", "landcover_", "ndvi", "canopy_", "terrain_")) or name in {
                     "landcover",
                     "koppen_geiger",
+                    "landform",
+                    "lithology",
+                    "wrb",
                 }:
                     habitat.add(lid)
         return {"env": sorted(env), "habitat": sorted(habitat), "weather": []}

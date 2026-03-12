@@ -53,6 +53,31 @@
       ]
     },
     {
+      "name": "edaphic",
+      "display_name": "Soil and Land Surface",
+      "description": "Static edaphic and land-surface covariates sampled from regional GIS rasters.",
+      "source": "Regional static raster stack",
+      "license": "Same as source dataset",
+      "layers": [
+        { "id": "cfvo", "code": "CFVO", "display_name": "Coarse Fragment Volume", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "clay", "code": "CLAY", "display_name": "Clay Content", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "clt", "code": "CLT", "display_name": "Cloud Fraction (Long-Term)", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "landform", "code": "LANDFORM", "display_name": "Landform Class", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "categorical" },
+        { "id": "lithology", "code": "LITHOLOGY", "display_name": "Lithology Class", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "categorical" },
+        { "id": "nitrogen", "code": "NITROGEN", "display_name": "Soil Nitrogen", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "phh20", "code": "PHH20", "display_name": "Soil pH (H2O)", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "rsds", "code": "RSDS", "display_name": "Surface Downwelling Shortwave Radiation", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "sand", "code": "SAND", "display_name": "Sand Content", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "scd", "code": "SCD", "display_name": "Snow Cover Days", "units": "days", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "sfc", "code": "SFC", "display_name": "Snowfall Flux Climatology", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "silt", "code": "SILT", "display_name": "Silt Content", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "soc", "code": "SOC", "display_name": "Soil Organic Carbon", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "swe", "code": "SWE", "display_name": "Snow Water Equivalent Climatology", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "vpd", "code": "VPD_STATIC", "display_name": "Vapor Pressure Deficit Climatology", "units": "scaled value", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "wrb", "code": "WRB", "display_name": "World Reference Base Soil Class", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "categorical" }
+      ]
+    },
+    {
       "name": "temporal",
       "display_name": "Recent Weather",
       "description": "Time-window aggregate variables for weather and soil conditions.",

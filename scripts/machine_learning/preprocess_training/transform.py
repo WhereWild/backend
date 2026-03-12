@@ -405,12 +405,28 @@ def classify_feature_name(column_name: str) -> str | None:
         "slope",
         "aspect",
         "aspect_deg",
+        "cfvo",
+        "clay",
+        "clt",
+        "nitrogen",
+        "phh20",
+        "rsds",
+        "sand",
+        "scd",
+        "sfc",
+        "silt",
+        "soc",
+        "swe",
+        "vpd",
     }:
         return "env"
 
     if name.startswith(("habitat_", "landcover_", "ndvi", "canopy_", "terrain_")) or name in {
         "landcover",
         "koppen_geiger",
+        "landform",
+        "lithology",
+        "wrb",
     }:
         return "habitat"
 
