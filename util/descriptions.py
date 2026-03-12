@@ -2811,7 +2811,7 @@ def _soil_texture_status_rows(
     location_gid: Optional[str] = None,
     unit_system: Optional[units.UnitSystem] = None,
 ) -> list[dict[str, Any]]:
-    _ = (taxon, unit_system)
+    _ = unit_system
 
     def _mean_percent(variable_id: str) -> Optional[float]:
         summary = _numeric_summary_for_context(
@@ -2913,8 +2913,31 @@ def _soil_texture_status_rows(
 
     texture_phrase = descriptor
     if coarse_descriptor:
-        texture_phrase = f"{texture_phrase} with {coarse_descriptor} fragments"
-    detail_lines: list[str] = [f"Typically {texture_phrase} soil"]
+        texture_phrase = f"{texture_phrase}, {coarse_descriptor}"
+
+    def _soil_outlier_text(variable_id: str, label: str) -> Optional[str]:
+        if location_gid:
+            return None
+        candidate = _select_variable_outlier_candidate(
+            variable_id=variable_id,
+            taxon=taxon,
+            taxon_dir=taxon_dir,
+            preferred_metrics=("mean",),
+            location_gid=location_gid,
+        )
+        if not candidate:
+            return None
+        phrase = str(candidate.get("phrase") or "").strip()
+        context = str(candidate.get("context") or "").strip()
+        if not phrase or not context:
+            return None
+        return f"avg {label} {phrase} for {context}"
+
+    texture_outlier = _soil_outlier_text(dominant_name, dominant_name)
+    texture_line = f"Typically {texture_phrase} soil"
+    if texture_outlier:
+        texture_line += f" ({texture_outlier})"
+    detail_lines: list[str] = [texture_line]
 
     nutrient_phrase: Optional[str] = None
     if nitrogen_pct is not None:
@@ -2923,12 +2946,21 @@ def _soil_texture_status_rows(
     if ph_value is not None:
         ph_phrase = _ph_label(ph_value)
 
+    soil_chem_outlier = _soil_outlier_text("phh2o", "pH") or _soil_outlier_text("nitrogen", "nitrogen")
+
     if nutrient_phrase and ph_phrase:
-        detail_lines.append(f"Typically {nutrient_phrase} and {ph_phrase} soil")
+        chem_line = f"Typically {nutrient_phrase} and {ph_phrase} soil"
     elif ph_phrase:
-        detail_lines.append(f"Typically {ph_phrase} soil")
+        chem_line = f"Typically {ph_phrase} soil"
     elif nutrient_phrase:
-        detail_lines.append(f"Typically {nutrient_phrase} soil")
+        chem_line = f"Typically {nutrient_phrase} soil"
+    else:
+        chem_line = None
+
+    if chem_line:
+        if soil_chem_outlier:
+            chem_line += f" ({soil_chem_outlier})"
+        detail_lines.append(chem_line)
     detail = "\n".join(detail_lines)
     return [
         {
