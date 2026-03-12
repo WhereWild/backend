@@ -32,7 +32,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
+    --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data/species_observation_canary_plants \
     --max-files 100 \
     --threads 8 \
@@ -47,7 +47,7 @@ with `(cell_id, year_month)` conflicts excluded.
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
+    --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data/species_observation_canary_plants \
     --max-files 1000 \
     --threads 16 \
@@ -60,7 +60,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
+    --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data/species_observation_canary_plants \
     --max-files 10000 \
     --threads 8 \
@@ -75,7 +75,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
-    --input-root ./data \
+    --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data/species_observation_canary_plants \
     --max-files 0 \
     --template-scan-max-files 50000 \
@@ -396,7 +396,7 @@ uv run python -m scripts.machine_learning.sweep_head_training \
 The summary file is written to `./tmp/head_sweep/sweep_results.json`, including
 ranked trials and `best_trial`.
 
-Current best (canary_cactus, latest recorded `pass_f`):
+Current best (canary_plants, latest recorded `pass_f`):
 
 - `head_lr=0.0088`
 - `head_weight_decay=0.00055`

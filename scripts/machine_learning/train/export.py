@@ -7,10 +7,10 @@ access to the original training parquet or GIS tiles.
 Usage:
 
   uv run python scripts/machine_learning/train/export.py \
-      --data-root ./data/species_observation_canary_cactus \
-      --encoder-checkpoint ./checkpoints/canary_cactus/encoder/encoder_best.pt \
-      --heads-checkpoint ./checkpoints/canary_cactus/heads/species_heads.pt \
-      --output ./checkpoints/canary_cactus/inference_bundle.pt
+    --data-root ./data/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
+    --output ./checkpoints/canary_plants/inference_bundle.pt
 """
 
 from __future__ import annotations
