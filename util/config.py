@@ -118,6 +118,24 @@ class GlobalConfig:
     skip_description_outliers: bool = False
     sdm_tile_size: int = 256
 
+    # ML training
+    ml_train_taxon_id: str = "3084072"
+    ml_model_kind: str = "gbt"
+    ml_negative_ratio: int = 3
+    ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
+    ml_negative_global_growth_factor: float = 5.0
+    ml_negative_global_max_extra_rounds: int = 12
+    ml_negative_prefilter_oversample_factor: float = 4.0
+    ml_negative_ring_oversample_factor: float = 2.0
+    ml_negative_batch_min: int = 4_096
+    ml_negative_min_bbox_span_degrees: float = 0.25
+    ml_negative_base_padding_degrees: float = 0.25
+    ml_test_size: float = 0.2
+    ml_random_seed: int = 42
+    ml_enable_background_eval: bool = False
+    ml_parquet_storage_mode: str = "local"
+    ml_raster_storage_mode: str = "auto"
+
     # Enrichment
 
     # GIS + locations
@@ -373,6 +391,10 @@ class GlobalConfig:
     @property
     def bioclim_root(self) -> Path:
         return self.data_root / "bioclim"
+
+    @property
+    def models_root(self) -> Path:
+        return self.data_root / "models"
 
     @property
     def temporal_cache_root(self) -> Path:
