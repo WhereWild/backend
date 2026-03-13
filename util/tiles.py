@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import io
 import math
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 from PIL import Image
@@ -18,7 +18,7 @@ from rasterio.warp import reproject
 from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
 
 from util.config import load_config
-from util import gis_lookup, units
+from util import gis_lookup, models, units
 
 
 CONFIG = load_config("global")
@@ -861,6 +861,100 @@ def render_variable_tile_bytes(
         reproject_to_mercator=reproject,
     )
     rgba = _colorize_layer(values, layer_id, value_type)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+HEATMAP_COLOR_STOPS = np.asarray(
+    [
+        [28, 38, 102],
+        [34, 94, 168],
+        [59, 170, 165],
+        [246, 190, 0],
+        [230, 57, 70],
+    ],
+    dtype=np.float32,
+)
+
+
+def _colorize_heatmap(values: np.ndarray) -> np.ndarray:
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return rgba
+
+    norm = np.clip(values, 0.0, 1.0)
+    finite_norm = norm[finite]
+    positions = np.linspace(0.0, 1.0, HEATMAP_COLOR_STOPS.shape[0], dtype=np.float32)
+    rgba[finite, 0] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 0]).astype(np.uint8)
+    rgba[finite, 1] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 1]).astype(np.uint8)
+    rgba[finite, 2] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 2]).astype(np.uint8)
+    rgba[finite, 3] = np.clip(40.0 + (finite_norm * 215.0), 0.0, 255.0).astype(np.uint8)
+    return rgba
+
+
+def _load_model_layers(
+    taxon_id: int,
+    model_id: str | None,
+    layers: Sequence[str] | None,
+) -> list[str]:
+    if layers:
+        layer_list = [str(layer).strip() for layer in layers if str(layer).strip()]
+    else:
+        layer_list = models.model_feature_columns(model_id, taxon_id=taxon_id)
+
+    if not layer_list:
+        requested = (model_id or "").strip() or models.DEFAULT_MODEL_ID
+        raise ValueError(
+            f"No feature columns available for taxon {taxon_id} and model '{requested}'."
+        )
+
+    layer_meta = gis_lookup.load_layer_metadata()
+    unknown = [layer for layer in layer_list if layer not in layer_meta]
+    if unknown:
+        raise ValueError(
+            "Model feature columns are not available in the GIS catalog: "
+            + ", ".join(sorted(unknown))
+        )
+    return layer_list
+
+
+def render_model_tile_bytes(
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    model_id: str | None = None,
+    layers: Sequence[str] | None = None,
+    tile_size: int = 256,
+    reproject: bool = True,
+) -> bytes:
+    layer_list = _load_model_layers(taxon_id, model_id, layers)
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
+
+    for idx, layer_id in enumerate(layer_list):
+        stack[:, :, idx] = _render_layer_values(
+            layer_id,
+            spec,
+            reproject_to_mercator=reproject,
+        )
+        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
+            print(
+                f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} "
+                f"taxon={taxon_id} current_layer={layer_id}"
+            )
+
+    probs = models.predict(
+        model_id,
+        stack,
+        feature_ids=layer_list,
+        taxon_id=taxon_id,
+    )
+    rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")

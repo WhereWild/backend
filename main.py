@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, tiles
+from util import descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -225,6 +225,107 @@ async def variable_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
+@app.get("/api/species/{taxon_id}/heatmap")
+def species_heatmap_metadata(
+    taxon_id: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+) -> dict[str, Any]:
+    return models.describe_model(model_id, taxon_id=taxon_id)
+
+
+@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
+async def species_heatmap_tile(
+    request: Request,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    reproject: bool = Query(
+        variable_tile_default_reproject,
+        description="If true, warp to Web Mercator; if false, keep WGS84.",
+    ),
+    max_native_zoom: int = Query(
+        10,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
+    if not resolved_model.get("available"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No heatmap model found for taxon_id {taxon_id}.",
+        )
+
+    if z > max_native_zoom:
+        zoom_diff = z - max_native_zoom
+        scale = 2 ** zoom_diff
+        parent_x = x // scale
+        parent_y = y // scale
+        subtile_x = x % scale
+        subtile_y = y % scale
+        parent_tile_size = min(tile_size * scale, variable_tile_max_size)
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            parent_payload = await run_in_threadpool(
+                tiles.render_model_tile_bytes,
+                taxon_id=taxon_id,
+                z=max_native_zoom,
+                x=parent_x,
+                y=parent_y,
+                model_id=model_id,
+                tile_size=parent_tile_size,
+                reproject=reproject,
+            )
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            from PIL import Image
+            import io
+
+            parent_img = Image.open(io.BytesIO(parent_payload))
+            subtile_size = parent_tile_size // scale
+            left = subtile_x * subtile_size
+            top = subtile_y * subtile_size
+            subtile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+            if subtile_size != tile_size:
+                subtile_img = subtile_img.resize((tile_size, tile_size), Image.LANCZOS)
+            buffer = io.BytesIO()
+            subtile_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            payload = await run_in_threadpool(
+                tiles.render_model_tile_bytes,
+                taxon_id=taxon_id,
+                z=z,
+                x=x,
+                y=y,
+                model_id=model_id,
+                tile_size=tile_size,
+                reproject=reproject,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {
+        "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
+    }
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
 @app.get("/api/species")
 def list_species(
     q: str = Query(..., min_length=1, description="Search term (scientific name or common name)"),
@@ -295,6 +396,7 @@ def get_species_detail(
     except Exception as exc:
         print(f"[description] failed for taxon_id={taxon_id}: {exc}")
         traceback.print_exc()
+    payload["heatmap"] = models.describe_model(models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
     return payload
 
 
