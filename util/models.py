@@ -15,7 +15,7 @@ from util.config import load_config
 
 
 CONFIG = load_config("global")
-AUTO_MODEL_ID = "auto_gbt"
+AUTO_MODEL_ID = f"auto_{str(CONFIG.ml_model_kind).strip().lower() or 'gbt'}"
 DEFAULT_MODEL_ID = AUTO_MODEL_ID
 
 
@@ -56,12 +56,21 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
     normalized = (model_id or "").strip()
     taxon_key = str(taxon_id).strip() if taxon_id is not None else ""
 
-    if normalized in {"", AUTO_MODEL_ID}:
+    if normalized == "":
         if not taxon_key:
             return None
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_gbt_")
+        model_kind = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
 
-    if normalized.startswith("taxon_") and normalized.endswith("_gbt"):
+    if normalized.startswith("auto_"):
+        model_kind = normalized.removeprefix("auto_").strip().lower()
+        if not model_kind or not taxon_key:
+            return None
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
+
+    if normalized.startswith("taxon_") and (
+        normalized.endswith("_gbt") or normalized.endswith("_maxent")
+    ):
         return _latest_artifact_for_prefix(f"{normalized}_")
 
     candidate = _models_root() / normalized

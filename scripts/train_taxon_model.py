@@ -15,10 +15,11 @@ from rasterio.windows import Window
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from util.config import load_config
 import util.gis_lookup as gis_lookup
@@ -937,14 +938,21 @@ def _make_one_hot_encoder() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
-def _build_preprocessor(feature_spec: FeatureSpec) -> ColumnTransformer:
+def _build_preprocessor(
+    feature_spec: FeatureSpec,
+    *,
+    model_kind: str,
+) -> ColumnTransformer:
     transformers: list[tuple[str, Pipeline, list[str]]] = []
 
     if feature_spec.numeric_columns:
+        numeric_steps: list[tuple[str, Any]] = [("imputer", SimpleImputer(strategy="median"))]
+        if model_kind == "maxent":
+            numeric_steps.append(("scaler", StandardScaler()))
         transformers.append(
             (
                 "numeric",
-                Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))]),
+                Pipeline(steps=numeric_steps),
                 feature_spec.numeric_columns,
             )
         )
@@ -973,14 +981,28 @@ def _build_preprocessor(feature_spec: FeatureSpec) -> ColumnTransformer:
     )
 
 
-def _train_model(X_train: np.ndarray, y_train: np.ndarray) -> GradientBoostingClassifier:
-    model = GradientBoostingClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=3,
-        subsample=0.8,
-        random_state=CONFIG.ml_random_seed,
-    )
+def _train_model(X_train: np.ndarray, y_train: np.ndarray) -> Any:
+    model_kind = str(CONFIG.ml_model_kind).strip().lower()
+    if model_kind == "gbt":
+        model = GradientBoostingClassifier(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=3,
+            subsample=0.8,
+            random_state=CONFIG.ml_random_seed,
+        )
+    elif model_kind == "maxent":
+        model = LogisticRegression(
+            penalty="l2",
+            C=1.0,
+            solver="lbfgs",
+            max_iter=2000,
+            random_state=int(CONFIG.ml_random_seed),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported ml_model_kind={CONFIG.ml_model_kind!r}; expected 'gbt' or 'maxent'."
+        )
     model.fit(X_train, y_train)
     return model
 
@@ -1000,7 +1022,7 @@ def _compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> dict[str, float 
 def _score_frame(
     frame: pd.DataFrame,
     preprocessor: ColumnTransformer,
-    model: GradientBoostingClassifier,
+    model: Any,
 ) -> np.ndarray:
     transformed = preprocessor.transform(frame)
     return model.predict_proba(transformed)[:, 1]
@@ -1133,7 +1155,8 @@ def main() -> None:
         stratify=y,
     )
 
-    preprocessor = _build_preprocessor(pruned_spec)
+    model_kind = str(CONFIG.ml_model_kind).strip().lower()
+    preprocessor = _build_preprocessor(pruned_spec, model_kind=model_kind)
     X_train = preprocessor.fit_transform(X_train_df)
     X_test = preprocessor.transform(X_test_df)
     print(
@@ -1208,8 +1231,14 @@ def main() -> None:
 
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = CONFIG.models_root / f"taxon_{taxon_id}_{CONFIG.ml_model_kind}_{run_ts}"
+    if model_kind == "gbt":
+        model_type = "sklearn_gradient_boosting"
+    elif model_kind == "maxent":
+        model_type = "sklearn_logistic_maxent_style"
+    else:
+        model_type = f"unknown_{model_kind}"
     payload = {
-        "model_type": "sklearn_gradient_boosting",
+        "model_type": model_type,
         "model": model,
         "preprocessor": preprocessor,
         "taxon_id": taxon_id,

@@ -68,7 +68,7 @@ class GlobalConfig:
 
     # Pipeline tuning
     root_taxon_id: str = field(
-        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "2519")
+        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "1")
     )
     process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False
@@ -120,8 +120,8 @@ class GlobalConfig:
 
     # ML training
     ml_train_taxon_id: str = "3084072"
-    ml_model_kind: str = "gbt"
-    ml_negative_ratio: int = 3
+    ml_model_kind: str = "maxent"
+    ml_negative_ratio: int = 10
     ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
     ml_negative_global_growth_factor: float = 5.0
     ml_negative_global_max_extra_rounds: int = 12
