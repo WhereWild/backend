@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from util.config import load_config
 from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
@@ -24,7 +26,7 @@ category_sample_limit = 500
 
 cors_allow_headers = ("*",)
 
-cors_allow_methods = ("GET",)
+cors_allow_methods = ("GET", "POST")
 
 cors_allow_origins = ("*",)
 
@@ -1061,6 +1063,24 @@ def list_relative_ranking_options(
         "rank": rank.upper(),
         "options": options,
     }
+
+@app.post("/uploadfile")
+async def create_upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> FileResponse:
+    # Write a temp file so it persists until after the response is sent.
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    try:
+        tmp.write(file.filename.encode())
+    finally:
+        tmp.close()
+
+    # Clean up the temp file after the response is delivered.
+    background_tasks.add_task(Path(tmp.name).unlink, missing_ok=True)
+
+    return FileResponse(
+        path=tmp.name,
+        media_type="application/octet-stream",
+        filename=file.filename,
+    )
 
 
 if __name__ == "__main__":
