@@ -272,15 +272,31 @@ def resolve_taxon_media(taxon_key: str) -> dict | None:
 @lru_cache(maxsize=1)
 def _load_payload() -> dict:
     """Loads the taxon catalog payload pickle.
-    
+
     Args:
         None.
-    
+
     Returns:
         A dict containing the catalog and lookup indices.
     """
+    import time
+    print(f"[taxa] Loading taxon catalog pickle from: {CONFIG.taxon_catalog_path}")
+    t0 = time.perf_counter()
     with PARQUET.open_input_file(CONFIG.taxon_catalog_path) as handle:
-        return pickle.load(handle)
+        print(f"[taxa] File handle opened, starting pickle.load ...")
+        payload = pickle.load(handle)
+    elapsed = time.perf_counter() - t0
+    keys = list(payload.keys()) if isinstance(payload, dict) else "<not a dict>"
+    print(f"[taxa] Pickle loaded in {elapsed:.3f}s — top-level keys: {keys}")
+    if isinstance(payload, dict):
+        catalog = payload.get("catalog", {})
+        name_index = payload.get("combined_name_index", {})
+        print(f"[taxa]   catalog entries:     {len(catalog):,}")
+        print(f"[taxa]   name_index entries:  {len(name_index):,}")
+        for k, v in payload.items():
+            size = len(v) if hasattr(v, '__len__') else '?'
+            print(f"[taxa]   key '{k}': {size} items")
+    return payload
 
 
 @lru_cache(maxsize=1)
@@ -290,17 +306,35 @@ def load_catalog() -> Dict[str, TaxonRecord]:
     Paths are stored as serialized in the payload and normalized lazily on
     per-record access, which keeps cold-start load time low.
     """
+    import time
+    print(f"[taxa] load_catalog() called — extracting catalog from payload ...")
+    t0 = time.perf_counter()
     payload = _load_payload()
-    return payload["catalog"]
+    catalog = payload["catalog"]
+    elapsed = time.perf_counter() - t0
+    print(f"[taxa] load_catalog() done in {elapsed:.3f}s — {len(catalog):,} taxon records")
+    if catalog:
+        sample_key = next(iter(catalog))
+        sample = catalog[sample_key]
+        print(f"[taxa]   sample record key={sample_key!r} fields={list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__}")
+    return catalog
 
 
 @lru_cache(maxsize=1)
 def load_name_index() -> dict:
     """Load name index and expand it to include all comma-separated common names."""
+    import time
+    print(f"[taxa] load_name_index() called — extracting combined_name_index from payload ...")
+    t0 = time.perf_counter()
     payload = _load_payload()
     name_index = payload["combined_name_index"]
     catalog = payload["catalog"]
+    print(f"[taxa]   raw name_index size: {len(name_index):,} entries")
+    print(f"[taxa]   catalog size:        {len(catalog):,} entries")
+    print(f"[taxa]   Expanding name index with common names and scientific names ...")
 
+    added_common = 0
+    added_scientific = 0
     # Enhance index with all common names and updated scientific names.
     for taxon_key, taxon in catalog.items():
         names = extract_common_names(taxon)
@@ -311,6 +345,7 @@ def load_name_index() -> dict:
             normalized = name.lower()
             if normalized not in name_index:
                 name_index[normalized] = []
+                added_common += 1
             if taxon_key not in name_index[normalized]:
                 name_index[normalized].append(taxon_key)
 
@@ -320,9 +355,14 @@ def load_name_index() -> dict:
             if normalized_scientific:
                 if normalized_scientific not in name_index:
                     name_index[normalized_scientific] = []
+                    added_scientific += 1
                 if taxon_key not in name_index[normalized_scientific]:
                     name_index[normalized_scientific].append(taxon_key)
 
+    elapsed = time.perf_counter() - t0
+    print(f"[taxa] load_name_index() done in {elapsed:.3f}s")
+    print(f"[taxa]   added {added_common:,} new common-name keys, {added_scientific:,} new scientific-name keys")
+    print(f"[taxa]   final name_index size: {len(name_index):,} entries")
     return name_index
 
 
@@ -823,11 +863,17 @@ def load_occurrence_points(
 @lru_cache(maxsize=1)
 def _child_index() -> dict[str, list[str]]:
     """Builds a parent taxon key -> child taxon keys index."""
+    import time
+    print(f"[taxa] _child_index() called — building parent->children mapping from catalog ...")
+    t0 = time.perf_counter()
     catalog = load_catalog()
     mapping: dict[str, list[str]] = {}
+    skipped_no_path = 0
+    skipped_no_key = 0
     for record in catalog.values():
         raw_path = record.get("path")
         if not raw_path:
+            skipped_no_path += 1
             continue
         path = Path(str(raw_path))
         parent_path = path.parent
@@ -835,6 +881,15 @@ def _child_index() -> dict[str, list[str]]:
         child_key = str(record.get("taxon_key") or "")
         if child_key:
             mapping.setdefault(parent_key, []).append(child_key)
+        else:
+            skipped_no_key += 1
     for children in mapping.values():
         children.sort()
+    elapsed = time.perf_counter() - t0
+    print(f"[taxa] _child_index() done in {elapsed:.3f}s")
+    print(f"[taxa]   {len(mapping):,} parent nodes, {sum(len(v) for v in mapping.values()):,} total child links")
+    if skipped_no_path:
+        print(f"[taxa]   skipped {skipped_no_path:,} records with no path")
+    if skipped_no_key:
+        print(f"[taxa]   skipped {skipped_no_key:,} records with no taxon_key")
     return mapping
