@@ -69,6 +69,48 @@ def _path_exists(path: Path) -> bool:
     return path.exists()
 
 
+def _add_tile_ids(df: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"decimalLatitude", "decimalLongitude"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        missing_list = ", ".join(sorted(missing))
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Uploaded file is missing required columns for tile lookup: "
+                f"{missing_list}"
+            ),
+        )
+
+    result = df.copy()
+    latitudes = pd.to_numeric(result["decimalLatitude"], errors="coerce")
+    longitudes = pd.to_numeric(result["decimalLongitude"], errors="coerce")
+
+    invalid_coords = (
+        latitudes.isna()
+        | longitudes.isna()
+        | (latitudes < -90)
+        | (latitudes > 90)
+        | (longitudes < -180)
+        | (longitudes > 180)
+    )
+    if invalid_coords.any():
+        invalid_count = int(invalid_coords.sum())
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Uploaded file has invalid coordinates in decimalLatitude/decimalLongitude "
+                f"for {invalid_count} row(s)."
+            ),
+        )
+
+    result["tileId"] = [
+        gis_lookup.get_region_name(float(lat), float(lon))
+        for lat, lon in zip(latitudes.tolist(), longitudes.tolist())
+    ]
+    return result
+
+
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
     """Returns a simple liveness payload.
@@ -1090,6 +1132,8 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
             df = pd.read_csv(buf)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
+
+    df = _add_tile_ids(df)
 
     out_name = Path(filename).stem + ".parquet"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
