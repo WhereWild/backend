@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import tempfile
 import traceback
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse
 
 from util.config import load_config
 from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
+import pandas as pd
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -1064,22 +1066,44 @@ def list_relative_ranking_options(
         "options": options,
     }
 
-@app.post("/uploadfile")
-async def create_upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> FileResponse:
-    # Write a temp file so it persists until after the response is sent.
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+@app.post("/upload/raw-observations")
+async def upload_raw_observations(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> FileResponse:
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
+
+    SUPPORTED = {".csv", ".tsv", ".parquet"}
+    if suffix not in SUPPORTED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
+        )
+
+    contents = await file.read()
+    buf = io.BytesIO(contents)
+
     try:
-        tmp.write(file.filename.encode())
+        if suffix == ".parquet":
+            df = pd.read_parquet(buf)
+        elif suffix == ".tsv":
+            df = pd.read_csv(buf, sep="\t")
+        else:  # .csv
+            df = pd.read_csv(buf)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
+
+    out_name = Path(filename).stem + ".parquet"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
+    try:
+        df.to_parquet(tmp.name, index=False)
     finally:
         tmp.close()
 
-    # Clean up the temp file after the response is delivered.
     background_tasks.add_task(Path(tmp.name).unlink, missing_ok=True)
 
     return FileResponse(
         path=tmp.name,
         media_type="application/octet-stream",
-        filename=file.filename,
+        filename=out_name,
     )
 
 
