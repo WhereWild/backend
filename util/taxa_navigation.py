@@ -280,22 +280,98 @@ def _load_payload() -> dict:
         A dict containing the catalog and lookup indices.
     """
     import time
-    print(f"[taxa] Loading taxon catalog pickle from: {CONFIG.taxon_catalog_path}")
-    t0 = time.perf_counter()
-    with PARQUET.open_input_file(CONFIG.taxon_catalog_path) as handle:
-        print(f"[taxa] File handle opened, starting pickle.load ...")
-        payload = pickle.load(handle)
-    elapsed = time.perf_counter() - t0
-    keys = list(payload.keys()) if isinstance(payload, dict) else "<not a dict>"
-    print(f"[taxa] Pickle loaded in {elapsed:.3f}s — top-level keys: {keys}")
-    if isinstance(payload, dict):
-        catalog = payload.get("catalog", {})
-        name_index = payload.get("combined_name_index", {})
-        print(f"[taxa]   catalog entries:     {len(catalog):,}")
-        print(f"[taxa]   name_index entries:  {len(name_index):,}")
-        for k, v in payload.items():
-            size = len(v) if hasattr(v, '__len__') else '?'
-            print(f"[taxa]   key '{k}': {size} items")
+    import sys
+
+    is_remote = getattr(PARQUET, 'is_remote', False)
+    storage_mode = f"remote ({type(PARQUET).__name__})" if is_remote else f"local ({type(PARQUET).__name__})"
+    print(f"[taxa] ── _load_payload() ──────────────────────────────────────────")
+    print(f"[taxa] Storage mode:  {storage_mode}")
+    print(f"[taxa] Catalog path:  {CONFIG.taxon_catalog_path}")
+
+    # Try to get file size before opening
+    t_size = time.perf_counter()
+    file_size_bytes: int | None = None
+    try:
+        if PARQUET.exists(CONFIG.taxon_catalog_path):
+            # Try pyarrow filesystem stat first
+            fs = getattr(PARQUET, 'filesystem', None)
+            if fs is not None:
+                info = fs.get_file_info(str(CONFIG.taxon_catalog_path))
+                file_size_bytes = info.size
+            else:
+                import os
+                stat = os.stat(CONFIG.taxon_catalog_path)
+                file_size_bytes = stat.st_size
+    except Exception as e:
+        print(f"[taxa] Could not stat file: {e}")
+    t_size_elapsed = time.perf_counter() - t_size
+    if file_size_bytes is not None:
+        print(f"[taxa] File size:     {file_size_bytes / 1024 / 1024:.2f} MB  (stat took {t_size_elapsed*1000:.1f}ms)")
+    else:
+        print(f"[taxa] File size:     unknown")
+
+    # Phase 1: open handle
+    print(f"[taxa] Phase 1: opening file handle ...")
+    t_open = time.perf_counter()
+    handle_ctx = PARQUET.open_input_file(CONFIG.taxon_catalog_path)
+    t_open_elapsed = time.perf_counter() - t_open
+
+    # Phase 2: read raw bytes (so we can time network transfer separately from pickle)
+    with handle_ctx as handle:
+        print(f"[taxa] Phase 1 done: handle opened in {t_open_elapsed*1000:.1f}ms")
+        print(f"[taxa] Phase 2: reading raw bytes into memory ...")
+        t_read = time.perf_counter()
+        try:
+            raw_bytes = handle.read()
+            t_read_elapsed = time.perf_counter() - t_read
+            actual_size = len(raw_bytes)
+            throughput = actual_size / t_read_elapsed / 1024 / 1024 if t_read_elapsed > 0 else 0
+            print(f"[taxa] Phase 2 done: read {actual_size / 1024 / 1024:.2f} MB in {t_read_elapsed:.3f}s  ({throughput:.1f} MB/s)")
+
+            # Phase 3: deserialize pickle from bytes
+            print(f"[taxa] Phase 3: deserializing pickle from {actual_size / 1024 / 1024:.2f} MB of bytes ...")
+            t_pickle = time.perf_counter()
+            import io as _io
+            payload = pickle.load(_io.BytesIO(raw_bytes))
+            t_pickle_elapsed = time.perf_counter() - t_pickle
+            print(f"[taxa] Phase 3 done: pickle.load() completed in {t_pickle_elapsed:.3f}s")
+        except AttributeError:
+            # handle doesn't support .read() — fall back to direct pickle.load
+            print(f"[taxa] Phase 2+3 (combined): handle has no .read(), calling pickle.load() directly ...")
+            t_pickle = time.perf_counter()
+            payload = pickle.load(handle)
+            t_pickle_elapsed = time.perf_counter() - t_pickle
+            print(f"[taxa] Phase 2+3 done: pickle.load() completed in {t_pickle_elapsed:.3f}s")
+
+    # Phase 4: inspect payload
+    print(f"[taxa] Phase 4: inspecting deserialized payload ...")
+    if not isinstance(payload, dict):
+        print(f"[taxa]   WARNING: payload is {type(payload).__name__}, not a dict!")
+        return payload
+
+    keys = list(payload.keys())
+    print(f"[taxa]   top-level keys: {keys}")
+    total_mem = 0
+    for k, v in payload.items():
+        count = len(v) if hasattr(v, '__len__') else '?'
+        try:
+            approx_bytes = sys.getsizeof(v)
+        except Exception:
+            approx_bytes = 0
+        total_mem += approx_bytes
+        print(f"[taxa]   '{k}': {count} items  (~{approx_bytes / 1024 / 1024:.1f} MB shallow)")
+
+    print(f"[taxa]   total shallow payload size: ~{total_mem / 1024 / 1024:.1f} MB")
+
+    # Sample a catalog record to show field names
+    catalog = payload.get("catalog", {})
+    if catalog:
+        sample_key = next(iter(catalog))
+        sample = catalog[sample_key]
+        fields = list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__
+        print(f"[taxa]   sample catalog record: key={sample_key!r}  fields={fields}")
+
+    print(f"[taxa] ── _load_payload() complete ────────────────────────────────")
     return payload
 
 
@@ -307,16 +383,23 @@ def load_catalog() -> Dict[str, TaxonRecord]:
     per-record access, which keeps cold-start load time low.
     """
     import time
-    print(f"[taxa] load_catalog() called — extracting catalog from payload ...")
+    print(f"[taxa] ── load_catalog() ───────────────────────────────────────────")
     t0 = time.perf_counter()
     payload = _load_payload()
+    t_extract = time.perf_counter()
     catalog = payload["catalog"]
-    elapsed = time.perf_counter() - t0
-    print(f"[taxa] load_catalog() done in {elapsed:.3f}s — {len(catalog):,} taxon records")
-    if catalog:
-        sample_key = next(iter(catalog))
-        sample = catalog[sample_key]
-        print(f"[taxa]   sample record key={sample_key!r} fields={list(sample.keys()) if isinstance(sample, dict) else type(sample).__name__}")
+    t_extract_elapsed = time.perf_counter() - t_extract
+    total_elapsed = time.perf_counter() - t0
+    print(f"[taxa] load_catalog() extracted in {t_extract_elapsed*1000:.1f}ms  (total incl. _load_payload: {total_elapsed:.3f}s)")
+    print(f"[taxa]   {len(catalog):,} taxon records in catalog")
+    # Rank distribution
+    rank_counts: dict[str, int] = {}
+    for rec in catalog.values():
+        rank = str(rec.get("rank") or "unknown").upper()
+        rank_counts[rank] = rank_counts.get(rank, 0) + 1
+    for rank, count in sorted(rank_counts.items(), key=lambda x: -x[1]):
+        print(f"[taxa]   rank {rank}: {count:,}")
+    print(f"[taxa] ── load_catalog() complete ──────────────────────────────────")
     return catalog
 
 
@@ -324,19 +407,25 @@ def load_catalog() -> Dict[str, TaxonRecord]:
 def load_name_index() -> dict:
     """Load name index and expand it to include all comma-separated common names."""
     import time
-    print(f"[taxa] load_name_index() called — extracting combined_name_index from payload ...")
+    _PROGRESS_INTERVAL = 10_000
+
+    print(f"[taxa] ── load_name_index() ────────────────────────────────────────")
     t0 = time.perf_counter()
     payload = _load_payload()
     name_index = payload["combined_name_index"]
     catalog = payload["catalog"]
+    total = len(catalog)
     print(f"[taxa]   raw name_index size: {len(name_index):,} entries")
-    print(f"[taxa]   catalog size:        {len(catalog):,} entries")
-    print(f"[taxa]   Expanding name index with common names and scientific names ...")
+    print(f"[taxa]   catalog size:        {total:,} entries to process")
+    print(f"[taxa]   progress reported every {_PROGRESS_INTERVAL:,} records")
 
     added_common = 0
     added_scientific = 0
+    t_loop_start = time.perf_counter()
+    t_last = t_loop_start
+
     # Enhance index with all common names and updated scientific names.
-    for taxon_key, taxon in catalog.items():
+    for i, (taxon_key, taxon) in enumerate(catalog.items()):
         names = extract_common_names(taxon)
 
         for name in names:
@@ -359,10 +448,30 @@ def load_name_index() -> dict:
                 if taxon_key not in name_index[normalized_scientific]:
                     name_index[normalized_scientific].append(taxon_key)
 
-    elapsed = time.perf_counter() - t0
-    print(f"[taxa] load_name_index() done in {elapsed:.3f}s")
-    print(f"[taxa]   added {added_common:,} new common-name keys, {added_scientific:,} new scientific-name keys")
+        if (i + 1) % _PROGRESS_INTERVAL == 0:
+            t_now = time.perf_counter()
+            elapsed_total = t_now - t_loop_start
+            elapsed_chunk = t_now - t_last
+            pct = (i + 1) / total * 100
+            rate = _PROGRESS_INTERVAL / elapsed_chunk if elapsed_chunk > 0 else 0
+            remaining = (total - i - 1) / rate if rate > 0 else 0
+            print(
+                f"[taxa]   [{i+1:>{len(str(total))},}/{total:,}  {pct:5.1f}%]"
+                f"  chunk={elapsed_chunk:.3f}s  total={elapsed_total:.3f}s"
+                f"  rate={rate:,.0f} rec/s  eta={remaining:.1f}s"
+                f"  index_size={len(name_index):,}"
+            )
+            t_last = t_now
+
+    t_loop_elapsed = time.perf_counter() - t_loop_start
+    total_elapsed = time.perf_counter() - t0
+    avg_rate = total / t_loop_elapsed if t_loop_elapsed > 0 else 0
+    print(f"[taxa] load_name_index() loop done in {t_loop_elapsed:.3f}s  ({avg_rate:,.0f} rec/s avg)")
+    print(f"[taxa]   added {added_common:,} new common-name keys")
+    print(f"[taxa]   added {added_scientific:,} new scientific-name keys")
     print(f"[taxa]   final name_index size: {len(name_index):,} entries")
+    print(f"[taxa]   total elapsed (incl. payload load): {total_elapsed:.3f}s")
+    print(f"[taxa] ── load_name_index() complete ───────────────────────────────")
     return name_index
 
 
@@ -385,10 +494,34 @@ def load_taxon_media() -> dict[str, dict]:
     Returns:
         Dictionary mapping taxon_key to media record with url, license, creator, rightsHolder.
     """
+    import time
+    print(f"[taxa] ── load_taxon_media() ───────────────────────────────────────")
+    print(f"[taxa]   media path: {CONFIG.taxon_media_path}")
     if not PARQUET.exists(CONFIG.taxon_media_path):
+        print(f"[taxa]   file does not exist — returning empty dict")
+        print(f"[taxa] ── load_taxon_media() complete ──────────────────────────")
         return {}
+    t_open = time.perf_counter()
     with PARQUET.open_input_file(CONFIG.taxon_media_path) as handle:
-        return pickle.load(handle)
+        t_open_elapsed = time.perf_counter() - t_open
+        print(f"[taxa]   handle opened in {t_open_elapsed*1000:.1f}ms")
+        print(f"[taxa]   reading + deserializing media pickle ...")
+        t_load = time.perf_counter()
+        try:
+            raw = handle.read()
+            t_read_elapsed = time.perf_counter() - t_load
+            import io as _io
+            t_pickle = time.perf_counter()
+            result = pickle.load(_io.BytesIO(raw))
+            t_pickle_elapsed = time.perf_counter() - t_pickle
+            print(f"[taxa]   read {len(raw)/1024/1024:.2f} MB in {t_read_elapsed:.3f}s, pickle in {t_pickle_elapsed:.3f}s")
+        except AttributeError:
+            result = pickle.load(handle)
+            t_pickle_elapsed = time.perf_counter() - t_load
+            print(f"[taxa]   pickle.load() (direct) in {t_pickle_elapsed:.3f}s")
+    print(f"[taxa]   {len(result):,} media records loaded")
+    print(f"[taxa] ── load_taxon_media() complete ──────────────────────────────")
+    return result
 
 # ---- Public API ----
 def get_taxon_by_id(taxon_id: str) -> TaxonRecord | None:
@@ -864,32 +997,68 @@ def load_occurrence_points(
 def _child_index() -> dict[str, list[str]]:
     """Builds a parent taxon key -> child taxon keys index."""
     import time
-    print(f"[taxa] _child_index() called — building parent->children mapping from catalog ...")
+    _PROGRESS_INTERVAL = 10_000
+
+    print(f"[taxa] ── _child_index() ───────────────────────────────────────────")
     t0 = time.perf_counter()
     catalog = load_catalog()
+    total = len(catalog)
+    print(f"[taxa]   building parent->children index over {total:,} records ...")
+    print(f"[taxa]   progress reported every {_PROGRESS_INTERVAL:,} records")
+
     mapping: dict[str, list[str]] = {}
     skipped_no_path = 0
     skipped_no_key = 0
-    for record in catalog.values():
+    t_last = time.perf_counter()
+    t_loop_start = t_last
+
+    for i, record in enumerate(catalog.values()):
         raw_path = record.get("path")
         if not raw_path:
             skipped_no_path += 1
-            continue
-        path = Path(str(raw_path))
-        parent_path = path.parent
-        parent_key = taxon_key_from_path(parent_path)
-        child_key = str(record.get("taxon_key") or "")
-        if child_key:
-            mapping.setdefault(parent_key, []).append(child_key)
         else:
-            skipped_no_key += 1
+            path = Path(str(raw_path))
+            parent_path = path.parent
+            parent_key = taxon_key_from_path(parent_path)
+            child_key = str(record.get("taxon_key") or "")
+            if child_key:
+                mapping.setdefault(parent_key, []).append(child_key)
+            else:
+                skipped_no_key += 1
+
+        if (i + 1) % _PROGRESS_INTERVAL == 0:
+            t_now = time.perf_counter()
+            elapsed_total = t_now - t_loop_start
+            elapsed_chunk = t_now - t_last
+            pct = (i + 1) / total * 100
+            rate = _PROGRESS_INTERVAL / elapsed_chunk if elapsed_chunk > 0 else 0
+            remaining = (total - i - 1) / rate if rate > 0 else 0
+            print(
+                f"[taxa]   [{i+1:>{len(str(total))},}/{total:,}  {pct:5.1f}%]"
+                f"  chunk={elapsed_chunk:.3f}s  total={elapsed_total:.3f}s"
+                f"  rate={rate:,.0f} rec/s  eta={remaining:.1f}s"
+                f"  parents_so_far={len(mapping):,}"
+            )
+            t_last = t_now
+
+    t_loop_elapsed = time.perf_counter() - t_loop_start
+
+    print(f"[taxa]   loop done in {t_loop_elapsed:.3f}s — sorting child lists ...")
+    t_sort = time.perf_counter()
     for children in mapping.values():
         children.sort()
-    elapsed = time.perf_counter() - t0
-    print(f"[taxa] _child_index() done in {elapsed:.3f}s")
-    print(f"[taxa]   {len(mapping):,} parent nodes, {sum(len(v) for v in mapping.values()):,} total child links")
+    t_sort_elapsed = time.perf_counter() - t_sort
+
+    total_elapsed = time.perf_counter() - t0
+    total_links = sum(len(v) for v in mapping.values())
+    avg_children = total_links / len(mapping) if mapping else 0
+    print(f"[taxa]   sort done in {t_sort_elapsed*1000:.1f}ms")
+    print(f"[taxa]   {len(mapping):,} parent nodes")
+    print(f"[taxa]   {total_links:,} total child links  (avg {avg_children:.1f} children/parent)")
     if skipped_no_path:
         print(f"[taxa]   skipped {skipped_no_path:,} records with no path")
     if skipped_no_key:
         print(f"[taxa]   skipped {skipped_no_key:,} records with no taxon_key")
+    print(f"[taxa]   total elapsed: {total_elapsed:.3f}s")
+    print(f"[taxa] ── _child_index() complete ──────────────────────────────────")
     return mapping
