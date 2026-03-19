@@ -56,6 +56,18 @@ def _preload_gis_legends() -> None:
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+
+
+@app.on_event("startup")
+def _preload_taxa() -> None:
+    try:
+        taxa_navigation.load_catalog()
+        taxa_navigation.load_name_index()
+        taxa_navigation._child_index()
+        taxa_navigation.load_taxon_media()
+    except Exception:
+        # Allow startup to succeed even if remote storage is temporarily unavailable.
+        pass
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:

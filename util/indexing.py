@@ -1364,6 +1364,7 @@ def build_density_curve(
     }
 
 
+@lru_cache(maxsize=65536)
 def _ancestor_contexts(taxon_path: Path) -> List[Any]:
     """Collects ancestor taxon records from a taxonomy path.
     
@@ -1546,10 +1547,11 @@ def _eligible_context_taxon_count_cached(
     )
 
 
+@lru_cache(maxsize=65536)
 def load_relative_ranks(
     taxon_dir: Path,
     variable_id: str,
-    metric_names: Optional[Sequence[str]] = None,
+    metric_names: Optional[tuple[str, ...]] = None,
     location_gid: Optional[str] = None,
 ) -> List[dict[str, Any]]:
     """Loads relative rank positions for a taxon across ancestor contexts.
