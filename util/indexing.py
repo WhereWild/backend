@@ -130,22 +130,14 @@ def _load_global_relative_rows(
     variable_id: str,
     metric_names: Optional[Sequence[str]] = None,
 ) -> pa.Table | None:
-    import time
     if PARQUET.is_remote:
         return None
     base = global_relative_positions_dir()
-    print(f"[ranks] _load_global_relative_rows(taxon={taxon_key}, var={variable_id})  base={base}")
-    t_exist = time.perf_counter()
-    exists = base.exists()
-    print(f"[ranks]   base.exists()={exists}  ({(time.perf_counter()-t_exist)*1000:.1f}ms)")
-    if not exists:
+    if not base.exists():
         return None
     try:
-        t_ds = time.perf_counter()
         dataset = pds.dataset(str(base), format="parquet")
-        print(f"[ranks]   pds.dataset() opened in {(time.perf_counter()-t_ds)*1000:.1f}ms  (files: {len(dataset.files)})")
-    except (OSError, ValueError) as e:
-        print(f"[ranks]   pds.dataset() failed: {e}")
+    except (OSError, ValueError):
         return None
     try:
         filter_expr = (
@@ -159,7 +151,6 @@ def _load_global_relative_rows(
         ]
         if requested_metrics:
             filter_expr = filter_expr & pds.field("metric").isin(requested_metrics)
-        t_scan = time.perf_counter()
         table = dataset.to_table(
             columns=[
                 "variable",
@@ -172,9 +163,7 @@ def _load_global_relative_rows(
             ],
             filter=filter_expr,
         )
-        print(f"[ranks]   to_table() scan done in {(time.perf_counter()-t_scan)*1000:.1f}ms  rows={table.num_rows}")
-    except (OSError, ValueError) as e:
-        print(f"[ranks]   to_table() failed: {e}")
+    except (OSError, ValueError):
         return None
     if not table.num_rows:
         return None
@@ -1566,20 +1555,14 @@ def load_relative_ranks(
     Returns:
         A list of relative-rank entries for each ancestor context and metric.
     """
-    import time
-    t0 = time.perf_counter()
-    print(f"[ranks] load_relative_ranks(dir={taxon_dir.name!r}, var={variable_id!r}, location={location_gid!r})")
     name = taxon_dir.name
     if "_" not in name:
-        print(f"[ranks]   no underscore in dir name — returning []")
         return []
     taxon_key = name.split("_")[-1]
     if not taxon_key:
-        print(f"[ranks]   no taxon_key — returning []")
         return []
     taxon = taxa_navigation.get_taxon_by_id(str(taxon_key))
     if taxon is None:
-        print(f"[ranks]   taxon {taxon_key!r} not found in catalog — returning []")
         return []
     requested_metrics = {
         str(name).strip().lower()
@@ -1712,7 +1695,6 @@ def load_relative_ranks(
                     ),
                 }
             )
-        print(f"[ranks] load_relative_ranks done (global path) in {(time.perf_counter()-t0)*1000:.1f}ms  results={len(results)}")
         return results
     for ancestor in contexts:
         ancestor_rank = taxa_navigation.canonical_rank(ancestor["rank"]) or ""
@@ -1821,7 +1803,6 @@ def load_relative_ranks(
                 "sampleCount": int(sample_count) if sample_count is not None else None,
             }
             results.append(entry)
-    print(f"[ranks] load_relative_ranks done (index path) in {(time.perf_counter()-t0)*1000:.1f}ms  results={len(results)}")
     return results
 
 
