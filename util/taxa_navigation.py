@@ -843,10 +843,13 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     Returns:
         A serialized version of the taxon containing its id, scientific and common names, description, image, and rank metadata.
     """
+    import time as _time
     taxon_id = taxon_id_as_int(taxon.get("taxon_key"))
     if taxon_id is None:
         return None
     scientific_name = (taxon.get("scientific_name") or "").replace("_", " ").strip()
+    _t_ser = _time.perf_counter()
+    print(f"[taxa] serialize_taxon({scientific_name!r}  key={taxon.get('taxon_key')})")
 
     common_names = extract_common_names_for_language(taxon, language=CONFIG.common_name_language)
     common_name = common_names[0] if common_names else scientific_name
@@ -859,10 +862,14 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
 
     # Prefer catalog-stored preferred image metadata when available.
     taxon_key = taxon.get("taxon_key")
+    _t_img = _time.perf_counter()
     preferred_image = preferred_image_payload(taxon)
+    print(f"[taxa]   preferred_image_payload: {(_time.perf_counter()-_t_img)*1000:.1f}ms")
     media_record = None
     if not preferred_image and taxon_key:
+        _t_media = _time.perf_counter()
         media_record = resolve_taxon_media(taxon_key)
+        print(f"[taxa]   resolve_taxon_media: {(_time.perf_counter()-_t_media)*1000:.1f}ms")
 
     result = {
         "taxon_id": taxon_id,
@@ -886,6 +893,7 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         result["image_rights_holder"] = media_record.get("rightsHolder")
         result["image_references"] = media_record.get("references")
 
+    print(f"[taxa]   serialize_taxon done in {(_time.perf_counter()-_t_ser)*1000:.1f}ms")
     return result
 
 
