@@ -87,6 +87,18 @@
         { "id": "snow_depth", "code": "SNOW_DEPTH", "display_name": "Snow Depth", "units": "m", "value_type": "numeric", "agg": "avg", "windows": [1] },
         { "id": "weather_code_simple", "code": "WEATHER_CODE_SIMPLE", "display_name": "Weather Code (Simple)", "units": "class id", "value_type": "categorical", "agg": "snapshot", "windows": [1] }
       ]
+    },
+    {
+      "name": "live_weather",
+      "display_name": "Live Weather",
+      "description": "Current conditions from GFS forecast model, updated every 6 hours.",
+      "source": "NOAA GFS via Open-Meteo AWS Open Data",
+      "license": "Public Domain",
+      "layers": [
+        { "id": "temperature_2m",       "code": "TEMPERATURE_2M",       "display_name": "Air Temperature (2m)",   "units": "°C", "value_type": "numeric" },
+        { "id": "relative_humidity_2m", "code": "RELATIVE_HUMIDITY_2M", "display_name": "Relative Humidity (2m)", "units": "%",  "value_type": "numeric" },
+        { "id": "cloud_cover",          "code": "CLOUD_COVER",          "display_name": "Cloud Cover",            "units": "%",  "value_type": "numeric" }
+      ]
     }
   ]
 }

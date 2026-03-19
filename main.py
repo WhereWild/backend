@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles
+from util import descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles, weather_tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -58,11 +58,15 @@ def _preload_gis_legends() -> None:
     try:
         gis_lookup.preload_layer_legends()
     except FileNotFoundError:
-        # Allow API to start even if GIS catalog/legends are not present yet.
         pass
     except OSError:
-        # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+
+
+@app.on_event("startup")
+def _load_weather_cache() -> None:
+    import threading
+    threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:
@@ -99,6 +103,15 @@ def _map_enabled_variables() -> frozenset[str]:
     if not enabled:
         enabled.update({"landcover", "koppen_geiger"})
     return frozenset(sorted(enabled))
+
+
+@app.get("/api/weather/status", summary="Live weather cache status")
+def weather_cache_status() -> dict:
+    return {
+        "ref_times": weather_tiles._cache_ref_times,
+        "cached_variables": list(weather_tiles._cache.keys()),
+        "ready": len(weather_tiles._cache) == len(weather_tiles.LIVE_WEATHER_VARIABLES),
+    }
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -154,6 +167,21 @@ async def variable_tile(
     layer_id = (variable_id or "").strip().lower()
     if not layer_id:
         raise HTTPException(status_code=400, detail="variable_id is required.")
+
+    # Live weather variables bypass the GeoTIFF pipeline entirely
+    if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
+        if await request.is_disconnected():
+            return Response(status_code=204)
+        payload = await run_in_threadpool(
+            weather_tiles.render_weather_tile_bytes,
+            variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+        )
+        if payload is None:
+            # Cache not yet populated — return transparent tile
+            return Response(status_code=204)
+        headers = {"Cache-Control": f"public, max-age={variable_tile_cache_seconds}"}
+        return Response(content=payload, media_type="image/png", headers=headers)
+
     enabled_variables = _map_enabled_variables()
     if layer_id not in enabled_variables:
         allowed = ", ".join(sorted(enabled_variables))
