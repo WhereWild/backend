@@ -2826,9 +2826,12 @@ def build_taxon_description(
     unit_system: Optional[str] = None,
 ) -> dict[str, Any]:
     """Builds a structured description and plain text rendering for a taxon."""
+    import time as _time
     from util import taxa_navigation
 
+    _t_desc = _time.perf_counter()
     scientific_name = (taxon.get("scientific_name") or "").replace("_", " ").strip()
+    print(f"[desc] ── build_taxon_description({scientific_name!r}, location={location_gid!r}) ──")
     if not scientific_name:
         return {
             "summary": "",
@@ -2948,4 +2951,5 @@ def build_taxon_description(
     }
     profile["sections"] = _build_profile_sections(profile)
     profile["text"] = _render_profile_text(profile)
+    print(f"[desc] ── build_taxon_description done in {(_time.perf_counter()-_t_desc)*1000:.0f}ms ──")
     return profile
