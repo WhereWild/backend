@@ -221,6 +221,15 @@ class GlobalConfig:
     )
     # Cap the number of occurrence rows per worklist batch to bound memory.
     # Set to 0 to disable batching (process all rows at once).
+    # Temporal raster builder settings
+    temporal_raster_b2_dest: str = "wherewild-localdev-writer:wherewild-data/gis/temporal/rasters"
+    temporal_raster_upload_enabled: bool = True
+    temporal_raster_force_rebuild: bool = False
+    # Subset of VAR_CONFIGS keys to build; empty tuple = build all
+    temporal_raster_vars: tuple[str, ...] = ()
+    # Subset of window labels to build; empty tuple = build all
+    temporal_raster_windows: tuple[str, ...] = ()
+
     temporal_worklist_batch_rows: int = 1_500_000
     # Log a one-time model elevation summary per model to validate HSURF access.
     temporal_debug_model_elevation: bool = True

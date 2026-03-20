@@ -159,6 +159,7 @@ async def variable_tile(
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
+    window: Optional[str] = Query(None, description="Aggregation window for live weather (e.g. 24h, 7d, 30d)."),
 ) -> Response:
     """Render a variable tile using the same overview + tile extraction flow as SDM tiles."""
     if await request.is_disconnected():
@@ -172,12 +173,17 @@ async def variable_tile(
     if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
         if await request.is_disconnected():
             return Response(status_code=204)
-        payload = await run_in_threadpool(
-            weather_tiles.render_weather_tile_bytes,
-            variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
-        )
+        if window and window != "live":
+            payload = await run_in_threadpool(
+                weather_tiles.render_aggregate_tile_bytes,
+                variable_id=layer_id, window=window, z=z, x=x, y=y, tile_size=tile_size,
+            )
+        else:
+            payload = await run_in_threadpool(
+                weather_tiles.render_weather_tile_bytes,
+                variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+            )
         if payload is None:
-            # Cache not yet populated — return transparent tile
             return Response(status_code=204)
         headers = {"Cache-Control": f"public, max-age={variable_tile_cache_seconds}"}
         return Response(content=payload, media_type="image/png", headers=headers)

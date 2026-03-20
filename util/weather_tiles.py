@@ -108,8 +108,8 @@ LIVE_WEATHER_VARIABLES: dict[str, dict] = {
     "cloud_cover":               {"model": "ncep_gfs013", "lo":   0.0, "hi": 100.0, "stops": _CLOUD},
     "precipitation":             {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _PRECIP},
     "snowfall_water_equivalent": {"model": "ncep_gfs013", "lo":   0.0, "hi":  10.0, "stops": _SNOWFALL},
-    "soil_moisture_0_to_10cm":   {"model": "ncep_gfs013", "lo":   0.0, "hi":   0.5, "stops": _SOIL_MOIST},
-    "soil_temperature_0_to_10cm": {"model": "ncep_gfs013", "lo": -10.0, "hi":  40.0, "stops": _BLUE_RED},
+    "soil_moisture_0_to_7cm":    {"model": "ncep_gfs013", "lo":   0.0, "hi":   0.5, "stops": _SOIL_MOIST, "fetch_as": "soil_moisture_0_to_10cm"},
+    "soil_temperature_0_to_7cm": {"model": "ncep_gfs013", "lo": -10.0, "hi":  40.0, "stops": _BLUE_RED,   "fetch_as": "soil_temperature_0_to_10cm"},
     # --- derived from temperature_2m + relative_humidity_2m ---
     "dew_point_2m":           {"model": "ncep_gfs013", "lo": -40.0, "hi":  35.0, "stops": _BLUE_RED, "derived": True},
     "vapor_pressure_deficit":  {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _VPD,     "derived": True},
@@ -158,11 +158,13 @@ def _load_model(model: str) -> None:
     ref_time = meta["reference_time"]
 
     # Determine which variables this model needs to supply (direct only; derived computed below)
+    # Use fetch_as when set (e.g. soil_moisture_0_to_7cm fetches soil_moisture_0_to_10cm from GFS)
     raw_needs = (
-        {var_id for var_id, cfg in LIVE_WEATHER_VARIABLES.items()
+        {cfg.get("fetch_as", var_id) for var_id, cfg in LIVE_WEATHER_VARIABLES.items()
          if cfg["model"] == model and not cfg.get("derived")}
         | _EXTRA_RAW
     )
+
 
     with _cache_lock:
         current_ref = _cache_ref_times.get(model)
@@ -235,12 +237,13 @@ def _load_model(model: str) -> None:
         es = 0.6108 * np.exp(17.27 * T / (T + 237.3))
         disk_hits["vapor_pressure_deficit"] = (es * (1.0 - RH_c / 100.0)).astype(np.float32)
 
-    # Populate memory cache
+    # Populate memory cache (resolve fetch_as aliases)
     with _cache_lock:
         for var_id, cfg in LIVE_WEATHER_VARIABLES.items():
             if cfg["model"] != model:
                 continue
-            arr = disk_hits.get(var_id)
+            fetch_key = cfg.get("fetch_as", var_id)
+            arr = disk_hits.get(fetch_key)
             if arr is not None:
                 _cache[var_id] = arr
         _cache_ref_times[model] = ref_time
@@ -320,6 +323,67 @@ def render_weather_tile_bytes(variable_id: str, z: int, x: int, y: int,
     rgba[~np.isfinite(dest), 3] = 0
     img = Image.fromarray(rgba, mode="RGBA")
 
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# Aggregate range overrides — sum over window is larger than snapshot range
+_AGG_RANGE_OVERRIDES: dict[str, dict[str, dict[str, float]]] = {
+    "precipitation": {
+        "24h": {"lo": 0.0, "hi":   50.0},
+        "7d":  {"lo": 0.0, "hi":  200.0},
+        "30d": {"lo": 0.0, "hi":  500.0},
+    },
+    "snowfall_water_equivalent": {
+        "24h": {"lo": 0.0, "hi":   20.0},
+        "7d":  {"lo": 0.0, "hi":   80.0},
+        "30d": {"lo": 0.0, "hi":  200.0},
+    },
+}
+
+# ERA5 grid (lat ascending, south→north, no flipud needed)
+_ERA5_LAT_MIN, _ERA5_LAT_MAX = -90.0,  90.0
+_ERA5_LON_MIN, _ERA5_LON_MAX = -180.0, 180.0
+
+
+def render_aggregate_tile_bytes(variable_id: str, window: str, z: int, x: int, y: int,
+                                 tile_size: int = 256) -> bytes | None:
+    """Render a tile from a pre-computed aggregate raster (.npy on disk)."""
+    npy_path = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters" / f"{variable_id}_{window}.npy"
+    if not npy_path.exists():
+        return None
+
+    arr = np.load(npy_path)  # [721, 1440], ERA5 grid, lat ascending
+    cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
+    if cfg is None or cfg.get("categorical"):
+        return None
+
+    overrides = _AGG_RANGE_OVERRIDES.get(variable_id, {}).get(window, {})
+    lo = overrides.get("lo", cfg["lo"])
+    hi = overrides.get("hi", cfg["hi"])
+
+    ny, nx = arr.shape
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    src_transform = rasterio_from_bounds(_ERA5_LON_MIN, _ERA5_LAT_MIN, _ERA5_LON_MAX, _ERA5_LAT_MAX, nx, ny)
+
+    minx, miny, maxx, maxy = tile_bounds_mercator(spec)
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    reproject(
+        source=arr,
+        destination=dest,
+        src_transform=src_transform,
+        src_crs=CRS.from_epsg(4326),
+        src_nodata=np.nan,
+        dst_transform=rasterio_from_bounds(minx, miny, maxx, maxy, tile_size, tile_size),
+        dst_crs=CRS.from_string(WEB_MERCATOR),
+        dst_nodata=np.nan,
+        resampling=RasterioResampling.bilinear,
+    )
+
+    rgba = _colorize(dest, cfg["stops"], lo, hi)
+    rgba[~np.isfinite(dest), 3] = 0
+    img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
