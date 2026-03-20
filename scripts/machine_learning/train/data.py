@@ -44,10 +44,9 @@ _ADAPTIVE_PREFETCH_WAIT_SECONDS = 0.05
 def load_split_table(
     data_root: str | Path,
     split: str,
-    partitioning: str = "hive",
 ) -> ds.Dataset:
-    """Load a single split from the partitioned dataset."""
-    dataset = ds.dataset(str(data_root), format="parquet", partitioning=partitioning)
+    """Load a single split from the split-partitioned dataset."""
+    dataset = ds.dataset(str(data_root), format="parquet", partitioning="hive")
     return dataset.filter(pc.field("split") == split)
 
 
@@ -127,9 +126,9 @@ def _record_batch_to_tensors(record_batch: pa.RecordBatch) -> dict[str, torch.Te
     }
 
 
-def detect_feature_dims(data_root: str | Path, partitioning: str = "hive") -> dict[str, int]:
+def detect_feature_dims(data_root: str | Path) -> dict[str, int]:
     """Read one row to determine feature vector sizes."""
-    dataset = ds.dataset(str(data_root), format="parquet", partitioning=partitioning)
+    dataset = ds.dataset(str(data_root), format="parquet", partitioning="hive")
     row = dataset.head(1)
     dims = {}
     for col in FEATURE_COLUMNS:
@@ -149,9 +148,8 @@ class TrainingDataset(Dataset):
         self,
         data_root: str | Path,
         split: str = "train",
-        partitioning: str = "hive",
     ) -> None:
-        split_ds = load_split_table(data_root, split, partitioning)
+        split_ds = load_split_table(data_root, split)
         columns = [*FEATURE_COLUMNS, *MASK_COLUMNS, *META_COLUMNS]
         table = split_ds.to_table(columns=columns)
         df = table.to_pandas()
@@ -277,9 +275,8 @@ class StreamingTrainingDataset:
         self,
         data_root: str | Path,
         split: str = "train",
-        partitioning: str = "hive",
     ) -> None:
-        self._split_ds = load_split_table(data_root, split, partitioning)
+        self._split_ds = load_split_table(data_root, split)
         self.feature_dim, self.recon_dim = _probe_feature_dims(self._split_ds)
         # count_rows() reads only parquet footers -- no column data is loaded.
         self.row_count: int = self._split_ds.count_rows()

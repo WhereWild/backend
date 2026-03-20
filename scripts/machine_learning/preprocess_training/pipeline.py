@@ -301,14 +301,12 @@ def write_partitioned_dataset(
     output_root: Path,
     max_rows_per_file: int,
 ) -> None:
-    """Write staging shards into a hive-partitioned parquet dataset."""
+    """Write staging shards into a split-partitioned hive-style parquet dataset."""
     output_root.mkdir(parents=True, exist_ok=True)
 
     partition_schema = pa.schema([pa.field("split", pa.string())])
 
-    heartbeat_stop, heartbeat_thread = start_phase_heartbeat(
-        "Final write", PROGRESS_INTERVAL_SECONDS
-    )
+    heartbeat_stop, heartbeat_thread = start_phase_heartbeat("Final write", PROGRESS_INTERVAL_SECONDS)
     try:
         staged_dataset = ds.dataset(shard_paths, format="parquet")
         ds.write_dataset(

@@ -1,4 +1,4 @@
-"""Validate a training parquet dataset against a schema contract.
+"""Validate a split-partitioned training parquet dataset against a schema contract.
 
 Checks required columns and Arrow-compatible types against
 `schemas/training_observation.schema.json`.
@@ -59,9 +59,9 @@ def _load_contract(schema_path: Path) -> tuple[dict[str, pa.DataType], set[str]]
     return expected, required
 
 
-def _read_data_schema(data_path: Path, partitioning: str | None = "hive") -> pa.Schema:
-    """Read dataset schema from a parquet file or directory."""
-    dataset = ds.dataset(data_path, format="parquet", partitioning=partitioning)
+def _read_data_schema(data_path: Path) -> pa.Schema:
+    """Read dataset schema from a split-partitioned parquet file or directory."""
+    dataset = ds.dataset(data_path, format="parquet", partitioning="hive")
     return dataset.schema
 
 
@@ -109,12 +109,10 @@ def _validate_with_loaded(
 def validate(
     schema_path: Path,
     data_path: Path,
-    *,
-    partitioning: str | None = "hive",
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """Convenience wrapper that loads schema/data before validation."""
     expected, required = _load_contract(schema_path)
-    actual_schema = _read_data_schema(data_path, partitioning=partitioning)
+    actual_schema = _read_data_schema(data_path)
 
     return _validate_with_loaded(expected=expected, required=required, actual_schema=actual_schema)
 
@@ -139,20 +137,11 @@ def main() -> int:
         action="store_true",
         help="If set, do not fail when data contains columns absent from schema.",
     )
-    parser.add_argument(
-        "--partitioning",
-        type=str,
-        default="hive",
-        choices=["hive", "none"],
-        help="Dataset partitioning mode. Use 'hive' for split/year_month/region_id directory partitions.",
-    )
 
     args = parser.parse_args()
 
-    partitioning_mode: str | None = None if args.partitioning == "none" else args.partitioning
-
     expected, required = _load_contract(args.schema)
-    actual_schema = _read_data_schema(args.data, partitioning=partitioning_mode)
+    actual_schema = _read_data_schema(args.data)
     missing_required, missing_optional, type_mismatches, extras = _validate_with_loaded(
         expected=expected,
         required=required,

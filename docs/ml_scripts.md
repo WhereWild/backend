@@ -13,7 +13,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 ## Scripts
 
 - `scripts/machine_learning/preprocess_training/cli.py`
-    - Builds partitioned training parquet dataset from occurrence parquet files.
+    - Builds a split-partitioned training parquet dataset from occurrence parquet files.
     - Entry script for the split implementation in `pipeline.py` and `transform.py`.
 - `scripts/machine_learning/train/cli.py`
     - Trains the shared encoder (Stage B) and per-species PU heads (Stage C).
@@ -33,7 +33,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data/species/taxonomy/Plantae_6 \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 100 \
     --threads 8 \
     --overwrite-output
@@ -48,7 +48,7 @@ with `(cell_id, year_month)` conflicts excluded.
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data/species/taxonomy/Plantae_6 \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 1000 \
     --threads 16 \
     --overwrite-output \
@@ -61,7 +61,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data/species/taxonomy/Plantae_6 \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 10000 \
     --threads 8 \
     --overwrite-output \
@@ -76,7 +76,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ```bash
 uv run python scripts/machine_learning/preprocess_training/cli.py \
     --input-root ./data/species/taxonomy/Plantae_6 \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --max-files 0 \
     --template-scan-max-files 50000 \
     --threads 8 \
@@ -116,7 +116,7 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
 
 ### Not implemented yet
 
-- Species-bucket partitioned view for per-species head training (`species_bucket`) is a separate derived-dataset step and is not implemented by the current preprocessing CLI.
+- Species-bucket or species-partitioned derived views for per-species head training (`species_bucket`) are separate derived-dataset steps and are not implemented by the current preprocessing CLI.
 
 ### Resume from staging after interrupted preprocess
 
@@ -131,8 +131,8 @@ Resume base + background shards, write output partitions, then write template:
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --staging-dir ./data/.species_observation_canary_plants_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --staging-dir ./data_ml/.species_observation_canary_plants_staging \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
     --resume-output-files \
@@ -152,7 +152,7 @@ If you only need to (re)create metadata after a completed write:
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-feature-template-file
 ```
 
@@ -160,8 +160,8 @@ If you only want to rebuild pooled background shards in staging (no final write)
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.resume_from_staging \
-    --staging-dir ./data/.species_observation_canary_plants_staging \
-    --output-root ./data/species_observation_canary_plants \
+    --staging-dir ./data_ml/.species_observation_canary_plants_staging \
+    --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
     --regenerate-background \
@@ -174,15 +174,13 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
 ```bash
 uv run python scripts/machine_learning/validate_training_schema.py \
     --schema schemas/training_observation.schema.json \
-    --data ./data/species_observation_canary_plants \
-    --partitioning hive \
+    --data ./data_ml/species_observation_canary_plants \
     --allow-extra-columns
 ```
 
 Notes:
 
-- Use `--partitioning hive` for partitioned datasets written as
-    `split=...`, `split=.../year_month=...`, or `split=.../year_month=.../region_id=...`.
+- The validator reads split-partitioned datasets written under `split=...` directories.
 - `fixed_size_list<float>` vectors are accepted as compatible with schema `list<float>`.
 
 ## 3. Regenerate schema docs
@@ -211,7 +209,7 @@ Current Stage B objective is masked reconstruction of observed feature values.
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 32768
@@ -221,7 +219,7 @@ On CPU (slower, no AMP):
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py encoder \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
     --batch-size 2048 \
@@ -233,7 +231,7 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py heads \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-dir ./checkpoints/canary_plants/heads
 ```
@@ -242,7 +240,7 @@ uv run python scripts/machine_learning/train/cli.py heads \
 
 ```bash
 uv run python scripts/machine_learning/train/cli.py all \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants \
     --epochs 50 \
     --head-epochs 50 \
@@ -278,7 +276,7 @@ Package the trained model into a single `.pt` file for server-side deployment:
 uv run python scripts/machine_learning/train/export.py \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --output ./checkpoints/canary_plants/inference_bundle.pt
 ```
 
@@ -385,7 +383,7 @@ for each trial and ranking by median species validation loss:
 
 ```bash
 uv run python -m scripts.machine_learning.sweep_head_training \
-    --data-root ./data/species_observation_canary_plants \
+    --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-root ./tmp/head_sweep \
     --head-lr-grid 0.01,0.005,0.001 \

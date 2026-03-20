@@ -7,12 +7,12 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 ## Storage
 
 - Format: `parquet`
-- Partition keys: `split`, `year_month`, `region_id`
+- Partition key: `split`
 - Compression: `zstd`
 
 ## Partitioning Guidance
 
-- Primary partitions are split/year_month/region_id for efficient spatiotemporal slicing and leakage-safe evaluation. Species partitioning is optional for derived head-training datasets (e.g., species_bucket) but not recommended as the base layout due to high cardinality and small-file risk.
+- Datasets use a split-only partition layout.
 
 ## Sampling Semantics
 
@@ -33,11 +33,11 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 | `presence_label` | `int8` | yes | `metadata` | 1 for positive, 0 for unlabeled/background sample. |
 | `sample_weight` | `float32` | yes | `metadata` | Row weight for PU learning / sampling correction. |
 | `cell_id` | `string` | yes | `metadata` | Spatial index cell id used to join environmental context. |
-| `region_id` | `string` | yes | `metadata` | Region/biome partition id for stratified splits and sampling. |
+| `region_id` | `string` | yes | `metadata` | Region/biome identifier retained for stratified analysis and sampling. |
 | `lat` | `float64` | yes | `metadata` | Latitude in WGS84 decimal degrees. |
 | `lon` | `float64` | yes | `metadata` | Longitude in WGS84 decimal degrees. |
 | `event_time_utc` | `timestamp_ms_utc` | yes | `metadata` | Observation/background timestamp in UTC used for weather alignment. |
-| `year_month` | `string` | yes | `metadata` | YYYY-MM partition key derived from event_time_utc. |
+| `year_month` | `string` | yes | `metadata` | YYYY-MM value derived from event_time_utc. |
 | `split` | `string` | yes | `metadata` | Dataset split label (train/val/test) from spatiotemporal splitter. |
 | `source` | `string` | yes | `metadata` | Data source tag (e.g., gbif, inat, generated_background). |
 | `feature_version` | `string` | yes | `metadata` | Version of feature engineering order and normalization. |

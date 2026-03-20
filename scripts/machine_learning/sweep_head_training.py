@@ -100,7 +100,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a grid sweep over Stage C species-head training hyperparameters.",
     )
-    parser.add_argument("--data-root", required=True, help="Path to preprocessed partitioned parquet dataset.")
+    parser.add_argument("--data-root", required=True, help="Path to preprocessed split-partitioned parquet dataset.")
     parser.add_argument(
         "--encoder-checkpoint", required=True, help="Path to encoder_best.pt used for Stage C training."
     )
