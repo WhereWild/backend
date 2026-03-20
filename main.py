@@ -66,7 +66,7 @@ def _preload_gis_legends() -> None:
 @app.on_event("startup")
 def _load_weather_cache() -> None:
     import threading
-    threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
+    threading.Thread(target=weather_tiles.load_from_disk, daemon=True, name="weather-cache").start()
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:
@@ -160,6 +160,7 @@ async def variable_tile(
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
     window: Optional[str] = Query(None, description="Aggregation window for live weather (e.g. 24h, 7d, 30d)."),
+    forecast: Optional[str] = Query(None, description="Forecast offset for live weather (e.g. 1h, 24h, 3d)."),
 ) -> Response:
     """Render a variable tile using the same overview + tile extraction flow as SDM tiles."""
     if await request.is_disconnected():
@@ -173,15 +174,19 @@ async def variable_tile(
     if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
         if await request.is_disconnected():
             return Response(status_code=204)
+        _FORECAST_LABEL_TO_HOURS = {"1h": 1, "8h": 8, "24h": 24, "3d": 72, "7d": 168}
+        forecast_hours = _FORECAST_LABEL_TO_HOURS.get(forecast or "", 0)
         if window and window != "live":
             payload = await run_in_threadpool(
                 weather_tiles.render_aggregate_tile_bytes,
                 variable_id=layer_id, window=window, z=z, x=x, y=y, tile_size=tile_size,
+                forecast_hours=forecast_hours,
             )
         else:
             payload = await run_in_threadpool(
                 weather_tiles.render_weather_tile_bytes,
                 variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+                forecast_hours=forecast_hours,
             )
         if payload is None:
             return Response(status_code=204)
