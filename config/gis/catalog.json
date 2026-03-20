@@ -91,13 +91,18 @@
     {
       "name": "live_weather",
       "display_name": "Live Weather",
-      "description": "Current conditions from GFS forecast model, updated every 6 hours.",
-      "source": "NOAA GFS via Open-Meteo AWS Open Data",
+      "description": "Current conditions from NCEP GFS 0.13° forecast model, updated every 6 hours.",
+      "source": "NCEP GFS 013 via Open-Meteo AWS Open Data",
       "license": "Public Domain",
       "layers": [
-        { "id": "temperature_2m",       "code": "TEMPERATURE_2M",       "display_name": "Air Temperature (2m)",   "units": "°C", "value_type": "numeric" },
-        { "id": "relative_humidity_2m", "code": "RELATIVE_HUMIDITY_2M", "display_name": "Relative Humidity (2m)", "units": "%",  "value_type": "numeric" },
-        { "id": "cloud_cover",          "code": "CLOUD_COVER",          "display_name": "Cloud Cover",            "units": "%",  "value_type": "numeric" }
+        { "id": "temperature_2m",             "code": "TEMPERATURE_2M",          "display_name": "Air Temperature (2m)",     "units": "°C",    "value_type": "numeric" },
+        { "id": "cloud_cover",                "code": "CLOUD_COVER",             "display_name": "Cloud Cover",              "units": "%",     "value_type": "numeric" },
+        { "id": "precipitation",              "code": "PRECIPITATION",           "display_name": "Precipitation",            "units": "mm",    "value_type": "numeric" },
+        { "id": "snowfall_water_equivalent",  "code": "SNOWFALL_WATER_EQUIV",    "display_name": "Snowfall Water Equivalent","units": "mm",    "value_type": "numeric" },
+        { "id": "soil_moisture_0_to_10cm",    "code": "SOIL_MOISTURE_0_10CM",    "display_name": "Soil Moisture (0–10cm)",   "units": "m³/m³", "value_type": "numeric" },
+        { "id": "soil_temperature_0_to_10cm", "code": "SOIL_TEMPERATURE_0_10CM", "display_name": "Soil Temperature (0–10cm)","units": "°C",    "value_type": "numeric" },
+        { "id": "dew_point_2m",               "code": "DEW_POINT_2M",            "display_name": "Dew Point (2m)",           "units": "°C",    "value_type": "numeric", "derived": true },
+        { "id": "vapor_pressure_deficit",     "code": "VPD",                     "display_name": "Vapor Pressure Deficit",   "units": "kPa",   "value_type": "numeric", "derived": true }
       ]
     }
   ]

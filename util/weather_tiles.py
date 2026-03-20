@@ -1,4 +1,4 @@
-"""Live weather tile rendering from Open-Meteo spatial data on S3 (multi-model)."""
+"""Live weather tile rendering from Open-Meteo ncep_gfs013 spatial data on S3."""
 from __future__ import annotations
 
 import io
@@ -31,11 +31,6 @@ MODEL_CONFIGS: dict[str, dict] = {
         "lon_min": -180.0,     "lon_max":  179.88281,
         "flipud": True,   # stored south-up
     },
-    "dwd_icon": {
-        "lat_min": -90.0,  "lat_max":  90.0,
-        "lon_min": -180.0, "lon_max":  179.875,
-        "flipud": False,  # stored north-down
-    },
 }
 
 # --- Color stops ---
@@ -55,18 +50,53 @@ _CLOUD = np.array([
     [255, 255, 255],
 ], dtype=np.float32)
 
-_HUMID = np.array([
-    [230, 100,  20],  # very dry: orange
-    [250, 200,  50],
-    [200, 230, 100],
-    [ 50, 180, 100],
-    [  0, 100, 200],  # very humid: blue
+_PRECIP = np.array([
+    [240, 248, 255],
+    [100, 180, 255],
+    [ 30, 100, 220],
+    [  0,  50, 160],
+    [  0,  20,  80],
 ], dtype=np.float32)
 
+_SNOWFALL = np.array([
+    [230, 240, 255],
+    [160, 200, 255],
+    [ 80, 140, 255],
+    [ 20,  60, 200],
+    [  0,  10, 100],
+], dtype=np.float32)
+
+_SOIL_MOIST = np.array([
+    [210, 170, 100],
+    [160, 130,  60],
+    [ 80, 160,  80],
+    [ 30, 120, 180],
+    [  0,  60, 160],
+], dtype=np.float32)
+
+_VPD = np.array([
+    [  0, 120, 200],  # low VPD: blue
+    [ 80, 200, 120],
+    [255, 240,  80],
+    [255, 140,   0],
+    [200,   0,   0],  # high VPD: red
+], dtype=np.float32)
+
+# "derived": True  → computed from other vars, not fetched from S3
+# "needs": [...]   → raw vars required for derivation (must also be in LIVE_WEATHER_VARIABLES or _EXTRA_RAW)
+_EXTRA_RAW = {"relative_humidity_2m"}  # fetched but not rendered directly
+
 LIVE_WEATHER_VARIABLES: dict[str, dict] = {
-    "temperature_2m":       {"model": "ncep_gfs013", "lo": -50.0, "hi":  50.0, "stops": _BLUE_RED},
-    "relative_humidity_2m": {"model": "ncep_gfs013", "lo":   0.0, "hi": 100.0, "stops": _HUMID},
-    "cloud_cover":          {"model": "dwd_icon",    "lo":   0.0, "hi": 100.0, "stops": _CLOUD},
+    # --- direct ---
+    "temperature_2m":            {"model": "ncep_gfs013", "lo": -50.0, "hi":  50.0, "stops": _BLUE_RED},
+    "cloud_cover":               {"model": "ncep_gfs013", "lo":   0.0, "hi": 100.0, "stops": _CLOUD},
+    "precipitation":             {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _PRECIP},
+    "snowfall_water_equivalent": {"model": "ncep_gfs013", "lo":   0.0, "hi":  10.0, "stops": _SNOWFALL},
+    "soil_moisture_0_to_10cm":   {"model": "ncep_gfs013", "lo":   0.0, "hi":   0.5, "stops": _SOIL_MOIST},
+    "soil_temperature_0_to_10cm": {"model": "ncep_gfs013", "lo": -10.0, "hi":  40.0, "stops": _BLUE_RED},
+    # --- derived from temperature_2m + relative_humidity_2m ---
+    "dew_point_2m":           {"model": "ncep_gfs013", "lo": -40.0, "hi":  35.0, "stops": _BLUE_RED,  "derived": True},
+    "vapor_pressure_deficit":  {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _VPD,      "derived": True},
 }
 
 # --- Disk cache ---
@@ -109,8 +139,12 @@ def _load_model(model: str) -> None:
         meta = json.load(f)
     ref_time = meta["reference_time"]
 
-    # Determine which variables this model needs to supply
-    raw_needs = {var_id for var_id, cfg in LIVE_WEATHER_VARIABLES.items() if cfg["model"] == model}
+    # Determine which variables this model needs to supply (direct only; derived computed below)
+    raw_needs = (
+        {var_id for var_id, cfg in LIVE_WEATHER_VARIABLES.items()
+         if cfg["model"] == model and not cfg.get("derived")}
+        | _EXTRA_RAW
+    )
 
     with _cache_lock:
         current_ref = _cache_ref_times.get(model)
@@ -132,7 +166,7 @@ def _load_model(model: str) -> None:
     need = [v for v in raw_needs if v not in disk_hits]
     if need:
         ref = datetime.fromisoformat(ref_time.replace("Z", "+00:00"))
-        valid = datetime.fromisoformat(meta["valid_times"][0].replace("Z", "+00:00"))
+        valid = datetime.fromisoformat(meta["valid_times"][1].replace("Z", "+00:00"))
         path = _s3_path(model, ref, valid)
         print(f"[weather_tiles] S3 fetch: {need} from {model} ({ref_time})", flush=True)
         backend = fsspec.open(path, mode="rb", s3={"anon": True})
@@ -149,6 +183,18 @@ def _load_model(model: str) -> None:
             disk_hits[var_id] = arr
             print(f"[weather_tiles] {model}/{var_id}  shape={arr.shape}  "
                   f"range=[{float(arr.min()):.1f}, {float(arr.max()):.1f}]", flush=True)
+
+    # Compute derived variables
+    T = disk_hits.get("temperature_2m")
+    RH = disk_hits.get("relative_humidity_2m")
+    if T is not None and RH is not None:
+        RH_c = np.clip(RH, 1.0, 100.0)
+        # Magnus formula → dew point (°C)
+        gamma = np.log(RH_c / 100.0) + 17.625 * T / (243.04 + T)
+        disk_hits["dew_point_2m"] = (243.04 * gamma / (17.625 - gamma)).astype(np.float32)
+        # Saturation vapor pressure → VPD (kPa)
+        es = 0.6108 * np.exp(17.27 * T / (T + 237.3))
+        disk_hits["vapor_pressure_deficit"] = (es * (1.0 - RH_c / 100.0)).astype(np.float32)
 
     # Populate memory cache
     with _cache_lock:
