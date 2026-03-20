@@ -102,7 +102,8 @@
         { "id": "soil_moisture_0_to_10cm",    "code": "SOIL_MOISTURE_0_10CM",    "display_name": "Soil Moisture (0–10cm)",   "units": "m³/m³", "value_type": "numeric" },
         { "id": "soil_temperature_0_to_10cm", "code": "SOIL_TEMPERATURE_0_10CM", "display_name": "Soil Temperature (0–10cm)","units": "°C",    "value_type": "numeric" },
         { "id": "dew_point_2m",               "code": "DEW_POINT_2M",            "display_name": "Dew Point (2m)",           "units": "°C",    "value_type": "numeric", "derived": true },
-        { "id": "vapor_pressure_deficit",     "code": "VPD",                     "display_name": "Vapor Pressure Deficit",   "units": "kPa",   "value_type": "numeric", "derived": true }
+        { "id": "vapor_pressure_deficit",     "code": "VPD",                     "display_name": "Vapor Pressure Deficit",   "units": "kPa",   "value_type": "numeric",     "derived": true },
+        { "id": "weather_code_simple",         "code": "WEATHER_CODE_SIMPLE",     "display_name": "Weather Code",             "units": "class id", "value_type": "categorical", "derived": true }
       ]
     }
   ]

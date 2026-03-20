@@ -82,8 +82,24 @@ _VPD = np.array([
     [200,   0,   0],  # high VPD: red
 ], dtype=np.float32)
 
+# Categorical color lookup for weather_code_simple (RGBA tuples)
+_WEATHER_CODE_COLORS: dict[int, tuple[int, int, int]] = {
+    0:  (255, 240,  80),  # clear
+    1:  (220, 230, 120),  # mainly clear
+    2:  (180, 190, 180),  # partly cloudy
+    3:  (120, 120, 130),  # overcast
+    51: (160, 210, 255),  # light drizzle
+    53: (100, 170, 255),  # moderate drizzle
+    55: ( 60, 130, 240),  # dense drizzle
+    61: ( 30, 100, 220),  # light rain
+    63: (  0,  60, 180),  # moderate rain
+    65: (  0,  20, 120),  # heavy rain
+    71: (220, 245, 255),  # slight snow — near white/icy
+    73: (160, 220, 240),  # moderate snow — cyan
+    75: ( 80, 170, 210),  # heavy snow — teal
+}
+
 # "derived": True  → computed from other vars, not fetched from S3
-# "needs": [...]   → raw vars required for derivation (must also be in LIVE_WEATHER_VARIABLES or _EXTRA_RAW)
 _EXTRA_RAW = {"relative_humidity_2m"}  # fetched but not rendered directly
 
 LIVE_WEATHER_VARIABLES: dict[str, dict] = {
@@ -95,8 +111,10 @@ LIVE_WEATHER_VARIABLES: dict[str, dict] = {
     "soil_moisture_0_to_10cm":   {"model": "ncep_gfs013", "lo":   0.0, "hi":   0.5, "stops": _SOIL_MOIST},
     "soil_temperature_0_to_10cm": {"model": "ncep_gfs013", "lo": -10.0, "hi":  40.0, "stops": _BLUE_RED},
     # --- derived from temperature_2m + relative_humidity_2m ---
-    "dew_point_2m":           {"model": "ncep_gfs013", "lo": -40.0, "hi":  35.0, "stops": _BLUE_RED,  "derived": True},
-    "vapor_pressure_deficit":  {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _VPD,      "derived": True},
+    "dew_point_2m":           {"model": "ncep_gfs013", "lo": -40.0, "hi":  35.0, "stops": _BLUE_RED, "derived": True},
+    "vapor_pressure_deficit":  {"model": "ncep_gfs013", "lo":   0.0, "hi":   5.0, "stops": _VPD,     "derived": True},
+    # --- derived from cloud_cover + precipitation + snowfall_water_equivalent ---
+    "weather_code_simple":    {"model": "ncep_gfs013", "categorical": True, "derived": True},
 }
 
 # --- Disk cache ---
@@ -185,6 +203,27 @@ def _load_model(model: str) -> None:
                   f"range=[{float(arr.min()):.1f}, {float(arr.max()):.1f}]", flush=True)
 
     # Compute derived variables
+    cc   = disk_hits.get("cloud_cover")
+    prec = disk_hits.get("precipitation")
+    swe  = disk_hits.get("snowfall_water_equivalent")
+    if cc is not None and prec is not None and swe is not None:
+        snow_rate = swe / 10.0  # cm/h (T+1 step = 1h)
+        rain_rate = prec         # mm/h
+        code = np.full(cc.shape, 3, dtype=np.float32)  # default: overcast
+        code[cc < 80] = 2
+        code[cc < 50] = 1
+        code[cc < 20] = 0
+        code[rain_rate >= 0.01] = 51
+        code[rain_rate >= 0.5]  = 53
+        code[rain_rate >= 1.0]  = 55
+        code[rain_rate >= 1.3]  = 61
+        code[rain_rate >= 2.5]  = 63
+        code[rain_rate >= 7.6]  = 65
+        code[snow_rate >= 0.01] = 71
+        code[snow_rate >= 0.2]  = 73
+        code[snow_rate >= 0.8]  = 75
+        disk_hits["weather_code_simple"] = code
+
     T = disk_hits.get("temperature_2m")
     RH = disk_hits.get("relative_humidity_2m")
     if T is not None and RH is not None:
@@ -265,10 +304,19 @@ def render_weather_tile_bytes(variable_id: str, z: int, x: int, y: int,
         dst_transform=dst_transform,
         dst_crs=dst_crs,
         dst_nodata=np.nan,
-        resampling=RasterioResampling.bilinear,
+        resampling=RasterioResampling.nearest if cfg.get("categorical") else RasterioResampling.bilinear,
     )
 
-    rgba = _colorize(dest, cfg["stops"], cfg["lo"], cfg["hi"])
+    if cfg.get("categorical"):
+        rgba = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
+        for code, rgb in _WEATHER_CODE_COLORS.items():
+            mask = (dest == code)
+            rgba[mask, 0] = rgb[0]
+            rgba[mask, 1] = rgb[1]
+            rgba[mask, 2] = rgb[2]
+            rgba[mask, 3] = 210
+    else:
+        rgba = _colorize(dest, cfg["stops"], cfg["lo"], cfg["hi"])
     rgba[~np.isfinite(dest), 3] = 0
     img = Image.fromarray(rgba, mode="RGBA")
 
