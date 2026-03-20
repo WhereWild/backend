@@ -67,6 +67,7 @@ OUT_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
 
 WINDOW_HOURS  = [1, 8, 24, 72, 168, 720, 2160]
 WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
+FORECAST_HOURS = [1, 8, 24, 72, 168]
 
 VAR_CONFIGS: dict[str, dict] = {
     "temperature_2m": {
@@ -265,8 +266,8 @@ def _compute_final(var_id: str, cfg: dict, sums: dict[str, np.ndarray],
     return (combined / n_total if agg == "avg" else combined).astype(np.float32)
 
 
-def _state_paths(var_id: str, window_label: str):
-    base = OUT_DIR / f"{var_id}_{window_label}"
+def _state_paths(var_id: str, window_label: str, suffix: str = ""):
+    base = OUT_DIR / f"{var_id}_{window_label}{suffix}"
     return (
         base.with_suffix(".npy"),
         Path(str(base) + ".meta.json"),
@@ -274,8 +275,8 @@ def _state_paths(var_id: str, window_label: str):
     )
 
 
-def _load_state(var_id: str, window_label: str) -> tuple[dict | None, dict | None]:
-    _, meta_p, sums_p = _state_paths(var_id, window_label)
+def _load_state(var_id: str, window_label: str, suffix: str = "") -> tuple[dict | None, dict | None]:
+    _, meta_p, sums_p = _state_paths(var_id, window_label, suffix)
     if not meta_p.exists() or not sums_p.exists():
         return None, None
     with open(meta_p) as f:
@@ -285,8 +286,8 @@ def _load_state(var_id: str, window_label: str) -> tuple[dict | None, dict | Non
 
 
 def _save_state(var_id: str, window_label: str, cfg: dict,
-                sums: dict[str, np.ndarray], meta: dict) -> None:
-    npy_p, meta_p, sums_p = _state_paths(var_id, window_label)
+                sums: dict[str, np.ndarray], meta: dict, suffix: str = "") -> None:
+    npy_p, meta_p, sums_p = _state_paths(var_id, window_label, suffix)
     result = _compute_final(var_id, cfg, sums, meta["n_era5"], meta["n_gfs"])
     np.save(npy_p, result)
     with open(meta_p, "w") as f:
@@ -313,7 +314,8 @@ def _gfs_raw_vars(cfg: dict) -> list[str]:
 def _full_build(var_id: str, cfg: dict, window_h: int, window_label: str,
                 now_ts: float, era5_end_ts: float, gfs_end_ts: float,
                 resolution_s: float,
-                era5_cidx: dict[str, list], gfs_cidx: dict[str, list]) -> None:
+                era5_cidx: dict[str, list], gfs_cidx: dict[str, list],
+                suffix: str = "") -> None:
     era5_model = cfg["era5_model"]
     w_start    = now_ts - window_h * 3600
 
@@ -349,7 +351,7 @@ def _full_build(var_id: str, cfg: dict, window_h: int, window_label: str,
         "n_era5": n_era5_total, "n_gfs": n_gfs_total,
         "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
     }
-    _save_state(var_id, window_label, cfg, sums, meta)
+    _save_state(var_id, window_label, cfg, sums, meta, suffix=suffix)
 
 
 # ── Incremental update for one var + window ───────────────────────────────────
@@ -428,6 +430,133 @@ def _incremental_update(var_id: str, cfg: dict, window_h: int, window_label: str
     _save_state(var_id, window_label, cfg, sums, meta)
 
 
+# ── Stale chunk cleanup ───────────────────────────────────────────────────────
+
+def _cleanup_stale_chunks(needed_chunks: set[str], indexed_prefixes: set[str]) -> None:
+    """Delete locally cached .om chunks that are no longer within any aggregation window.
+
+    Only removes files whose model+var prefix was indexed this run (so we don't
+    accidentally delete chunks for vars we didn't process).
+    """
+    removed = 0
+    for path in Path("/tmp").glob("*_chunk_*.om"):
+        name = path.name
+        idx = name.find("_chunk_")
+        if idx == -1:
+            continue
+        prefix     = name[:idx]           # e.g. "era5_land_temperature_2m"
+        chunk_name = name[idx + 1:]       # e.g. "chunk_42.om"
+        if prefix in indexed_prefixes and chunk_name not in needed_chunks:
+            path.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        print(f"  cleaned {removed} stale .om chunk(s) from /tmp/")
+
+
+# ── Forecast aggregate builds ─────────────────────────────────────────────────
+
+def build_forecast_aggregates(
+    forecast_hours_list: list[int],
+    var_configs: dict,
+    windows: list[tuple[int, str]],
+    now_ts: float,
+    era5_end_ts: float,
+    gfs_data_end_ts: float,
+    resolution_s: float,
+    era5_cidx_by_var: dict[str, dict[str, list]],
+    gfs_cidx: dict[str, list],
+) -> None:
+    """Build aggregate rasters for each forecast offset.
+
+    Each file is saved as {var}_{window}__f{hours:03d}h.npy (e.g. temperature_2m_30d__f072h.npy).
+
+    Uses the "now" sums as a starting point and applies a small incremental delta:
+      - drop the oldest forecast_h hours from the ERA5/GFS tail
+      - add the GFS forecast hours at the leading edge
+    This makes each forecast offset O(forecast_hours) rather than O(window_size).
+    Falls back to a full build if the "now" state is missing.
+    """
+    print("\n=== forecast aggregate builds ===")
+    for forecast_h in forecast_hours_list:
+        future_ts      = now_ts + forecast_h * 3600
+        gfs_end_for_fc = min(gfs_data_end_ts, future_ts)
+        suffix         = f"__f{forecast_h:03d}h"
+        future_dt      = datetime.fromtimestamp(future_ts, tz=timezone.utc)
+        print(f"\n--- +{forecast_h}h forecast | anchor={future_dt.strftime('%Y-%m-%dT%HZ')} ---")
+
+        for var_id, cfg in var_configs.items():
+            era5_cidx  = era5_cidx_by_var.get(var_id, {})
+            era5_model = cfg["era5_model"]
+
+            for window_h, window_label in windows:
+                print(f"  [{window_label:4s}] {var_id} +{forecast_h}h ...", flush=True)
+
+                # Load the "now" state built in the main loop
+                now_sums, now_meta = _load_state(var_id, window_label)
+                if now_sums is None:
+                    # State missing — fall back to full build
+                    _full_build(var_id, cfg, window_h, window_label,
+                                future_ts, era5_end_ts, gfs_end_for_fc,
+                                resolution_s, era5_cidx, gfs_cidx, suffix=suffix)
+                    continue
+
+                sums   = {k: v.copy() for k, v in now_sums.items()}
+                n_era5 = now_meta["n_era5"]
+                n_gfs  = now_meta["n_gfs"]
+                old_w_start  = now_meta["era5_window_start_ts"]
+                old_gfs_end  = now_meta["gfs_end_ts"]
+                old_gfs_start = now_meta["gfs_start_ts"]
+                new_w_start  = old_w_start + forecast_h * 3600
+
+                # 1. Drop oldest forecast_h hours from the ERA5 tail
+                drop_end = min(new_w_start, era5_end_ts)
+                if drop_end > old_w_start:
+                    for rv in _era5_raw_vars(cfg):
+                        key = f"era5_{rv}"
+                        if key not in sums or rv not in era5_cidx:
+                            continue
+                        dropped, _ = _accumulate(era5_model, rv, old_w_start, drop_end,
+                                                 resolution_s, era5_cidx[rv])
+                        sums[key] = (sums[key] - dropped).astype(np.float32)
+                    n_era5 -= int(round((drop_end - old_w_start) / resolution_s))
+
+                # Drop from GFS if the old window start was already in the GFS region
+                gfs_drop_end = min(new_w_start, old_gfs_end)
+                if gfs_drop_end > old_gfs_start:
+                    for gv in _gfs_raw_vars(cfg):
+                        key = f"gfs_{gv}"
+                        if key not in sums or gv not in gfs_cidx:
+                            continue
+                        dropped, _ = _accumulate("ncep_gfs013", gv, old_gfs_start, gfs_drop_end,
+                                                 resolution_s, gfs_cidx[gv])
+                        sums[key] = (sums[key] - dropped).astype(np.float32)
+                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution_s))
+
+                # 2. Add new GFS forecast hours [old_gfs_end → future_ts]
+                if gfs_end_for_fc > old_gfs_end:
+                    for gv in _gfs_raw_vars(cfg):
+                        key = f"gfs_{gv}"
+                        if gv not in gfs_cidx:
+                            continue
+                        added, n_add = _accumulate("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc,
+                                                   resolution_s, gfs_cidx[gv])
+                        sums[key] = (sums.get(key, np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32))
+                                     + added).astype(np.float32)
+                    n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution_s))
+
+                n_era5 = max(n_era5, 0)
+                n_gfs  = max(n_gfs,  0)
+                meta = {
+                    **now_meta,
+                    "era5_window_start_ts": new_w_start,
+                    "gfs_start_ts": max(era5_end_ts, new_w_start),
+                    "gfs_end_ts": gfs_end_for_fc,
+                    "n_era5": n_era5, "n_gfs": n_gfs,
+                    "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+                }
+                _save_state(var_id, window_label, cfg, sums, meta, suffix=suffix)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(only_vars: list[str] | None, only_windows: list[str] | None,
@@ -485,6 +614,8 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
             print(f"  GFS {gv}: ERROR {e}")
 
     # ── Process each variable ─────────────────────────────────────────────
+    era5_cidx_by_var: dict[str, dict[str, list]] = {}
+
     for var_id, cfg in var_configs.items():
         print(f"\n=== {var_id} ===")
         era5_model = cfg["era5_model"]
@@ -500,6 +631,7 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                 print(f"  ERA5 {rv}: {len(era5_cidx[rv])} chunk(s)")
             except Exception as e:
                 print(f"  ERA5 {rv}: ERROR {e}")
+        era5_cidx_by_var[var_id] = era5_cidx
 
         for window_h, window_label in windows:
             sums, old_meta = _load_state(var_id, window_label)
@@ -516,6 +648,28 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                                     sums, old_meta,
                                     now_ts, era5_end_ts, gfs_end_ts, resolution_s,
                                     era5_cidx, gfs_cidx)
+
+    # ── Build forecast aggregate rasters ──────────────────────────────────
+    build_forecast_aggregates(
+        FORECAST_HOURS, var_configs, windows,
+        now_ts, era5_end_ts, gfs_data_end_ts,
+        resolution_s, era5_cidx_by_var, gfs_cidx,
+    )
+
+    # ── Clean up stale downloaded chunks ──────────────────────────────────
+    needed_chunks: set[str] = set()
+    indexed_prefixes: set[str] = set()
+    for gv, idx_list in gfs_cidx.items():
+        indexed_prefixes.add(f"gfs013_{gv}")
+        for chunk_name, *_ in idx_list:
+            needed_chunks.add(chunk_name)
+    for var_id, era5_cidx in era5_cidx_by_var.items():
+        short = VAR_CONFIGS[var_id]["era5_model"].replace("copernicus_", "")
+        for rv, idx_list in era5_cidx.items():
+            indexed_prefixes.add(f"{short}_{rv}")
+            for chunk_name, *_ in idx_list:
+                needed_chunks.add(chunk_name)
+    _cleanup_stale_chunks(needed_chunks, indexed_prefixes)
 
 
 if __name__ == "__main__":
@@ -545,3 +699,8 @@ if __name__ == "__main__":
             print(f"  rclone exited with code {result.returncode}")
         else:
             print("  upload complete")
+
+    print("\n=== preloading forecast tiles ===")
+    from util import weather_tiles
+    weather_tiles.preload_all_forecasts()
+    weather_tiles.cleanup_weather_disk_cache(now_ts)
