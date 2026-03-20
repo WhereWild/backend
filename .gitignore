@@ -2,6 +2,7 @@
 .env.local
 .python-version
 data/
+data_ml/
 processed/
 cache/
 tmp/
