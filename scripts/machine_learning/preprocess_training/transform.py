@@ -54,7 +54,7 @@ _UNCATALOGUED_SUMMARY = {
     "skipped_context": {},
 }
 _UNCATALOGUED_SUMMARY_GUARD = threading.Lock()
-_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
 GROUP_TO_FEATURE_COLUMN = _feature_contract.GROUP_TO_FEATURE_COLUMN
 GROUP_TO_MASK_COLUMN = _feature_contract.GROUP_TO_MASK_COLUMN

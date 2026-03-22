@@ -15,7 +15,7 @@ import pyarrow.dataset as ds
 import torch
 from torch.utils.data import Dataset
 
-_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 FEATURE_COLUMNS = _feature_contract.FEATURE_COLUMNS
 MASK_COLUMNS = _feature_contract.MASK_COLUMNS
 

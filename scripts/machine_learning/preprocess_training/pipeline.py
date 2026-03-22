@@ -18,7 +18,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 feature_template_dict = _feature_contract.feature_template_dict
 format_feature_group_counts = _feature_contract.format_feature_group_counts
 

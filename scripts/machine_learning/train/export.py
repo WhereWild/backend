@@ -35,7 +35,7 @@ except ImportError:
 FEATURE_COLUMNS = import_local_symbol("data", "FEATURE_COLUMNS")
 MASK_COLUMNS = import_local_symbol("data", "MASK_COLUMNS")
 _list_column_to_2d_numpy = import_local_symbol("data", "_list_column_to_2d_numpy")
-_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
 format_feature_group_counts = _feature_contract.format_feature_group_counts
 normalize_feature_template = _feature_contract.normalize_feature_template

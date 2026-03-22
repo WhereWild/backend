@@ -14,7 +14,7 @@ from typing import Any
 
 import pyarrow.dataset as ds
 
-_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 FEATURE_COLUMNS = _feature_contract.FEATURE_COLUMNS
 FEATURE_COLUMN_TO_GROUP = _feature_contract.FEATURE_COLUMN_TO_GROUP
 FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
