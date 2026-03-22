@@ -144,6 +144,7 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
     --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
+    --reuse-existing-background \
     --resume-output-files \
     --resume-feature-template-file \
     --background-ratio 1.0 \
@@ -154,6 +155,7 @@ Notes:
 
 - `--resume-output-files` always clears the output directory before writing (full rewrite from staging).
 - Use `--regenerate-background` with `--resume-background-files` to delete and rebuild existing `background_pooled_*.parquet` shards.
+- If background shards already exist in staging, the resume CLI requires either `--reuse-existing-background` or `--regenerate-background` when `--resume-background-files` is set.
 - Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
 - `--resume-output-files` requires selecting at least one staging file type via `--resume-base-files` and/or `--resume-background-files`.
 

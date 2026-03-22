@@ -290,6 +290,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete existing background_pooled_*.parquet files and regenerate them (requires --resume-background-files).",
     )
+    parser.add_argument(
+        "--reuse-existing-background",
+        action="store_true",
+        help="Acknowledge and reuse existing background_pooled_*.parquet files without regenerating them.",
+    )
     return parser.parse_args()
 
 
@@ -300,6 +305,25 @@ def _list_staging_paths(staging_dir: Path) -> tuple[list[Path], list[Path]]:
     base_paths = [path for path in all_paths if not path.name.startswith("background_pooled_")]
     background_paths = [path for path in all_paths if path.name.startswith("background_pooled_")]
     return base_paths, background_paths
+
+
+def _ensure_background_selection_is_explicit(
+    *,
+    existing_background_paths: list[Path],
+    resume_background_files: bool,
+    regenerate_background: bool,
+    reuse_existing_background: bool,
+) -> None:
+    """Refuse to silently reuse existing background shards during resume runs."""
+    if not resume_background_files or not existing_background_paths:
+        return
+    if regenerate_background or reuse_existing_background:
+        return
+    raise SystemExit(
+        "Existing background_pooled_*.parquet shards were found in staging. "
+        "Refusing to silently reuse them because they may not match the requested background ratio. "
+        "Pass --reuse-existing-background to keep them as-is, or --regenerate-background to rebuild them."
+    )
 
 
 def main() -> int:
@@ -322,6 +346,10 @@ def main() -> int:
 
     if args.regenerate_background and not args.resume_background_files:
         raise SystemExit("--regenerate-background requires --resume-background-files.")
+    if args.reuse_existing_background and not args.resume_background_files:
+        raise SystemExit("--reuse-existing-background requires --resume-background-files.")
+    if args.regenerate_background and args.reuse_existing_background:
+        raise SystemExit("Use only one of --regenerate-background or --reuse-existing-background.")
 
     if args.resume_feature_template_file and not args.resume_output_files:
         if not output_root.exists():
@@ -348,6 +376,13 @@ def main() -> int:
     base_paths, existing_background_paths = _list_staging_paths(staging_dir)
     if args.resume_base_files and not base_paths:
         raise SystemExit(f"No base staging parquet shards found in: {staging_dir}")
+
+    _ensure_background_selection_is_explicit(
+        existing_background_paths=existing_background_paths,
+        resume_background_files=args.resume_background_files,
+        regenerate_background=args.regenerate_background,
+        reuse_existing_background=args.reuse_existing_background,
+    )
 
     if args.regenerate_background and existing_background_paths:
         # Allow deterministic rebuilds when previous background generation was
