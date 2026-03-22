@@ -20,7 +20,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
     - Entry script for `train_encoder.py`, `train_heads.py`, `model.py`, `losses.py`, `data.py`.
 - `scripts/machine_learning/train/export.py`
     - Packages the encoder, species heads, and a pre-computed geocell feature table into a single `.pt` inference bundle.
-    - Also embeds feature names so the inference engine can sample GIS rasters on the fly.
+    - Also embeds feature names so the inference engine can sample GIS rasters on the fly for catalog-backed groups and preserve the unsampleable `other` group width.
 - `scripts/machine_learning/validate_training_schema.py`
     - Validates dataset schema compatibility against `schemas/training_observation.schema.json`.
 - `scripts/machine_learning/generate_training_schema_docs.py`
@@ -113,6 +113,11 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Fail fast when a configured join source is missing or lacks required keys.
 - Auto context discovery
     - When explicit templates/paths are not set, the preprocessor looks for nearby context files in each occurrence directory.
+- Uncatalogued numeric columns
+    - Numeric columns from occurrence parquet files that are not represented in the GIS catalog are retained in `other_features`.
+    - Numeric columns from context parquet files that are not represented in the GIS catalog are skipped.
+    - The preprocessor logs warnings when uncatalogued numeric columns are encountered.
+    - The preprocessor also writes `_meta/uncatalogued_columns.json` under the dataset root with kept/skipped examples.
 
 ### Not implemented yet
 
@@ -198,6 +203,7 @@ Before starting model training, verify:
 - `train/val/test` splits are all present.
 - `year_month` coverage looks reasonable and not dominated by fallback timestamps.
 - Feature vectors are non-null and consistent in dimensionality.
+- `other_features` width looks reasonable for the occurrence schema you expect.
 
 ## 4. Train the model
 
@@ -285,12 +291,12 @@ The bundle contains:
 - Encoder architecture config and weights.
 - Per-species head weights and metadata (prior, val_loss, counts).
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
-- Feature names per group (env, habitat, weather) so the inference engine can sample GIS rasters on the fly for arbitrary coordinates.
+- Feature names per group (env, habitat, weather, other). GIS sampling only reconstructs catalog-backed env/habitat features; weather and other are emitted as missing in sampled-only paths.
 
 The preprocessing step also writes `feature_template.json` under
 `<output-root>/_meta/`. Export reads this file automatically. If it is missing (e.g. older
-preprocessed datasets), export falls back to deriving feature names from the GIS
-catalog.
+preprocessed datasets), export falls back to deriving catalog-backed feature names from the GIS
+catalog; uncatalogued `other` names require the saved template.
 
 ## 6. Run inference / serve the API
 

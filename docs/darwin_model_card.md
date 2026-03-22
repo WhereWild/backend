@@ -138,7 +138,7 @@ Expected outcome: most compute spent once in shared encoder; species updates are
 ### 5.1 Export format
 
 - The trained encoder + per-species heads + geocell feature table are packaged into a single `.pt` inference bundle via `scripts/machine_learning/train/export.py`.
-- The bundle also stores feature names (env, habitat, weather) so the server can sample GIS rasters on the fly.
+- The bundle also stores feature names (env, habitat, weather, other). Only env and habitat are directly sampleable from GIS rasters; weather and other are filled as missing in sampled-only inference paths.
 
 ### 5.2 Runtime
 
@@ -203,7 +203,7 @@ Remaining gaps to close full policy alignment are documented in Sections 3.3 and
     - positives from observations,
     - unlabeled/background rows sampled from other-species positives in the same split, filtered to avoid `(cell_id, year_month)` conflicts for the target species.
 6. Build vectors:
-    - `env_features`, `habitat_features`, `weather_features` with fixed order by `feature_version`.
+    - `env_features`, `habitat_features`, `weather_features`, `other_features` with fixed order by `feature_version`.
 7. Keep leakage-prone fields (`lat`, `lon`, `event_time_utc`, `source`) as metadata only; exclude from model input tensors.
 8. Write split-partitioned Parquet by `split`.
 

@@ -47,6 +47,8 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 | `habitat_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to habitat_features (1=missing, 0=observed). |
 | `weather_features` | `list<float32>` | no | `input` | Dense recent weather feature vector aligned to event_time_utc. |
 | `weather_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to weather_features (1=missing, 0=observed). |
+| `other_features` | `list<float32>` | no | `input` | Dense feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files. |
+| `other_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to other_features (1=missing, 0=observed). |
 
 ## Validation
 

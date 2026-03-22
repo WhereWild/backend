@@ -171,6 +171,7 @@ def _raw_feature_dim_from_names() -> int | None:
         len(_feature_names.get("env", []))
         + len(_feature_names.get("habitat", []))
         + len(_feature_names.get("weather", []))
+        + len(_feature_names.get("other", []))
     )
 
 
@@ -218,9 +219,11 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
         env_dim = len(_feature_names.get("env", []))
         habitat_dim = len(_feature_names.get("habitat", []))
         weather_dim = len(_feature_names.get("weather", []))
+        other_dim = len(_feature_names.get("other", []))
         return (
             False,
-            f"bundle sampled feature template is empty (env={env_dim}, habitat={habitat_dim}, weather={weather_dim})",
+            "bundle sampled feature template is empty "
+            f"(env={env_dim}, habitat={habitat_dim}, weather={weather_dim}, other={other_dim})",
         )
 
     alignable = raw_dim == _input_dim or 2 * raw_dim == _input_dim
@@ -446,8 +449,8 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
     """Build a feature + mask vector for an arbitrary point from GIS rasters.
 
     Static (env + habitat) features are sampled from local COG tiles.
-    Weather features are filled with zeros and marked entirely missing so
-    the model relies only on environmental context.
+    Weather and other features are filled with zeros and marked entirely
+    missing so the model relies only on environmental context.
     Returns ``None`` when feature names are unavailable or rasterio is
     not installed.
     """
@@ -461,6 +464,7 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
     env_names: list[str] = _feature_names["env"]
     habitat_names: list[str] = _feature_names["habitat"]
     weather_dim: int = len(_feature_names.get("weather", []))
+    other_dim: int = len(_feature_names.get("other", []))
 
     needs_dem = _DEM_DERIVED & set(env_names)
     dem_vals = _compute_dem_derived_single(lat, lon) if needs_dem else {}
@@ -487,8 +491,8 @@ def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | 
             hab_v.append(val)
             hab_m.append(0.0)
 
-    features = env_v + hab_v + [0.0] * weather_dim
-    mask = env_m + hab_m + [1.0] * weather_dim
+    features = env_v + hab_v + [0.0] * weather_dim + [0.0] * other_dim
+    mask = env_m + hab_m + [1.0] * weather_dim + [1.0] * other_dim
 
     feat_t = torch.tensor(features, dtype=torch.float32)
     mask_t = torch.tensor(mask, dtype=torch.float32)
@@ -643,6 +647,7 @@ def _batch_sample_features(
     env_names: list[str] = _feature_names["env"]
     habitat_names: list[str] = _feature_names["habitat"]
     weather_dim: int = len(_feature_names.get("weather", []))
+    other_dim: int = len(_feature_names.get("other", []))
     n_coords = len(coords)
 
     layer_vals: dict[str, list[float | None]] = {}
@@ -732,8 +737,8 @@ def _batch_sample_features(
                 hv.append(val)
                 hm.append(0.0)
 
-        features = ev + hv + [0.0] * weather_dim
-        mask = em + hm + [1.0] * weather_dim
+        features = ev + hv + [0.0] * weather_dim + [0.0] * other_dim
+        mask = em + hm + [1.0] * weather_dim + [1.0] * other_dim
         ft = torch.tensor(features, dtype=torch.float32)
         mt = torch.tensor(mask, dtype=torch.float32)
         ft[mt > 0.5] = 0.0

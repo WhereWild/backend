@@ -134,7 +134,12 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         if template_path.exists():
             with open(template_path) as f:
                 raw = json.load(f)
-            return {"env": raw["env"], "habitat": raw["habitat"], "weather": raw.get("weather", [])}
+            return {
+                "env": raw["env"],
+                "habitat": raw["habitat"],
+                "weather": raw.get("weather", []),
+                "other": raw.get("other", []),
+            }
 
     # Fallback: derive from the GIS catalog using the same classification rules
     # the preprocessing pipeline uses.
@@ -186,7 +191,7 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
                     "wrb",
                 }:
                     habitat.add(lid)
-        return {"env": sorted(env), "habitat": sorted(habitat), "weather": []}
+        return {"env": sorted(env), "habitat": sorted(habitat), "weather": [], "other": []}
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return None
 
@@ -211,7 +216,8 @@ def export_bundle(
         print(
             f"Feature names: env={len(feature_names['env'])}, "
             f"habitat={len(feature_names['habitat'])}, "
-            f"weather={len(feature_names.get('weather', []))}"
+            f"weather={len(feature_names.get('weather', []))}, "
+            f"other={len(feature_names.get('other', []))}"
         )
     else:
         print("Warning: could not determine feature names; on-the-fly GIS sampling will be unavailable.")

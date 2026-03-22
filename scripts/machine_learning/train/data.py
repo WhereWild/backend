@@ -18,8 +18,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-FEATURE_COLUMNS = ["env_features", "habitat_features", "weather_features"]
-MASK_COLUMNS = ["env_missing_mask", "habitat_missing_mask", "weather_missing_mask"]
+FEATURE_COLUMNS = ["env_features", "habitat_features", "weather_features", "other_features"]
+MASK_COLUMNS = ["env_missing_mask", "habitat_missing_mask", "weather_missing_mask", "other_missing_mask"]
 META_COLUMNS = ["species_key", "presence_label", "sample_weight", "cell_id"]
 
 MISSING_SENTINEL = -9999.0

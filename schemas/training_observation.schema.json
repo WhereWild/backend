@@ -12,7 +12,7 @@
   },
   "notes": {
     "presence_label": "1 = known occurrence, 0 = unlabeled/background pseudo-absence",
-    "feature_vectors": "Feature vectors are dense and fixed-order per feature_version.",
+    "feature_vectors": "Feature vectors are dense and fixed-order per feature_version. Uncatalogued numeric observation columns are retained in other_features.",
     "feature_role": "input columns are allowed in model tensors; metadata columns are retained for joins, splits, auditing, and calibration only.",
     "partitioning": "Datasets are partitioned only by split. year_month and region_id remain metadata columns for sampling, analysis, and leakage checks.",
     "sampling_semantics": "For PU runs, generated unlabeled/background rows are sampled from other-species positive rows within the same split. Candidate rows that conflict with target-species positives on (cell_id, year_month) are excluded. Generated rows keep unlabeled semantics (presence_label=0) and are not treated as true negatives."
@@ -157,6 +157,20 @@
       "required": false,
       "feature_role": "metadata",
       "description": "Missingness mask aligned to weather_features (1=missing, 0=observed)."
+    },
+    {
+      "name": "other_features",
+      "parquet_type": "list<float32>",
+      "required": false,
+      "feature_role": "input",
+      "description": "Dense feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files."
+    },
+    {
+      "name": "other_missing_mask",
+      "parquet_type": "list<int8>",
+      "required": false,
+      "feature_role": "metadata",
+      "description": "Missingness mask aligned to other_features (1=missing, 0=observed)."
     }
   ]
 }

@@ -37,18 +37,22 @@ def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
         "env": len(template.get("env", [])),
         "habitat": len(template.get("habitat", [])),
         "weather": len(template.get("weather", [])),
+        "other": len(template.get("other", [])),
     }
 
 
 def _format_feature_dims(dims: dict[str, int] | None) -> str:
     if dims is None:
         return "unknown"
-    return f"env={dims.get('env', 0)}, habitat={dims.get('habitat', 0)}, weather={dims.get('weather', 0)}"
+    return (
+        f"env={dims.get('env', 0)}, habitat={dims.get('habitat', 0)}, "
+        f"weather={dims.get('weather', 0)}, other={dims.get('other', 0)}"
+    )
 
 
 def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
-    """Read one row to infer vector widths for env/habitat/weather columns."""
-    vector_columns = ["env_features", "habitat_features", "weather_features"]
+    """Read one row to infer vector widths for feature-vector columns."""
+    vector_columns = ["env_features", "habitat_features", "weather_features", "other_features"]
     present_columns = [name for name in vector_columns if name in dataset.schema.names]
     if not present_columns:
         return None
@@ -57,11 +61,12 @@ def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
     if row.num_rows == 0:
         return None
 
-    dims = {"env": 0, "habitat": 0, "weather": 0}
+    dims = {"env": 0, "habitat": 0, "weather": 0, "other": 0}
     column_to_group = {
         "env_features": "env",
         "habitat_features": "habitat",
         "weather_features": "weather",
+        "other_features": "other",
     }
     for column_name in present_columns:
         values = row.column(column_name)[0].as_py() or []
@@ -116,6 +121,7 @@ def _load_catalog_feature_template() -> dict[str, list[str]] | None:
         "env": sorted(env),
         "habitat": sorted(habitat),
         "weather": sorted(weather),
+        "other": [],
     }
     return template if any(_template_counts(template).values()) else None
 
@@ -158,6 +164,7 @@ def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
         "env": sorted(str(v) for v in raw.get("env", []) if isinstance(v, str) and v),
         "habitat": sorted(str(v) for v in raw.get("habitat", []) if isinstance(v, str) and v),
         "weather": sorted(str(v) for v in raw.get("weather", []) if isinstance(v, str) and v),
+        "other": sorted(str(v) for v in raw.get("other", []) if isinstance(v, str) and v),
     }
     return template if any(_template_counts(template).values()) else None
 
@@ -187,6 +194,7 @@ def _write_feature_template_from_output(output_root: Path) -> Path:
         "env": sorted(env),
         "habitat": sorted(habitat),
         "weather": sorted(weather),
+        "other": [],
     }
 
     meta_dir = output_root / "_meta"
