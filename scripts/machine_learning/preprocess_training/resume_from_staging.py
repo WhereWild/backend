@@ -133,12 +133,21 @@ def _find_matching_template_in_sibling_datasets(
 ) -> dict[str, list[str]] | None:
     """Look for a non-empty template in other local datasets with matching dims."""
     project_root = Path(__file__).resolve().parents[3]
-    data_root = project_root / "data"
-    if not data_root.exists():
-        return None
-
     target_meta = (output_root / "_meta" / "feature_template.json").resolve()
-    candidates = sorted(data_root.glob("species_observation*/_meta/feature_template.json"))
+    search_roots: list[Path] = []
+    for candidate_root in (output_root.parent, project_root / "data_ml", project_root / "data"):
+        try:
+            resolved = candidate_root.resolve()
+        except OSError:
+            continue
+        if not resolved.exists() or resolved in search_roots:
+            continue
+        search_roots.append(resolved)
+
+    candidates: list[Path] = []
+    for search_root in search_roots:
+        candidates.extend(sorted(search_root.glob("species_observation*/_meta/feature_template.json")))
+
     for candidate in candidates:
         try:
             if candidate.resolve() == target_meta:
