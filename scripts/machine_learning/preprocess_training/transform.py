@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from importlib import import_module
 import re
 import threading
 import time
@@ -53,6 +54,10 @@ _UNCATALOGUED_SUMMARY = {
     "skipped_context": {},
 }
 _UNCATALOGUED_SUMMARY_GUARD = threading.Lock()
+_feature_contract = import_module("scripts.machine_learning.feature_contract")
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+GROUP_TO_FEATURE_COLUMN = _feature_contract.GROUP_TO_FEATURE_COLUMN
+GROUP_TO_MASK_COLUMN = _feature_contract.GROUP_TO_MASK_COLUMN
 
 
 @dataclass(frozen=True)
@@ -552,6 +557,26 @@ def vector_from_columns(
     return values_array, mask_array
 
 
+def build_feature_group_arrays(
+    frame: pd.DataFrame,
+    *,
+    feature_template: FeatureGroups,
+    missing_sentinel: float,
+) -> tuple[list[pa.Array], list[str]]:
+    """Build feature-vector arrays and names in canonical group order."""
+    arrays: list[pa.Array] = []
+    names: list[str] = []
+    for group_name in FEATURE_GROUPS:
+        values, missing_mask = vector_from_columns(
+            frame,
+            getattr(feature_template, group_name),
+            missing_sentinel=missing_sentinel,
+        )
+        arrays.extend([values, missing_mask])
+        names.extend([GROUP_TO_FEATURE_COLUMN[group_name], GROUP_TO_MASK_COLUMN[group_name]])
+    return arrays, names
+
+
 def classify_feature_name(column_name: str) -> str | None:
     """Classify numeric source column into catalog-native feature groups."""
     name = column_name.lower()
@@ -833,34 +858,9 @@ def transform_frame(
         dtype="object",
     )
 
-    bioclimate_values, bioclimate_missing_mask = vector_from_columns(
+    feature_arrays, feature_names = build_feature_group_arrays(
         filtered,
-        feature_template.bioclimate,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    landclass_values, landclass_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.landclass,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    terrain_values, terrain_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.terrain,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    edaphic_values, edaphic_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.edaphic,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    temporal_values, temporal_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.temporal,
-        missing_sentinel=missing_feature_sentinel,
-    )
-    other_values, other_missing_mask = vector_from_columns(
-        filtered,
-        feature_template.other,
+        feature_template=feature_template,
         missing_sentinel=missing_feature_sentinel,
     )
 
@@ -881,18 +881,7 @@ def transform_frame(
                 pa.array(splits, type=pa.string()),
                 pa.array(source.tolist(), type=pa.string()),
                 pa.array([feature_version] * len(filtered), type=pa.string()),
-                bioclimate_values,
-                bioclimate_missing_mask,
-                landclass_values,
-                landclass_missing_mask,
-                terrain_values,
-                terrain_missing_mask,
-                edaphic_values,
-                edaphic_missing_mask,
-                temporal_values,
-                temporal_missing_mask,
-                other_values,
-                other_missing_mask,
+                *feature_arrays,
             ],
             names=[
                 "sample_id",
@@ -909,18 +898,7 @@ def transform_frame(
                 "split",
                 "source",
                 "feature_version",
-                "bioclimate_features",
-                "bioclimate_missing_mask",
-                "landclass_features",
-                "landclass_missing_mask",
-                "terrain_features",
-                "terrain_missing_mask",
-                "edaphic_features",
-                "edaphic_missing_mask",
-                "temporal_features",
-                "temporal_missing_mask",
-                "other_features",
-                "other_missing_mask",
+                *feature_names,
             ],
         ),
         low_cell_warnings,
