@@ -57,9 +57,11 @@ _UNCATALOGUED_SUMMARY_GUARD = threading.Lock()
 
 @dataclass(frozen=True)
 class FeatureGroups:
-    env: list[str]
-    habitat: list[str]
-    weather: list[str]
+    bioclimate: list[str]
+    landclass: list[str]
+    terrain: list[str]
+    edaphic: list[str]
+    temporal: list[str]
     other: list[str]
 
 
@@ -76,10 +78,12 @@ class TransformResult:
 
 @dataclass(frozen=True)
 class CatalogFeatureRules:
-    env_exact: frozenset[str]
-    habitat_exact: frozenset[str]
-    weather_exact: frozenset[str]
-    weather_prefixes: tuple[str, ...]
+    bioclimate_exact: frozenset[str]
+    landclass_exact: frozenset[str]
+    terrain_exact: frozenset[str]
+    edaphic_exact: frozenset[str]
+    temporal_exact: frozenset[str]
+    temporal_prefixes: tuple[str, ...]
 
 
 def warn_once(key: str, message: str) -> None:
@@ -268,10 +272,12 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in GIS catalog: {catalog_path}") from exc
 
-    env_exact: set[str] = set()
-    habitat_exact: set[str] = set()
-    weather_exact: set[str] = set()
-    weather_prefixes: set[str] = set()
+    bioclimate_exact: set[str] = set()
+    landclass_exact: set[str] = set()
+    terrain_exact: set[str] = set()
+    edaphic_exact: set[str] = set()
+    temporal_exact: set[str] = set()
+    temporal_prefixes: set[str] = set()
 
     for category in payload.get("categories", []):
         if not isinstance(category, dict):
@@ -289,31 +295,33 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
                 continue
 
             if category_name == "bioclimate":
-                env_exact.add(layer_id)
+                bioclimate_exact.add(layer_id)
             elif category_name == "landclass":
-                habitat_exact.add(layer_id)
+                landclass_exact.add(layer_id)
             elif category_name == "terrain":
-                env_exact.add(layer_id)
+                terrain_exact.add(layer_id)
             elif category_name == "temporal":
-                weather_exact.add(layer_id)
-                weather_prefixes.add(f"{layer_id}_")
+                temporal_exact.add(layer_id)
+                temporal_prefixes.add(f"{layer_id}_")
             elif category_name == "edaphic":
-                if (
-                    layer_id in {"landform", "lithology", "wrb"}
-                    or str(layer.get("value_type", "")).lower() == "categorical"
-                ):
-                    habitat_exact.add(layer_id)
-                else:
-                    env_exact.add(layer_id)
+                edaphic_exact.add(layer_id)
 
     rules = CatalogFeatureRules(
-        env_exact=frozenset(env_exact),
-        habitat_exact=frozenset(habitat_exact),
-        weather_exact=frozenset(weather_exact),
-        weather_prefixes=tuple(sorted(weather_prefixes)),
+        bioclimate_exact=frozenset(bioclimate_exact),
+        landclass_exact=frozenset(landclass_exact),
+        terrain_exact=frozenset(terrain_exact),
+        edaphic_exact=frozenset(edaphic_exact),
+        temporal_exact=frozenset(temporal_exact),
+        temporal_prefixes=tuple(sorted(temporal_prefixes)),
     )
 
-    if not (rules.env_exact or rules.habitat_exact or rules.weather_exact):
+    if not (
+        rules.bioclimate_exact
+        or rules.landclass_exact
+        or rules.terrain_exact
+        or rules.edaphic_exact
+        or rules.temporal_exact
+    ):
         raise ValueError(f"GIS catalog produced no feature rules: {catalog_path}")
 
     return rules
@@ -545,18 +553,22 @@ def vector_from_columns(
 
 
 def classify_feature_name(column_name: str) -> str | None:
-    """Classify numeric source column into env/habitat/weather feature groups."""
+    """Classify numeric source column into catalog-native feature groups."""
     name = column_name.lower()
     if name in _EXCLUDED_FEATURE_COLUMNS_LOWER:
         return None
 
     catalog_rules = _load_catalog_feature_rules()
-    if name in catalog_rules.env_exact:
-        return "env"
-    if name in catalog_rules.habitat_exact:
-        return "habitat"
-    if name in catalog_rules.weather_exact or any(name.startswith(prefix) for prefix in catalog_rules.weather_prefixes):
-        return "weather"
+    if name in catalog_rules.bioclimate_exact:
+        return "bioclimate"
+    if name in catalog_rules.landclass_exact:
+        return "landclass"
+    if name in catalog_rules.terrain_exact:
+        return "terrain"
+    if name in catalog_rules.edaphic_exact:
+        return "edaphic"
+    if name in catalog_rules.temporal_exact or any(name.startswith(prefix) for prefix in catalog_rules.temporal_prefixes):
+        return "temporal"
 
     return None
 
@@ -578,9 +590,11 @@ def build_feature_template(
     temporal_context_path: Path | None,
 ) -> FeatureGroups:
     """Build one global feature layout to keep vector sizes consistent."""
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
     other: set[str] = set()
 
     scan_files = files
@@ -635,12 +649,16 @@ def build_feature_template(
             if not is_numeric_arrow_type(field.type):
                 continue
             feature_group = classify_feature_name(field.name)
-            if feature_group == "env":
-                env.add(field.name)
-            elif feature_group == "habitat":
-                habitat.add(field.name)
-            elif feature_group == "weather":
-                weather.add(field.name)
+            if feature_group == "bioclimate":
+                bioclimate.add(field.name)
+            elif feature_group == "landclass":
+                landclass.add(field.name)
+            elif feature_group == "terrain":
+                terrain.add(field.name)
+            elif feature_group == "edaphic":
+                edaphic.add(field.name)
+            elif feature_group == "temporal":
+                temporal.add(field.name)
             elif field.name.lower() not in _EXCLUDED_FEATURE_COLUMNS_LOWER:
                 if source_kind == "occurrence":
                     other.add(field.name)
@@ -672,9 +690,11 @@ def build_feature_template(
             print(f"Schema scan progress | files: {index:,}/{len(schema_paths):,} | elapsed: {elapsed:.1f}s")
 
     return FeatureGroups(
-        env=sorted(env),
-        habitat=sorted(habitat),
-        weather=sorted(weather),
+        bioclimate=sorted(bioclimate),
+        landclass=sorted(landclass),
+        terrain=sorted(terrain),
+        edaphic=sorted(edaphic),
+        temporal=sorted(temporal),
         other=sorted(other),
     )
 
@@ -813,19 +833,29 @@ def transform_frame(
         dtype="object",
     )
 
-    env_values, env_missing_mask = vector_from_columns(
+    bioclimate_values, bioclimate_missing_mask = vector_from_columns(
         filtered,
-        feature_template.env,
+        feature_template.bioclimate,
         missing_sentinel=missing_feature_sentinel,
     )
-    habitat_values, habitat_missing_mask = vector_from_columns(
+    landclass_values, landclass_missing_mask = vector_from_columns(
         filtered,
-        feature_template.habitat,
+        feature_template.landclass,
         missing_sentinel=missing_feature_sentinel,
     )
-    weather_values, weather_missing_mask = vector_from_columns(
+    terrain_values, terrain_missing_mask = vector_from_columns(
         filtered,
-        feature_template.weather,
+        feature_template.terrain,
+        missing_sentinel=missing_feature_sentinel,
+    )
+    edaphic_values, edaphic_missing_mask = vector_from_columns(
+        filtered,
+        feature_template.edaphic,
+        missing_sentinel=missing_feature_sentinel,
+    )
+    temporal_values, temporal_missing_mask = vector_from_columns(
+        filtered,
+        feature_template.temporal,
         missing_sentinel=missing_feature_sentinel,
     )
     other_values, other_missing_mask = vector_from_columns(
@@ -851,12 +881,16 @@ def transform_frame(
                 pa.array(splits, type=pa.string()),
                 pa.array(source.tolist(), type=pa.string()),
                 pa.array([feature_version] * len(filtered), type=pa.string()),
-                env_values,
-                env_missing_mask,
-                habitat_values,
-                habitat_missing_mask,
-                weather_values,
-                weather_missing_mask,
+                bioclimate_values,
+                bioclimate_missing_mask,
+                landclass_values,
+                landclass_missing_mask,
+                terrain_values,
+                terrain_missing_mask,
+                edaphic_values,
+                edaphic_missing_mask,
+                temporal_values,
+                temporal_missing_mask,
                 other_values,
                 other_missing_mask,
             ],
@@ -875,12 +909,16 @@ def transform_frame(
                 "split",
                 "source",
                 "feature_version",
-                "env_features",
-                "env_missing_mask",
-                "habitat_features",
-                "habitat_missing_mask",
-                "weather_features",
-                "weather_missing_mask",
+                "bioclimate_features",
+                "bioclimate_missing_mask",
+                "landclass_features",
+                "landclass_missing_mask",
+                "terrain_features",
+                "terrain_missing_mask",
+                "edaphic_features",
+                "edaphic_missing_mask",
+                "temporal_features",
+                "temporal_missing_mask",
                 "other_features",
                 "other_missing_mask",
             ],

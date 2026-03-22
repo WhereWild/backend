@@ -34,9 +34,11 @@ except ImportError:
 
 def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
     return {
-        "env": len(template.get("env", [])),
-        "habitat": len(template.get("habitat", [])),
-        "weather": len(template.get("weather", [])),
+        "bioclimate": len(template.get("bioclimate", [])),
+        "landclass": len(template.get("landclass", [])),
+        "terrain": len(template.get("terrain", [])),
+        "edaphic": len(template.get("edaphic", [])),
+        "temporal": len(template.get("temporal", [])),
         "other": len(template.get("other", [])),
     }
 
@@ -45,14 +47,22 @@ def _format_feature_dims(dims: dict[str, int] | None) -> str:
     if dims is None:
         return "unknown"
     return (
-        f"env={dims.get('env', 0)}, habitat={dims.get('habitat', 0)}, "
-        f"weather={dims.get('weather', 0)}, other={dims.get('other', 0)}"
+        f"bioclimate={dims.get('bioclimate', 0)}, landclass={dims.get('landclass', 0)}, "
+        f"terrain={dims.get('terrain', 0)}, edaphic={dims.get('edaphic', 0)}, "
+        f"temporal={dims.get('temporal', 0)}, other={dims.get('other', 0)}"
     )
 
 
 def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
     """Read one row to infer vector widths for feature-vector columns."""
-    vector_columns = ["env_features", "habitat_features", "weather_features", "other_features"]
+    vector_columns = [
+        "bioclimate_features",
+        "landclass_features",
+        "terrain_features",
+        "edaphic_features",
+        "temporal_features",
+        "other_features",
+    ]
     present_columns = [name for name in vector_columns if name in dataset.schema.names]
     if not present_columns:
         return None
@@ -61,11 +71,20 @@ def _feature_dims_from_vectors(dataset: ds.Dataset) -> dict[str, int] | None:
     if row.num_rows == 0:
         return None
 
-    dims = {"env": 0, "habitat": 0, "weather": 0, "other": 0}
+    dims = {
+        "bioclimate": 0,
+        "landclass": 0,
+        "terrain": 0,
+        "edaphic": 0,
+        "temporal": 0,
+        "other": 0,
+    }
     column_to_group = {
-        "env_features": "env",
-        "habitat_features": "habitat",
-        "weather_features": "weather",
+        "bioclimate_features": "bioclimate",
+        "landclass_features": "landclass",
+        "terrain_features": "terrain",
+        "edaphic_features": "edaphic",
+        "temporal_features": "temporal",
         "other_features": "other",
     }
     for column_name in present_columns:
@@ -101,26 +120,34 @@ def _load_catalog_feature_template() -> dict[str, list[str]] | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
     for category in catalog.get("categories", []):
         for layer in category.get("layers", []):
             layer_id = layer.get("id")
             if not isinstance(layer_id, str) or not layer_id:
                 continue
             group = classify_feature_name(layer_id)
-            if group == "env":
-                env.add(layer_id)
-            elif group == "habitat":
-                habitat.add(layer_id)
-            elif group == "weather":
-                weather.add(layer_id)
+            if group == "bioclimate":
+                bioclimate.add(layer_id)
+            elif group == "landclass":
+                landclass.add(layer_id)
+            elif group == "terrain":
+                terrain.add(layer_id)
+            elif group == "edaphic":
+                edaphic.add(layer_id)
+            elif group == "temporal":
+                temporal.add(layer_id)
 
     template = {
-        "env": sorted(env),
-        "habitat": sorted(habitat),
-        "weather": sorted(weather),
+        "bioclimate": sorted(bioclimate),
+        "landclass": sorted(landclass),
+        "terrain": sorted(terrain),
+        "edaphic": sorted(edaphic),
+        "temporal": sorted(temporal),
         "other": [],
     }
     return template if any(_template_counts(template).values()) else None
@@ -161,9 +188,11 @@ def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
     except (OSError, json.JSONDecodeError):
         return None
     template = {
-        "env": sorted(str(v) for v in raw.get("env", []) if isinstance(v, str) and v),
-        "habitat": sorted(str(v) for v in raw.get("habitat", []) if isinstance(v, str) and v),
-        "weather": sorted(str(v) for v in raw.get("weather", []) if isinstance(v, str) and v),
+        "bioclimate": sorted(str(v) for v in raw.get("bioclimate", []) if isinstance(v, str) and v),
+        "landclass": sorted(str(v) for v in raw.get("landclass", []) if isinstance(v, str) and v),
+        "terrain": sorted(str(v) for v in raw.get("terrain", []) if isinstance(v, str) and v),
+        "edaphic": sorted(str(v) for v in raw.get("edaphic", []) if isinstance(v, str) and v),
+        "temporal": sorted(str(v) for v in raw.get("temporal", []) if isinstance(v, str) and v),
         "other": sorted(str(v) for v in raw.get("other", []) if isinstance(v, str) and v),
     }
     return template if any(_template_counts(template).values()) else None
@@ -175,25 +204,33 @@ def _write_feature_template_from_output(output_root: Path) -> Path:
     schema = dataset.schema
     feature_dims = _feature_dims_from_vectors(dataset)
 
-    env: set[str] = set()
-    habitat: set[str] = set()
-    weather: set[str] = set()
+    bioclimate: set[str] = set()
+    landclass: set[str] = set()
+    terrain: set[str] = set()
+    edaphic: set[str] = set()
+    temporal: set[str] = set()
 
     for field in schema:
         if not is_numeric_arrow_type(field.type):
             continue
         group = classify_feature_name(field.name)
-        if group == "env":
-            env.add(field.name)
-        elif group == "habitat":
-            habitat.add(field.name)
-        elif group == "weather":
-            weather.add(field.name)
+        if group == "bioclimate":
+            bioclimate.add(field.name)
+        elif group == "landclass":
+            landclass.add(field.name)
+        elif group == "terrain":
+            terrain.add(field.name)
+        elif group == "edaphic":
+            edaphic.add(field.name)
+        elif group == "temporal":
+            temporal.add(field.name)
 
     rebuilt_template = {
-        "env": sorted(env),
-        "habitat": sorted(habitat),
-        "weather": sorted(weather),
+        "bioclimate": sorted(bioclimate),
+        "landclass": sorted(landclass),
+        "terrain": sorted(terrain),
+        "edaphic": sorted(edaphic),
+        "temporal": sorted(temporal),
         "other": [],
     }
 

@@ -20,7 +20,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
     - Entry script for `train_encoder.py`, `train_heads.py`, `model.py`, `losses.py`, `data.py`.
 - `scripts/machine_learning/train/export.py`
     - Packages the encoder, species heads, and a pre-computed geocell feature table into a single `.pt` inference bundle.
-    - Also embeds feature names so the inference engine can sample GIS rasters on the fly for catalog-backed groups and preserve the unsampleable `other` group width.
+    - Also embeds feature names so the inference engine can sample GIS rasters on the fly for catalog-backed groups and preserve the unsampleable `temporal` and `other` group widths.
 - `scripts/machine_learning/validate_training_schema.py`
     - Validates dataset schema compatibility against `schemas/training_observation.schema.json`.
 - `scripts/machine_learning/generate_training_schema_docs.py`
@@ -118,6 +118,10 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Numeric columns from context parquet files that are not represented in the GIS catalog are skipped.
     - The preprocessor logs warnings when uncatalogued numeric columns are encountered.
     - The preprocessor also writes `_meta/uncatalogued_columns.json` under the dataset root with kept/skipped examples.
+- Feature grouping
+    - Catalog-backed numeric columns are grouped into `bioclimate_features`, `landclass_features`, `terrain_features`, `edaphic_features`, and `temporal_features`.
+    - Within each group, vector order comes from the discovered feature template written to `_meta/feature_template.json`.
+    - `other_features` retains uncatalogued numeric columns from occurrence parquet files only.
 
 ### Not implemented yet
 
@@ -203,6 +207,7 @@ Before starting model training, verify:
 - `train/val/test` splits are all present.
 - `year_month` coverage looks reasonable and not dominated by fallback timestamps.
 - Feature vectors are non-null and consistent in dimensionality.
+- Catalog-group widths in `_meta/feature_template.json` look reasonable for the source schemas you expect.
 - `other_features` width looks reasonable for the occurrence schema you expect.
 
 ## 4. Train the model

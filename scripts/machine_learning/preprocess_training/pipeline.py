@@ -411,9 +411,11 @@ def run_preprocess(args) -> int:
     template_seconds = time.perf_counter() - template_start
     print(
         "Feature template sizes | "
-        f"env={len(feature_template.env):,}, "
-        f"habitat={len(feature_template.habitat):,}, "
-        f"weather={len(feature_template.weather):,}, "
+        f"bioclimate={len(feature_template.bioclimate):,}, "
+        f"landclass={len(feature_template.landclass):,}, "
+        f"terrain={len(feature_template.terrain):,}, "
+        f"edaphic={len(feature_template.edaphic):,}, "
+        f"temporal={len(feature_template.temporal):,}, "
         f"other={len(feature_template.other):,}"
     )
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
@@ -425,9 +427,11 @@ def run_preprocess(args) -> int:
     with open(template_json_path, "w") as _ft_fh:
         json.dump(
             {
-                "env": feature_template.env,
-                "habitat": feature_template.habitat,
-                "weather": feature_template.weather,
+                "bioclimate": feature_template.bioclimate,
+                "landclass": feature_template.landclass,
+                "terrain": feature_template.terrain,
+                "edaphic": feature_template.edaphic,
+                "temporal": feature_template.temporal,
                 "other": feature_template.other,
             },
             _ft_fh,
