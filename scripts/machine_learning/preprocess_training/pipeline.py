@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,6 +17,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+
+_feature_contract = import_module("scripts.machine_learning.feature_contract")
+feature_template_dict = _feature_contract.feature_template_dict
+format_feature_group_counts = _feature_contract.format_feature_group_counts
 
 try:
     from .transform import build_feature_template, get_uncatalogued_summary, reset_uncatalogued_summary, transform_file
@@ -409,15 +414,7 @@ def run_preprocess(args) -> int:
         temporal_context_path=args.temporal_context_path,
     )
     template_seconds = time.perf_counter() - template_start
-    print(
-        "Feature template sizes | "
-        f"bioclimate={len(feature_template.bioclimate):,}, "
-        f"landclass={len(feature_template.landclass):,}, "
-        f"terrain={len(feature_template.terrain):,}, "
-        f"edaphic={len(feature_template.edaphic):,}, "
-        f"temporal={len(feature_template.temporal):,}, "
-        f"other={len(feature_template.other):,}"
-    )
+    print(f"Feature template sizes | {format_feature_group_counts(feature_template)}")
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -425,18 +422,7 @@ def run_preprocess(args) -> int:
     meta_dir.mkdir(parents=True, exist_ok=True)
     template_json_path = meta_dir / "feature_template.json"
     with open(template_json_path, "w") as _ft_fh:
-        json.dump(
-            {
-                "bioclimate": feature_template.bioclimate,
-                "landclass": feature_template.landclass,
-                "terrain": feature_template.terrain,
-                "edaphic": feature_template.edaphic,
-                "temporal": feature_template.temporal,
-                "other": feature_template.other,
-            },
-            _ft_fh,
-            indent=2,
-        )
+        json.dump(feature_template_dict(feature_template), _ft_fh, indent=2)
     print(f"Saved feature template to {template_json_path}")
 
     staging_dir.mkdir(parents=True, exist_ok=True)

@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -34,10 +35,13 @@ except ImportError:
 FEATURE_COLUMNS = import_local_symbol("data", "FEATURE_COLUMNS")
 MASK_COLUMNS = import_local_symbol("data", "MASK_COLUMNS")
 _list_column_to_2d_numpy = import_local_symbol("data", "_list_column_to_2d_numpy")
+_feature_contract = import_module("scripts.machine_learning.feature_contract")
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+format_feature_group_counts = _feature_contract.format_feature_group_counts
+normalize_feature_template = _feature_contract.normalize_feature_template
 
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
-FEATURE_TEMPLATE_GROUPS = ["bioclimate", "landclass", "terrain", "edaphic", "temporal", "other"]
 
 
 def build_cell_table(
@@ -135,7 +139,7 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         if template_path.exists():
             with open(template_path) as f:
                 raw = json.load(f)
-            return {group: raw.get(group, []) for group in FEATURE_TEMPLATE_GROUPS}
+            return normalize_feature_template(raw)
 
     # Fallback: derive from the GIS catalog using the same classification rules
     # the preprocessing pipeline uses.
@@ -151,13 +155,7 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         with open(catalog_path) as f:
             catalog = json.load(f)
 
-        grouped: dict[str, set[str]] = {
-            "bioclimate": set(),
-            "landclass": set(),
-            "terrain": set(),
-            "edaphic": set(),
-            "temporal": set(),
-        }
+        grouped: dict[str, set[str]] = {group: set() for group in FEATURE_GROUPS if group != "other"}
         for category in catalog.get("categories", []):
             for layer in category.get("layers", []):
                 lid = layer.get("id")
@@ -195,14 +193,7 @@ def export_bundle(
 
     feature_names = _load_feature_names(data_root)
     if feature_names is not None:
-        print(
-            f"Feature names: bioclimate={len(feature_names.get('bioclimate', []))}, "
-            f"landclass={len(feature_names.get('landclass', []))}, "
-            f"terrain={len(feature_names.get('terrain', []))}, "
-            f"edaphic={len(feature_names.get('edaphic', []))}, "
-            f"temporal={len(feature_names.get('temporal', []))}, "
-            f"other={len(feature_names.get('other', []))}"
-        )
+        print(f"Feature names: {format_feature_group_counts(feature_names)}")
     else:
         print("Warning: could not determine feature names; on-the-fly GIS sampling will be unavailable.")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import queue
 import threading
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,26 +15,13 @@ import pyarrow.dataset as ds
 import torch
 from torch.utils.data import Dataset
 
+_feature_contract = import_module("scripts.machine_learning.feature_contract")
+FEATURE_COLUMNS = _feature_contract.FEATURE_COLUMNS
+MASK_COLUMNS = _feature_contract.MASK_COLUMNS
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
-
-FEATURE_COLUMNS = [
-    "bioclimate_features",
-    "landclass_features",
-    "terrain_features",
-    "edaphic_features",
-    "temporal_features",
-    "other_features",
-]
-MASK_COLUMNS = [
-    "bioclimate_missing_mask",
-    "landclass_missing_mask",
-    "terrain_missing_mask",
-    "edaphic_missing_mask",
-    "temporal_missing_mask",
-    "other_missing_mask",
-]
 META_COLUMNS = ["species_key", "presence_label", "sample_weight", "cell_id"]
 
 MISSING_SENTINEL = -9999.0

@@ -29,6 +29,10 @@ from typing import Any, Callable, Iterator, NamedTuple
 
 import torch
 
+_feature_contract = import_module("scripts.machine_learning.feature_contract")
+_SAMPLED_FEATURE_GROUPS = _feature_contract.SAMPLED_FEATURE_GROUPS
+_UNSAMPLED_FEATURE_GROUPS = _feature_contract.UNSAMPLED_FEATURE_GROUPS
+
 # ---------------------------------------------------------------------------
 # Lazy import of model classes — avoids hard-wiring sys.path at module level.
 # The first call to ``load_bundle`` patches sys.path once.
@@ -53,8 +57,6 @@ HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
 _QUEUE_PUT_POLL_SECONDS = 0.1
 LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
-_SAMPLED_FEATURE_GROUPS = ("bioclimate", "landclass", "terrain", "edaphic")
-_UNSAMPLED_FEATURE_GROUPS = ("temporal", "other")
 
 
 def _feature_group_names(group_name: str) -> list[str]:
