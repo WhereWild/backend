@@ -1,56 +1,45 @@
 # B2 Dataset Structure Summary
 
-- Generated UTC: 2026-02-26T06:38:46.403509+00:00
-- Source: `local:/home/kelly/Softwares/wherewild/data`
-- Matched files: 2,932,574
-- Total size: 957,046,386,615 bytes (891.32 GB)
+- Generated UTC: 2026-03-20T02:03:28.424913+00:00
+- Source: `local:/home/kelly/Softwares/wherewild/wherewild/data`
+- Matched files: 2,944,269
+- Total size: 961,900,032,654 bytes (895.84 GB)
 - Distinct extensions: 10
-- Distinct prefixes (depth=10): 2,749,089
+- Distinct prefixes (depth=2): 9
 
 ## Time Coverage
 
 - Earliest modified UTC: 2025-12-30T21:05:03.286000+00:00
-- Latest modified UTC: 2026-02-17T23:57:51.518000+00:00
+- Latest modified UTC: 2026-03-15T04:42:32.504000+00:00
 
 ## Top Extensions
 
 | Extension | Files | Bytes |
 | --- | ---: | ---: |
-| `parquet` | 2,918,527 | 312,961,491,011 |
-| `tif` | 13,968 | 640,711,945,171 |
+| `parquet` | 2,919,854 | 293,383,391,587 |
+| `tif` | 24,336 | 665,143,690,674 |
 | `[no_extension]` | 50 | 327,880 |
 | `xml` | 10 | 4,362 |
-| `json` | 6 | 24,539 |
+| `json` | 6 | 24,499 |
 | `csv` | 5 | 2,888,896 |
 | `vrt` | 4 | 189,652 |
 | `pkl` | 2 | 521,136,911 |
 | `gpkg` | 1 | 2,759,749,632 |
 | `tmp` | 1 | 88,628,561 |
 
-## Top Prefixes (Depth 10)
+## Top Prefixes (Depth 2)
 
 | Prefix | Files | Bytes |
 | --- | ---: | ---: |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Caryophyllales_422/Cactaceae_2519/Pelecyphora_3231951/Pelecyphora_vivipara_11498251/Escobaria_vivipara_var._radiosa_3951580` | 7 | 374,898 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Caryophyllales_422/Cactaceae_2519/Echinocereus_5384005/Echinocereus_pamanesiorum_7761409/Echinocereus_pamanesii_subsp._bonatzii_3955936` | 7 | 242,611 |
-| `species/taxonomy/Animalia_1/Chordata_44/Aves_212/Columbiformes_1446/Columbidae_5233/Columba_2495404/Columba_livia_2495414/Columba_livia_var._domestica_10729360` | 6 | 269,099,710 |
-| `species/taxonomy/Animalia_1/Chordata_44/Aves_212/Anseriformes_1108/Anatidae_2986/Anas_2498056/Anas_platyrhynchos_9761484/Anas_platyrhynchos_f._domesticus_9577769` | 6 | 73,787,725 |
-| `species/taxonomy/Animalia_1/Chordata_44/Aves_212/Anseriformes_1108/Anatidae_2986/Cairina_2498282/Cairina_moschata_9751099/Cairina_moschata_var._domestica_10708159` | 6 | 54,991,032 |
-| `species/taxonomy/Animalia_1/Chordata_44/Mammalia_359/Artiodactyla_731/Cervidae_5298/Odocoileus_2440964/Odocoileus_hemionus_2440974/Odocoileus_hemionus_columbianus_4262326` | 6 | 49,331,981 |
-| `species/taxonomy/Animalia_1/Arthropoda_54/Insecta_216/Lepidoptera_797/Nymphalidae_7017/Limenitis_5131972/Limenitis_astyanax_5132505/Limenitis_arthemis_astyanax_5714327` | 6 | 48,314,633 |
-| `species/taxonomy/Animalia_1/Arthropoda_54/Insecta_216/Hemiptera_809/Pentatomidae_9650/Graphosoma_4405318/Graphosoma_italicum_7437802/Graphosoma_italicum_italicum_10673323` | 6 | 45,411,006 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Caryophyllales_422/Cactaceae_2519/Echinocereus_5384005/Echinocereus_engelmannii_3084111/Echinocereus_engelmannii_subsp._engelmannii_7283894` | 6 | 32,819,002 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Lamiales_408/Lamiaceae_2497/Lamium_2926678/Lamium_galeobdolon_2927324/Lamium_galeobdolon_subsp._argentatum_6411098` | 6 | 24,538,130 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Caryophyllales_422/Cactaceae_2519/Opuntia_3084187/Opuntia_basilaris_5384070/Opuntia_basilaris_var._basilaris_7219423` | 6 | 23,019,230 |
-| `species/taxonomy/Animalia_1/Arthropoda_54/Insecta_216/Lepidoptera_797/Nymphalidae_7017/Limenitis_5131972/Limenitis_arthemis_5132084/Limenitis_arthemis_arthemis_7205815` | 6 | 21,712,908 |
-| `species/taxonomy/Animalia_1/Chordata_44/Aves_212/Passeriformes_729/Parulidae_5263/Setophaga_2489984/Setophaga_auduboni_7760978/Setophaga_coronata_auduboni_6542061` | 6 | 20,468,355 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Magnoliopsida_220/Caryophyllales_422/Caryophyllaceae_2518/Silene_3085897/Silene_latifolia_5384805/Silene_latifolia_subsp._alba_5586736` | 6 | 20,433,800 |
-| `species/taxonomy/Animalia_1/Chordata_44/Aves_212/Passeriformes_729/Parulidae_5263/Setophaga_2489984/Setophaga_coronata_7341805/Setophaga_coronata_coronata_7341806` | 6 | 18,473,034 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Liliopsida_196/Poales_1369/Poaceae_3073/Phragmites_2705783/Phragmites_australis_5290149/Phragmites_australis_subsp._australis_7226752` | 6 | 17,706,616 |
-| `species/taxonomy/Animalia_1/Chordata_44/Amphibia_131/Anura_952/Bufonidae_6727/Anaxyrus_2422857/Anaxyrus_americanus_2422872/Anaxyrus_americanus_americanus_6169917` | 6 | 17,036,034 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Polypodiopsida_7228684/Polypodiales_392/Dennstaedtiaceae_6623/Pteridium_5275011/Pteridium_aquilinum_5275012/Pteridium_aquilinum_var._latiusculum_5532541` | 6 | 17,005,511 |
-| `species/taxonomy/Animalia_1/Arthropoda_54/Insecta_216/Coleoptera_1470/Coccinellidae_7782/Harmonia_1043111/Harmonia_axyridis_4989904/Harmonia_axyridis_f._succinea_11134183` | 6 | 16,427,097 |
-| `species/taxonomy/Plantae_6/Tracheophyta_7707728/Liliopsida_196/Asparagales_1169/Asparagaceae_7683/Maianthemum_9608430/Maianthemum_racemosum_2769457/Maianthemum_racemosum_subsp._amplexicaule_2769473` | 6 | 16,392,906 |
+| `species/taxonomy` | 2,919,902 | 293,739,170,156 |
+| `gis/regions` | 24,351 | 665,232,513,249 |
+| `gis/locations` | 6 | 168,556,674 |
+| `gis/legends` | 5 | 16,090 |
+| `gis/gadm.gpkg` | 1 | 2,759,749,632 |
+| `gis/catalog.json` | 1 | 8,409 |
+| `.DS_Store` | 1 | 6,148 |
+| `gis/.DS_Store` | 1 | 6,148 |
+| `species/.DS_Store` | 1 | 6,148 |
 
 ## Sample Tabular Paths
 
