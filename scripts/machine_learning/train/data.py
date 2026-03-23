@@ -41,6 +41,7 @@ _PREFETCH_MEM_AVAILABLE_GIB_CRITICAL = 4.0
 _PREFETCH_MEM_AVAILABLE_GIB_HIGH = 8.0
 _PREFETCH_MEM_AVAILABLE_GIB_MODERATE = 12.0
 _ADAPTIVE_PREFETCH_WAIT_SECONDS = 0.05
+_FRAGMENT_SHUFFLE_SEED = 0
 
 
 def load_split_table(
@@ -278,19 +279,33 @@ class StreamingTrainingDataset:
         data_root: str | Path,
         split: str = "train",
     ) -> None:
-        self._split_ds = load_split_table(data_root, split)
+        self._dataset = ds.dataset(str(data_root), format="parquet", partitioning="hive")
+        self._split_filter = pc.field("split") == split
+        self._split_ds = self._dataset.filter(self._split_filter)
         self.feature_dim, self.recon_dim = _probe_feature_dims(self._split_ds)
         # count_rows() reads only parquet footers -- no column data is loaded.
         self.row_count: int = self._split_ds.count_rows()
 
-    def _iter_record_batches(self) -> Iterator[dict[str, torch.Tensor]]:
-        """Yield one tensor dict per parquet record batch (lazy, re-entrant)."""
+    def _iter_record_batches(self, *, shuffle_fragments: bool = False) -> Iterator[dict[str, torch.Tensor]]:
+        """Yield one tensor dict per parquet record batch (lazy, re-entrant).
+
+        When ``shuffle_fragments`` is enabled, parquet fragments are visited in
+        a random order before record batches are read. This prevents training
+        from inheriting long runs of label-homogeneous rows when the dataset
+        was written with positives and pooled background in separate fragments.
+        """
         columns = [*FEATURE_COLUMNS, *MASK_COLUMNS, *META_COLUMNS]
-        scanner = self._split_ds.scanner(columns=columns, batch_size=_SCAN_BATCH_ROWS)
-        for record_batch in scanner.to_batches():
-            if record_batch.num_rows == 0:
-                continue
-            yield _record_batch_to_tensors(record_batch)
+        fragments = list(self._dataset.get_fragments(filter=self._split_filter))
+        if shuffle_fragments and len(fragments) > 1:
+            fragment_order = np.random.default_rng(_FRAGMENT_SHUFFLE_SEED).permutation(len(fragments))
+            fragments = [fragments[idx] for idx in fragment_order]
+
+        for fragment in fragments:
+            scanner = fragment.scanner(columns=columns, batch_size=_SCAN_BATCH_ROWS)
+            for record_batch in scanner.to_batches():
+                if record_batch.num_rows == 0:
+                    continue
+                yield _record_batch_to_tensors(record_batch)
 
 
 def _yield_batches_from_parts(
@@ -434,7 +449,7 @@ class StreamingBatchIterator:
         buffer: list[dict[str, torch.Tensor]] = []
         buf_rows = 0
 
-        for rb_tensors in self._dataset._iter_record_batches():
+        for rb_tensors in self._dataset._iter_record_batches(shuffle_fragments=self._shuffle):
             buffer.append(rb_tensors)
             buf_rows += rb_tensors["features"].shape[0]
             if buf_rows >= self._shuffle_buffer_size:
@@ -501,7 +516,7 @@ class ChunkCachedBatchIterator:
         return max(1, math.ceil(self._dataset.row_count / self._batch_size))
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        record_batches = iter(self._dataset._iter_record_batches())
+        record_batches = iter(self._dataset._iter_record_batches(shuffle_fragments=self._shuffle))
         # Queue maxsize is a hard safety ceiling. Adaptive prefetch is a
         # dynamic soft ceiling enforced by inflight_chunks + condition waits.
         # The producer may intentionally wait even when queue capacity remains
