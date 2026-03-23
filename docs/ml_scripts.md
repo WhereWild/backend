@@ -6,8 +6,8 @@ training, export, and inference.
 Optional shell shortcuts:
 
 ```bash
-alias ww-preprocess='uv run python scripts/machine_learning/preprocess_training/cli.py'
-alias ww-train='uv run python scripts/machine_learning/train/cli.py'
+alias ww-preprocess='uv run python -m scripts.machine_learning.preprocess_training.cli'
+alias ww-train='uv run python -m scripts.machine_learning.train.cli'
 ```
 
 ## Scripts
@@ -31,7 +31,7 @@ alias ww-train='uv run python scripts/machine_learning/train/cli.py'
 ### Basic smoke run
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 100 \
@@ -46,7 +46,7 @@ donor rows are sampled from other-species positives in the same split,
 with `(cell_id, year_month)` conflicts excluded.
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 1000 \
@@ -59,7 +59,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ### Large run (OOM-safer schema scan)
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 10000 \
@@ -74,7 +74,7 @@ uv run python scripts/machine_learning/preprocess_training/cli.py \
 ### Full-data run in WSL (OOM-aware)
 
 ```bash
-uv run python scripts/machine_learning/preprocess_training/cli.py \
+uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 0 \
@@ -183,7 +183,7 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
 ## 2. Validate output schema
 
 ```bash
-uv run python scripts/machine_learning/validate_training_schema.py \
+uv run python -m scripts.machine_learning.validate_training_schema \
     --schema schemas/training_observation.schema.json \
     --data ./data_ml/species_observation_canary_plants \
     --allow-extra-columns
@@ -197,7 +197,7 @@ Notes:
 ## 3. Regenerate schema docs
 
 ```bash
-uv run python scripts/machine_learning/generate_training_schema_docs.py
+uv run python -m scripts.machine_learning.generate_training_schema_docs
 ```
 
 ## Trainability checklist
@@ -221,7 +221,7 @@ Install training dependencies with: `uv sync --extra ml`.
 Current Stage B objective is masked reconstruction of observed feature values.
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py encoder \
+uv run python -m scripts.machine_learning.train.cli encoder \
     --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
@@ -231,7 +231,7 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 On CPU (slower, no AMP):
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py encoder \
+uv run python -m scripts.machine_learning.train.cli encoder \
     --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
     --epochs 50 \
@@ -243,7 +243,7 @@ uv run python scripts/machine_learning/train/cli.py encoder \
 ### Stage C: Train per-species PU heads
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py heads \
+uv run python -m scripts.machine_learning.train.cli heads \
     --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --output-dir ./checkpoints/canary_plants/heads
@@ -252,7 +252,7 @@ uv run python scripts/machine_learning/train/cli.py heads \
 ### Both stages sequentially
 
 ```bash
-uv run python scripts/machine_learning/train/cli.py all \
+uv run python -m scripts.machine_learning.train.cli all \
     --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants \
     --epochs 50 \
@@ -286,7 +286,7 @@ uv run python scripts/machine_learning/train/cli.py all \
 Package the trained model into a single `.pt` file for server-side deployment:
 
 ```bash
-uv run python scripts/machine_learning/train/export.py \
+uv run python -m scripts.machine_learning.train.export \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
     --data-root ./data_ml/species_observation_canary_plants \
