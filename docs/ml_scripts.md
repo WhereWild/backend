@@ -307,13 +307,16 @@ catalog; uncatalogued `other` names require the saved template.
 
 ## 6. Run inference / serve the API
 
-### Load the bundle and predict in Python
+### Load the bundle and prepare a heatmap stream in Python
 
 ```python
-from util.inference import load_bundle, predict
+from util.inference import load_bundle, predict_heatmap_stream
 
 load_bundle("checkpoints/canary_plants/inference_bundle.pt")
-results = predict(lat=25.0, lon=-100.0, top_k=10)
+stream_result = predict_heatmap_stream(
+    11498251,
+    (24.0, -106.0, 32.0, -94.0),
+)
 ```
 
 ### Start the FastAPI server
@@ -334,14 +337,11 @@ Runtime device env vars:
     Controls parallel raster-layer sampling for heatmaps.
     Keep at `1` unless benchmarked on your deployment.
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
-    Controls sampling chunk size for `GET /api/predict/heatmap/stream`.
+    Controls sampling chunk size for heatmap job streams.
     Independent from model scoring batch size.
 - `WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS`: integer `>=1` (default: `2`).
     Controls how many prepared stream chunks can queue ahead.
     Increase for more read-ahead overlap (uses more memory).
-- `WHEREWILD_INFERENCE_PROFILE`: `0` (default) or `1`.
-    When set, `GET /api/predict/heatmap` includes a `profile` object with
-    stage timings.
 
 Example forcing both inference compute and cell table to CUDA:
 
@@ -351,7 +351,6 @@ WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
 WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
 WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
 WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS=2 \
-WHEREWILD_INFERENCE_PROFILE=0 \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
     uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -366,10 +365,9 @@ docker compose up -d gdal
 
 ### Prediction endpoints
 
-- `GET /api/predict?lat=&lon=&top_k=&threshold=` -- single-point prediction.
-- `GET /api/predict/batch?coords=lat1,lon1,lat2,lon2&top_k=&threshold=` -- batch (max 100 coordinates).
-- `GET /api/predict/heatmap?species_key=&min_lat=&min_lon=&max_lat=&max_lon=&resolution=` -- per-species probability grid with variable resolution.
-- `GET /api/predict/info` -- model metadata (species count, cell count).
+- `POST /api/predict/heatmap-jobs` -- create a cancellable heatmap job.
+- `GET /api/predict/heatmap-jobs/{job_id}/stream` -- stream heatmap NDJSON events.
+- `DELETE /api/predict/heatmap-jobs/{job_id}` -- cancel a stale or running heatmap job.
 
 ### On-the-fly GIS sampling
 

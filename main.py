@@ -162,7 +162,7 @@ async def lifespan(app: FastAPI):
             print(f"Warning: failed to load inference bundle {bundle_path}")
             _tb.print_exc()
     else:
-        print(f"Inference bundle not found at {bundle_path} — /api/predict disabled")
+        print(f"Inference bundle not found at {bundle_path} — heatmap inference endpoints disabled")
     yield
 
 
@@ -2431,61 +2431,8 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
 
 
 # ---------------------------------------------------------------------------
-# SDM prediction response models
+# SDM heatmap job models
 # ---------------------------------------------------------------------------
-
-
-class SpeciesPrediction(BaseModel):
-    species_key: int
-    score: float
-    prior: float
-
-
-class PredictResponse(BaseModel):
-    lat: float
-    lon: float
-    top_k: int
-    threshold: float
-    n_results: int
-    predictions: list[SpeciesPrediction]
-
-
-class CoordinatePredictions(BaseModel):
-    lat: float
-    lon: float
-    n_results: int
-    predictions: list[SpeciesPrediction]
-
-
-class PredictBatchResponse(BaseModel):
-    n_coordinates: int
-    top_k: int
-    threshold: float
-    results: list[CoordinatePredictions]
-
-
-class HeatmapCell(BaseModel):
-    lat: float
-    lon: float
-    score: float
-    n_native: int
-    source: str | None = None
-
-
-class PredictHeatmapResponse(BaseModel):
-    species_key: int
-    bbox: list[float]
-    resolution: float
-    native_resolution: float
-    n_cells: int
-    cells: list[HeatmapCell]
-
-
-class PredictInfoResponse(BaseModel):
-    loaded: bool
-    n_species: int
-    n_cells: int
-    species_keys: list[int]
 
 
 class HeatmapJobCreateRequest(BaseModel):
@@ -2496,7 +2443,7 @@ class HeatmapJobCreateRequest(BaseModel):
     max_lon: float
     resolution: float | None = None
     include_source: bool = False
-    feature_mode: str = "auto"
+    feature_mode: str = "prefer_cell_table"
     max_cells: int = 20000
 
 
@@ -2638,223 +2585,8 @@ def _build_heatmap_stream_response(
 
 
 # ---------------------------------------------------------------------------
-# SDM prediction endpoints
+# SDM heatmap job endpoints
 # ---------------------------------------------------------------------------
-
-
-@app.get("/api/predict", response_model=PredictResponse)
-def predict_species(
-    lat: float = Query(..., ge=-90, le=90, description="Latitude in degrees."),
-    lon: float = Query(..., ge=-180, le=180, description="Longitude in degrees."),
-    top_k: int = Query(20, ge=1, le=500, description="Maximum species to return."),
-    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum score threshold."),
-) -> PredictResponse:
-    """Predict species suitability for a geographic coordinate.
-
-    Returns ranked species scores from the Darwin SDM.  Requires an
-    inference bundle to be loaded at startup (set WHEREWILD_INFERENCE_BUNDLE
-    env var or place at checkpoints/inference_bundle.pt).
-
-    Args:
-        lat: Latitude of the query point.
-        lon: Longitude of the query point.
-        top_k: Number of top-scoring species to return.
-        threshold: Minimum sigmoid score to include.
-
-    Returns:
-        A dict with coordinate echo, cell info, and ranked predictions.
-    """
-    if not inference.is_loaded():
-        raise HTTPException(
-            status_code=503,
-            detail="Inference model not loaded. Set WHEREWILD_INFERENCE_BUNDLE or place bundle at checkpoints/inference_bundle.pt.",
-        )
-
-    predictions = inference.predict(
-        lat,
-        lon,
-        top_k=top_k,
-        score_threshold=threshold,
-    )
-    return PredictResponse(
-        lat=lat,
-        lon=lon,
-        top_k=top_k,
-        threshold=threshold,
-        n_results=len(predictions),
-        predictions=predictions,
-    )
-
-
-@app.get("/api/predict/batch", response_model=PredictBatchResponse)
-def predict_species_batch(
-    coords: str = Query(
-        ...,
-        description=("Comma-separated lat,lon pairs. Example: 25.0,-100.0,26.5,-99.0"),
-    ),
-    top_k: int = Query(20, ge=1, le=500),
-    threshold: float = Query(0.0, ge=0.0, le=1.0),
-) -> PredictBatchResponse:
-    """Batch prediction for multiple coordinates.
-
-    Coordinates are passed as a flat comma-separated string of
-    alternating lat,lon values.
-
-    Args:
-        coords: Flat comma-separated lat,lon pairs.
-        top_k: Number of top-scoring species per coordinate.
-        threshold: Minimum sigmoid score.
-
-    Returns:
-        A list of per-coordinate prediction results.
-    """
-    if not inference.is_loaded():
-        raise HTTPException(
-            status_code=503,
-            detail="Inference model not loaded.",
-        )
-
-    parts = [float(v.strip()) for v in coords.split(",")]
-    if len(parts) % 2 != 0:
-        raise HTTPException(status_code=400, detail="coords must have an even number of values (lat,lon pairs).")
-
-    coordinate_list = [(parts[i], parts[i + 1]) for i in range(0, len(parts), 2)]
-    if len(coordinate_list) > 100:
-        raise HTTPException(status_code=400, detail="Maximum 100 coordinate pairs per batch request.")
-
-    batch_results = inference.predict_batch(
-        coordinate_list,
-        top_k=top_k,
-        score_threshold=threshold,
-    )
-    return PredictBatchResponse(
-        n_coordinates=len(coordinate_list),
-        top_k=top_k,
-        threshold=threshold,
-        results=[
-            CoordinatePredictions(
-                lat=lat,
-                lon=lon,
-                n_results=len(preds),
-                predictions=preds,
-            )
-            for (lat, lon), preds in zip(coordinate_list, batch_results)
-        ],
-    )
-
-
-@app.get("/api/predict/heatmap", response_model=PredictHeatmapResponse)
-def predict_species_heatmap(
-    species_key: int = Query(..., description="GBIF species key."),
-    min_lat: float = Query(..., ge=-90, le=90, description="Southern edge of bounding box."),
-    min_lon: float = Query(..., ge=-180, le=180, description="Western edge of bounding box."),
-    max_lat: float = Query(..., ge=-90, le=90, description="Northern edge of bounding box."),
-    max_lon: float = Query(..., ge=-180, le=180, description="Eastern edge of bounding box."),
-    resolution: float | None = Query(
-        None, gt=0, le=10, description="Grid cell size in degrees. Defaults to model native (0.25)."
-    ),
-    include_source: bool = Query(
-        False, description="Include per-cell feature source (`sampled` or `cell_table`) for debugging."
-    ),
-    feature_mode: str = Query(
-        "auto",
-        description="Feature source strategy: auto, prefer_cell_table, cell_table_only, sampled_only.",
-    ),
-    max_cells: int = Query(
-        20000,
-        ge=100,
-        le=2_000_000,
-        description="Hard cap on output heatmap cells to avoid OOM.",
-    ),
-) -> PredictHeatmapResponse:
-    """Compute a probability grid for one species over a bounding box.
-
-    Returns per-cell scores suitable for rendering a heat map.
-    All cells within the bounding box are evaluated in a single vectorized
-    forward pass.
-
-    Args:
-        species_key: GBIF species key (must exist in the loaded model).
-        min_lat: Southern edge latitude.
-        min_lon: Western edge longitude.
-        max_lat: Northern edge latitude.
-        max_lon: Eastern edge longitude.
-        resolution: Grid cell size in degrees (default: model native).
-
-    Returns:
-        A dict containing species_key, bbox, resolution, cell count, and
-        a list of ``{lat, lon, score}`` entries for every cell that has
-        environmental data.
-    """
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-    _validate_heatmap_bbox(min_lat, min_lon, max_lat, max_lon)
-    try:
-        result = inference.predict_heatmap(
-            species_key,
-            (min_lat, min_lon, max_lat, max_lon),
-            resolution=resolution,
-            include_source=include_source,
-            feature_mode=feature_mode,
-            max_cells=max_cells,
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return PredictHeatmapResponse(**result)
-
-
-@app.get("/api/predict/heatmap/stream")
-def predict_species_heatmap_stream(
-    species_key: int = Query(..., description="GBIF species key."),
-    min_lat: float = Query(..., ge=-90, le=90, description="Southern edge of bounding box."),
-    min_lon: float = Query(..., ge=-180, le=180, description="Western edge of bounding box."),
-    max_lat: float = Query(..., ge=-90, le=90, description="Northern edge of bounding box."),
-    max_lon: float = Query(..., ge=-180, le=180, description="Eastern edge of bounding box."),
-    resolution: float | None = Query(
-        None, gt=0, le=10, description="Grid cell size in degrees. Defaults to model native (0.25)."
-    ),
-    include_source: bool = Query(
-        False, description="Include per-cell feature source (`sampled` or `cell_table`) for debugging."
-    ),
-    feature_mode: str = Query(
-        "auto",
-        description="Feature source strategy: auto, prefer_cell_table, cell_table_only, sampled_only.",
-    ),
-    max_cells: int = Query(
-        20000,
-        ge=100,
-        le=2_000_000,
-        description="Hard cap on output heatmap cells to avoid OOM.",
-    ),
-) -> StreamingResponse:
-    """Stream heatmap cells as NDJSON.
-
-    Emits one line of JSON per event:
-    - ``{"type": "meta", ...}``
-    - many ``{"type": "cell", ...}``
-    - final ``{"type": "done", "n_cells": N}``
-    """
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-    _validate_heatmap_bbox(min_lat, min_lon, max_lat, max_lon)
-
-    try:
-        stream_result = inference.predict_heatmap_stream(
-            species_key,
-            (min_lat, min_lon, max_lat, max_lon),
-            resolution=resolution,
-            include_source=include_source,
-            feature_mode=feature_mode,
-            max_cells=max_cells,
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return _build_heatmap_stream_response(stream_result)
 
 
 @app.post("/api/predict/heatmap-jobs", response_model=HeatmapJobResponse)
@@ -2978,26 +2710,6 @@ def cancel_predict_heatmap_job(job_id: str) -> HeatmapJobDeleteResponse:
         current_status = job["status"]
 
     return HeatmapJobDeleteResponse(job_id=job_id, status=current_status)
-
-
-@app.get("/api/predict/info", response_model=PredictInfoResponse)
-def predict_model_info() -> PredictInfoResponse:
-    """Return metadata about the loaded inference model.
-
-    Returns:
-        Species count, cell count, and per-species metadata.
-    """
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-
-    return PredictInfoResponse(
-        loaded=True,
-        n_species=len(inference.known_species()),
-        n_cells=inference.cell_count(),
-        species_keys=inference.known_species(),
-    )
-
-
 if __name__ == "__main__":
     import uvicorn
 

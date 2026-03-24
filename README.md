@@ -348,15 +348,12 @@ WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
 #   Controls how many coords are sampled per stream chunk (independent of score batch size).
 # Stream prefetch queue depth: integer >=1 (default: 2)
 #   Controls how many prepared stream chunks can queue ahead (more overlap, more memory).
-# Heatmap profiling: 0|1 (default: 0)
-#   When enabled, /api/predict/heatmap includes a profile block with stage timings.
 # Note: cell-table cuda requires WHEREWILD_INFERENCE_DEVICE=cuda
 WHEREWILD_INFERENCE_DEVICE=cuda \
 WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
 WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
 WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
 WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS=2 \
-WHEREWILD_INFERENCE_PROFILE=0 \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/inference_bundle.pt \
   uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 

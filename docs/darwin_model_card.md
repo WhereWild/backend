@@ -145,14 +145,9 @@ Expected outcome: most compute spent once in shared encoder; species updates are
 - The inference engine (`util/inference.py`) loads the bundle at startup and runs on CPU.
 - No CUDA, AMP, or heavy ML dependencies are needed on the server.
 - FastAPI prediction endpoints currently exposed:
-    - `/api/predict` (single-point scoring)
-    - `/api/predict/batch` (batch scoring)
-    - `/api/predict/heatmap` (materialized heatmap)
-    - `/api/predict/heatmap/stream` (streaming heatmap)
     - `/api/predict/heatmap-jobs` (create async heatmap job)
     - `/api/predict/heatmap-jobs/{job_id}/stream` (stream async heatmap job progress/results)
     - `/api/predict/heatmap-jobs/{job_id}` (delete/cancel heatmap job)
-    - `/api/predict/info` (model/bundle metadata)
 
 ### 5.3 On-the-fly GIS sampling
 
