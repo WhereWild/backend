@@ -1,21 +1,26 @@
 from __future__ import annotations
-
 import io
+import json
 import math
+import shutil
 import tempfile
 import traceback
 from contextlib import asynccontextmanager
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
-
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import scripts.enrich_tree as enrich_tree
 
 from util.config import load_config
 from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
-import pandas as pd
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -69,6 +74,36 @@ def _path_exists(path: Path) -> bool:
     return path.exists()
 
 
+def _normalize_coordinate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+
+    if "decimalLatitude" not in result.columns:
+        latitude_match = next(
+            (
+                column
+                for column in result.columns
+                if "latitude" in str(column).strip().lower()
+            ),
+            None,
+        )
+        if latitude_match is not None:
+            result = result.rename(columns={latitude_match: "decimalLatitude"})
+
+    if "decimalLongitude" not in result.columns:
+        longitude_match = next(
+            (
+                column
+                for column in result.columns
+                if "longitude" in str(column).strip().lower()
+            ),
+            None,
+        )
+        if longitude_match is not None:
+            result = result.rename(columns={longitude_match: "decimalLongitude"})
+
+    return result
+
+
 def _add_tile_ids(df: pd.DataFrame) -> pd.DataFrame:
     required_columns = {"decimalLatitude", "decimalLongitude"}
     missing = required_columns - set(df.columns)
@@ -104,11 +139,350 @@ def _add_tile_ids(df: pd.DataFrame) -> pd.DataFrame:
             ),
         )
 
+    result["decimalLatitude"] = latitudes
+    result["decimalLongitude"] = longitudes
     result["tileId"] = [
         gis_lookup.get_region_name(float(lat), float(lon))
         for lat, lon in zip(latitudes.tolist(), longitudes.tolist())
     ]
     return result
+
+
+def _ensure_catalog_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    if "catalogNumber" in df.columns:
+        return df
+
+    result = df.copy()
+    result["catalogNumber"] = [f"obs_{idx}" for idx in range(1, len(result) + 1)]
+    return result
+
+
+def _add_gis_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    if "tileId" not in df.columns:
+        raise HTTPException(
+            status_code=422,
+            detail="Uploaded file is missing tileId. Populate tileId before GIS enrichment.",
+        )
+
+    result = df.copy()
+    layer_ids = enrich_tree._load_layer_ids()
+    if not layer_ids:
+        return result
+
+    for layer_id in layer_ids:
+        if layer_id not in result.columns:
+            result[layer_id] = np.nan
+
+    derived_layers = {
+        layer_id: enrich_tree.DERIVED_DEM_LAYER_METRICS.get(layer_id)
+        for layer_id in layer_ids
+        if enrich_tree.DERIVED_DEM_LAYER_METRICS.get(layer_id) is not None
+    }
+
+    def _to_float_array(values: Any, expected_len: int) -> np.ndarray:
+        if values is None:
+            return np.full(expected_len, np.nan, dtype="float64")
+        if isinstance(values, np.ndarray):
+            raw_values = values.tolist()
+        elif isinstance(values, (list, tuple)):
+            raw_values = list(values)
+        else:
+            raw_values = [values]
+
+        coerced: list[float] = []
+        for value in raw_values:
+            if value is None:
+                coerced.append(np.nan)
+                continue
+            if isinstance(value, (list, tuple, dict, set, np.ndarray)):
+                coerced.append(np.nan)
+                continue
+            try:
+                coerced.append(float(value))
+            except (TypeError, ValueError):
+                coerced.append(np.nan)
+
+        array = np.asarray(coerced, dtype="float64")
+        if array.shape[0] != expected_len:
+            normalized = np.full(expected_len, np.nan, dtype="float64")
+            copy_len = min(expected_len, array.shape[0])
+            if copy_len > 0:
+                normalized[:copy_len] = array[:copy_len]
+            return normalized
+        return array
+
+    ordered = result.sort_values("tileId", kind="stable")
+    for tile_id, group in ordered.groupby("tileId", dropna=True, sort=False):
+        if not str(tile_id).strip():
+            continue
+        row_indices = group.index.to_numpy()
+        row_count = len(row_indices)
+        lats = group["decimalLatitude"].to_numpy(dtype=float)
+        lons = group["decimalLongitude"].to_numpy(dtype=float)
+
+        if derived_layers:
+            metrics = tuple(sorted(set(derived_layers.values())))
+            derived_values = enrich_tree._sample_dem_derived_values(
+                lats=lats,
+                lons=lons,
+                tile_id=str(tile_id),
+                metrics=metrics,
+            )
+            for layer_id, metric in derived_layers.items():
+                metric_array = _to_float_array(
+                    derived_values.get(metric),
+                    row_count,
+                )
+                result.loc[row_indices, layer_id] = metric_array
+
+        for layer_id in layer_ids:
+            if layer_id in derived_layers:
+                continue
+            values = enrich_tree._sample_layer_values(layer_id, lats, lons, str(tile_id))
+            value_array = _to_float_array(values, row_count)
+            result.loc[row_indices, layer_id] = value_array
+
+    return result
+
+
+def _write_summary_artifacts_from_dataframe(df: pd.DataFrame, directory: Path) -> None:
+    filtered = df.copy()
+    if "obscured" in filtered.columns:
+        filtered = filtered[filtered["obscured"].astype(str) == "No"]
+    if "coordinateUncertaintyInMeters" in filtered.columns:
+        uncertainty = pd.to_numeric(
+            filtered["coordinateUncertaintyInMeters"],
+            errors="coerce",
+        )
+        filtered = filtered[uncertainty <= 500]
+
+    categorical_cols = [
+        column
+        for column in filtered.columns
+        if summary_stats._layer_value_type(column) == "categorical"
+    ]
+    categorical_entries = summary_stats._collect_categorical_stats(filtered, categorical_cols)
+    summary_stats._write_categorical_stats(
+        directory,
+        categorical_entries,
+        merge_existing=False,
+    )
+
+    numeric_cols = [
+        column
+        for column in filtered.select_dtypes(include=["number"]).columns
+        if (
+            column not in summary_stats.excluded_numeric_columns
+            and summary_stats._layer_value_type(column) != "categorical"
+        )
+    ]
+    stats: dict[str, dict[str, Any]] = {}
+    density_rows: list[dict[str, Any]] = []
+    for column in numeric_cols:
+        series = pd.to_numeric(filtered[column], errors="coerce").dropna()
+        if series.empty:
+            continue
+        q10 = float(series.quantile(0.10))
+        q25 = float(series.quantile(0.25))
+        q50 = float(series.quantile(0.50))
+        q75 = float(series.quantile(0.75))
+        q90 = float(series.quantile(0.90))
+        col_min = float(series.min())
+        col_max = float(series.max())
+        stats[column] = {
+            "count": int(series.count()),
+            "min": col_min,
+            "10th percentile": q10,
+            "25th percentile": q25,
+            "median": q50,
+            "75th percentile": q75,
+            "90th percentile": q90,
+            "max": col_max,
+            "mean": float(series.mean()),
+            "std": float(series.std()),
+            "10-90 range": float(q90 - q10),
+            "range": float(col_max - col_min),
+        }
+
+        values = series.astype(float).tolist()
+        point_count = summary_stats._density_point_count(len(values))
+        curve = summary_stats._build_density_curve(values, point_count)
+        if curve:
+            density_rows.append(
+                {
+                    "variable": column,
+                    "count": int(len(values)),
+                    "sampleCount": int(len(values)),
+                    "pointCount": int(point_count),
+                    "points": curve["points"],
+                    "density": curve["density"],
+                    "min": curve["min"],
+                    "max": curve["max"],
+                    "bandwidth": curve["bandwidth"],
+                }
+            )
+
+    summary_stats._write_summary_stats(
+        directory,
+        stats,
+        merge_existing=False,
+    )
+    density_path = directory / summary_stats.density_graph_filename
+    if density_rows:
+        pd.DataFrame(density_rows).to_parquet(density_path, index=False)
+    else:
+        density_path.unlink(missing_ok=True)
+
+
+def _write_occurrence_index_from_dataframe(df: pd.DataFrame, directory: Path) -> None:
+    if "catalogNumber" not in df.columns:
+        raise HTTPException(
+            status_code=422,
+            detail="Uploaded file is missing required column for indexing: catalogNumber",
+        )
+
+    index_path = directory / "occurrence_index.parquet"
+    catalog_series = df["catalogNumber"].astype(str)
+    targets = indexing.index_targets_for_columns(
+        set(df.columns),
+        layer_catalog=gis_lookup.load_layer_metadata(),
+    )
+
+    index_columns: dict[str, pa.Array] = {}
+    column_lengths: dict[str, int] = {}
+    category_offsets: dict[str, dict[str, dict[str, int | float]]] = {}
+    max_len = 0
+
+    for layer_id, value_type in targets:
+        layer_series = df[layer_id]
+        valid_mask = layer_series.notna()
+        if "obscured" in df.columns:
+            valid_mask = valid_mask & (df["obscured"].astype(str) == "No")
+        if "coordinateUncertaintyInMeters" in df.columns:
+            uncertainty = pd.to_numeric(df["coordinateUncertaintyInMeters"], errors="coerce")
+            valid_mask = valid_mask & (uncertainty <= 500)
+
+        selected = df.loc[valid_mask, [layer_id]].copy()
+        selected["catalogNumber"] = catalog_series.loc[valid_mask]
+        selected[layer_id] = pd.to_numeric(selected[layer_id], errors="coerce")
+        selected = selected.dropna(subset=[layer_id])
+        if selected.empty:
+            continue
+
+        if value_type == "categorical":
+            selected[layer_id] = selected[layer_id].astype(int)
+        else:
+            selected[layer_id] = selected[layer_id].astype(float)
+
+        selected = selected.sort_values(layer_id, kind="stable")
+        value_array = pa.array(
+            selected[layer_id].tolist(),
+            type=pa.int64() if value_type == "categorical" else pa.float64(),
+        )
+        catalog_array = pa.array(selected["catalogNumber"].astype(str).tolist(), type=pa.string())
+        origin_array = pa.array([0] * len(selected), type=pa.int32())
+        struct_array = pa.StructArray.from_arrays(
+            [catalog_array, origin_array, value_array],
+            fields=[
+                pa.field("catalogNumber", pa.string()),
+                pa.field("originId", pa.int32()),
+                pa.field("value", value_array.type),
+            ],
+        )
+        index_columns[layer_id] = struct_array
+        column_lengths[layer_id] = len(struct_array)
+        max_len = max(max_len, len(struct_array))
+
+        if value_type == "categorical":
+            values = selected[layer_id].tolist()
+            offsets: dict[str, dict[str, int | float]] = {}
+            current_value = None
+            start_idx = 0
+            for idx, value in enumerate(values):
+                if current_value is None:
+                    current_value = value
+                    start_idx = idx
+                    continue
+                if value != current_value:
+                    offsets[str(current_value)] = {
+                        "value": int(current_value),
+                        "start": start_idx,
+                        "count": idx - start_idx,
+                    }
+                    current_value = value
+                    start_idx = idx
+            if current_value is not None:
+                offsets[str(current_value)] = {
+                    "value": int(current_value),
+                    "start": start_idx,
+                    "count": len(values) - start_idx,
+                }
+            if offsets:
+                category_offsets[layer_id] = offsets
+
+    if not index_columns:
+        index_path.unlink(missing_ok=True)
+        return
+
+    for key, arr in list(index_columns.items()):
+        if len(arr) < max_len:
+            pad = pa.nulls(max_len - len(arr), type=arr.type)
+            index_columns[key] = pa.concat_arrays([arr, pad])
+
+    index_table = pa.table(index_columns)
+    metadata = dict(index_table.schema.metadata or {})
+    metadata[b"origin_map"] = json.dumps(
+        [{"id": 0, "relative_path": ".", "taxon_key": "uploaded"}]
+    ).encode("utf-8")
+    metadata[b"column_lengths"] = json.dumps(column_lengths).encode("utf-8")
+    metadata[b"catalog_column"] = b"catalogNumber"
+    metadata[b"category_offsets"] = json.dumps(category_offsets).encode("utf-8")
+    index_table = index_table.replace_schema_metadata(metadata)
+    pq.write_table(index_table, index_path)
+
+
+def _build_index_archive(df: pd.DataFrame, uploaded_name: str) -> tuple[Path, str, Path]:
+    work_dir = Path(tempfile.mkdtemp(prefix="wherewild-uploaded_0_"))
+    occurrence_path = work_dir / CONFIG.occurrence_parquet_filename
+    index_path = work_dir / "occurrence_index.parquet"
+    archive_name = "processed_observations.zip"
+    archive_path = work_dir / archive_name
+
+    df.to_parquet(occurrence_path, index=False)
+
+    try:
+        _write_summary_artifacts_from_dataframe(df, work_dir)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to build summary stat artifacts: {exc}",
+        ) from exc
+
+    try:
+        _write_occurrence_index_from_dataframe(df, work_dir)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to build occurrence index parquet: {exc}",
+        ) from exc
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(occurrence_path, arcname=CONFIG.occurrence_parquet_filename)
+        if index_path.exists():
+            archive.write(index_path, arcname=index_path.name)
+        summary_stats_path = work_dir / "summary_stats.parquet"
+        categorical_stats_path = work_dir / "categorical_stats.parquet"
+        density_graph_path = work_dir / summary_stats.density_graph_filename
+        if summary_stats_path.exists():
+            archive.write(summary_stats_path, arcname=summary_stats_path.name)
+        if categorical_stats_path.exists():
+            archive.write(categorical_stats_path, arcname=categorical_stats_path.name)
+        if density_graph_path.exists():
+            archive.write(density_graph_path, arcname=density_graph_path.name)
+
+    return archive_path, archive_name, work_dir
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -1119,6 +1493,8 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
             status_code=400,
             detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
         )
+    
+    print("Received file, converting to parquet...")
 
     contents = await file.read()
     buf = io.BytesIO(contents)
@@ -1133,20 +1509,23 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
 
+    print("Finished converting file to parquet, normalizing fields...")
+
+    df = _normalize_coordinate_columns(df)
+    df = _ensure_catalog_numbers(df)
+    print("Finished normalizing fields. adding tileID...")
     df = _add_tile_ids(df)
+    print("Finished adding tileID, adding columns for GIS data, building parquet files")
+    df = _add_gis_columns(df)
 
-    out_name = Path(filename).stem + ".parquet"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".parquet")
-    try:
-        df.to_parquet(tmp.name, index=False)
-    finally:
-        tmp.close()
+    archive_path, out_name, work_dir = _build_index_archive(df, filename)
 
-    background_tasks.add_task(Path(tmp.name).unlink, missing_ok=True)
+    background_tasks.add_task(shutil.rmtree, work_dir, True)
 
+    print("Finished generating, returning zip")
     return FileResponse(
-        path=tmp.name,
-        media_type="application/octet-stream",
+        path=archive_path,
+        media_type="application/zip",
         filename=out_name,
     )
 

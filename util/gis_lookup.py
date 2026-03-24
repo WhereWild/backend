@@ -107,10 +107,34 @@ def open_raster(source: RasterSource) -> Iterator[Any]:
     import rasterio
 
     if source.gdal_env:
-        with rasterio.Env(**source.gdal_env):
+        aws_env = {
+            key: str(value)
+            for key, value in source.gdal_env.items()
+            if str(key).startswith("AWS_")
+        }
+        gdal_env = {
+            key: value
+            for key, value in source.gdal_env.items()
+            if not str(key).startswith("AWS_")
+        }
+        previous = {key: os.environ.get(key) for key in aws_env}
+        for key, value in aws_env.items():
+            os.environ[key] = value
+        try:
+            if gdal_env:
+                with rasterio.Env(**gdal_env):
+                    with rasterio.open(source.uri) as ds:
+                        yield ds
+                return
             with rasterio.open(source.uri) as ds:
                 yield ds
-        return
+            return
+        finally:
+            for key, original in previous.items():
+                if original is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = original
     with rasterio.open(source.uri) as ds:
         yield ds
 
