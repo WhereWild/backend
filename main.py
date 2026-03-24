@@ -160,91 +160,53 @@ def _ensure_catalog_numbers(df: pd.DataFrame) -> pd.DataFrame:
 def _add_gis_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-    if "tileId" not in df.columns:
+    required_columns = {"tileId", "decimalLatitude", "decimalLongitude", "catalogNumber"}
+    missing_columns = required_columns - set(df.columns)
+    if missing_columns:
         raise HTTPException(
             status_code=422,
-            detail="Uploaded file is missing tileId. Populate tileId before GIS enrichment.",
+            detail=(
+                "Uploaded file is missing required columns for GIS enrichment: "
+                f"{', '.join(sorted(missing_columns))}"
+            ),
         )
 
-    result = df.copy()
     layer_ids = enrich_tree._load_layer_ids()
     if not layer_ids:
-        return result
+        return df.copy()
 
-    for layer_id in layer_ids:
-        if layer_id not in result.columns:
-            result[layer_id] = np.nan
+    result = df.copy()
+    result["decimalLatitude"] = pd.to_numeric(result["decimalLatitude"], errors="coerce")
+    result["decimalLongitude"] = pd.to_numeric(result["decimalLongitude"], errors="coerce")
+    result["catalogNumber"] = result["catalogNumber"].astype(str)
+    result["tileId"] = result["tileId"].astype(str)
 
-    derived_layers = {
-        layer_id: enrich_tree.DERIVED_DEM_LAYER_METRICS.get(layer_id)
-        for layer_id in layer_ids
-        if enrich_tree.DERIVED_DEM_LAYER_METRICS.get(layer_id) is not None
-    }
-
-    def _to_float_array(values: Any, expected_len: int) -> np.ndarray:
-        if values is None:
-            return np.full(expected_len, np.nan, dtype="float64")
-        if isinstance(values, np.ndarray):
-            raw_values = values.tolist()
-        elif isinstance(values, (list, tuple)):
-            raw_values = list(values)
-        else:
-            raw_values = [values]
-
-        coerced: list[float] = []
-        for value in raw_values:
-            if value is None:
-                coerced.append(np.nan)
-                continue
-            if isinstance(value, (list, tuple, dict, set, np.ndarray)):
-                coerced.append(np.nan)
-                continue
-            try:
-                coerced.append(float(value))
-            except (TypeError, ValueError):
-                coerced.append(np.nan)
-
-        array = np.asarray(coerced, dtype="float64")
-        if array.shape[0] != expected_len:
-            normalized = np.full(expected_len, np.nan, dtype="float64")
-            copy_len = min(expected_len, array.shape[0])
-            if copy_len > 0:
-                normalized[:copy_len] = array[:copy_len]
-            return normalized
-        return array
-
-    ordered = result.sort_values("tileId", kind="stable")
-    for tile_id, group in ordered.groupby("tileId", dropna=True, sort=False):
-        if not str(tile_id).strip():
-            continue
-        row_indices = group.index.to_numpy()
-        row_count = len(row_indices)
-        lats = group["decimalLatitude"].to_numpy(dtype=float)
-        lons = group["decimalLongitude"].to_numpy(dtype=float)
-
-        if derived_layers:
-            metrics = tuple(sorted(set(derived_layers.values())))
-            derived_values = enrich_tree._sample_dem_derived_values(
-                lats=lats,
-                lons=lons,
-                tile_id=str(tile_id),
-                metrics=metrics,
-            )
-            for layer_id, metric in derived_layers.items():
-                metric_array = _to_float_array(
-                    derived_values.get(metric),
-                    row_count,
-                )
-                result.loc[row_indices, layer_id] = metric_array
-
-        for layer_id in layer_ids:
-            if layer_id in derived_layers:
-                continue
-            values = enrich_tree._sample_layer_values(layer_id, lats, lons, str(tile_id))
-            value_array = _to_float_array(values, row_count)
-            result.loc[row_indices, layer_id] = value_array
-
-    return result
+    work_dir = Path(tempfile.mkdtemp(prefix="wherewild-upload-gis_"))
+    data_path = work_dir / CONFIG.occurrence_parquet_filename
+    try:
+        result.to_parquet(data_path, index=False)
+        work_df = result[["catalogNumber", "tileId", "decimalLatitude", "decimalLongitude"]].copy()
+        work_df = work_df[work_df["tileId"].astype(str).str.strip() != ""]
+        if work_df.empty:
+            return result
+        work_df["missingLayers"] = [list(layer_ids)] * len(work_df)
+        work_df["taxonKey"] = "uploaded"
+        work_df["dataPath"] = str(data_path)
+        worklist = pa.table(
+            {
+                "catalogNumber": pa.array(work_df["catalogNumber"].to_numpy(), type=pa.large_string()),
+                "tileId": pa.array(work_df["tileId"].to_numpy(), type=pa.large_string()),
+                "decimalLatitude": pa.array(work_df["decimalLatitude"].to_numpy(), type=pa.float64()),
+                "decimalLongitude": pa.array(work_df["decimalLongitude"].to_numpy(), type=pa.float64()),
+                "missingLayers": pa.array(work_df["missingLayers"].to_list(), type=pa.list_(pa.large_string())),
+                "taxonKey": pa.array(work_df["taxonKey"].to_numpy(), type=pa.large_string()),
+                "dataPath": pa.array(work_df["dataPath"].to_numpy(), type=pa.large_string()),
+            }
+        )
+        enrich_tree._process_tiles(worklist)
+        return pq.read_table(data_path).to_pandas()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _write_summary_artifacts_from_dataframe(df: pd.DataFrame, directory: Path) -> None:
