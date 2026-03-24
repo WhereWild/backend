@@ -24,81 +24,11 @@ Runtime device env vars:
   Controls parallel raster-layer sampling for heatmaps.
   Keep at `1` unless benchmarked on your deployment.
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
-  Controls sampling chunk size for `GET /api/predict/heatmap/stream`.
+  Controls sampling chunk size for heatmap job streaming.
   This is independent from model scoring batch size.
 - `WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS`: integer `>=1` (default: `2`).
   Controls how many prepared stream chunks can queue ahead.
   Increase for more read-ahead overlap (uses more memory).
-- `WHEREWILD_INFERENCE_PROFILE`: `0` (default) or `1`.
-  When set, `GET /api/predict/heatmap` includes a `profile` object with
-  stage timings (`lookup_ms`, `sample_ms`, `fallback_ms`, `score_ms`, `total_ms`).
-
-### `GET /api/predict`
-
-Predict species suitability for a single coordinate.
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `lat` | float | required | Latitude (-90 to 90). |
-| `lon` | float | required | Longitude (-180 to 180). |
-| `top_k` | int | 20 | Maximum species to return. |
-| `threshold` | float | 0.0 | Minimum sigmoid score to include. |
-
-Returns ranked `{species_key, score, prior}` dicts. Works for any land
-coordinate: pre-computed cells are used when available, otherwise static GIS
-features (bioclim, terrain, landcover) are sampled on the fly from local COG
-tiles.
-
-### `GET /api/predict/batch`
-
-Batch prediction for up to 100 coordinates.
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `coords` | string | required | Comma-separated lat,lon pairs (e.g. `25.0,-100.0,26.5,-99.0`). |
-| `top_k` | int | 20 | Maximum species per coordinate. |
-| `threshold` | float | 0.0 | Minimum sigmoid score. |
-
-Coordinates that fall in the same cell share a single encoder pass.
-
-### `GET /api/predict/heatmap`
-
-Compute a probability grid for one species over a bounding box.
-
-| Parameter | Type | Default | Description |
-| --- | --- | --- | --- |
-| `species_key` | int | required | GBIF species key. |
-| `min_lat` | float | required | Southern edge. |
-| `min_lon` | float | required | Western edge. |
-| `max_lat` | float | required | Northern edge. |
-| `max_lon` | float | required | Eastern edge. |
-| `resolution` | float | model native (0.25) | Output cell size in degrees. |
-| `include_source` | bool | false | Include per-cell feature source (`sampled` or `cell_table`) for debugging. |
-| `feature_mode` | string | `auto` | Feature source strategy: `auto`, `prefer_cell_table`, `cell_table_only`, `sampled_only`. |
-| `max_cells` | int | 20000 | Hard cap on output cells; oversized requests return 400. |
-
-All requested cells in the bbox are scored in vectorized batches.
-`feature_mode=auto` is the endpoint default.
-In `auto`, cell-table features are preferred at native/coarser resolutions;
-for finer-than-native requests, sampled GIS features are preferred with
-cell-table fallback for missing samples. When `include_source=true`, each
-returned cell may include `source` as `sampled` or `cell_table`.
-
-### `GET /api/predict/heatmap/stream`
-
-Stream the same heatmap as NDJSON (`application/x-ndjson`) so clients can
-render progressively without waiting for the full grid.
-
-Uses the same query parameters as `GET /api/predict/heatmap`.
-
-Event lines:
-
-- `{"type":"meta", ...}` once at start (includes `requested_cells`)
-- `{"type":"cell", "lat":..., "lon":..., "score":..., "n_native":...}` per cell
-- `{"type":"done", "n_cells":...}` once at end
-
-This endpoint is preferred for large bboxes because the server does not need to
-build a giant in-memory `cells` list before sending data.
 
 ### Job resource model for stale-call cancellation
 
@@ -108,9 +38,23 @@ For robust client workflows, use cancellable heatmap jobs:
 
 Create a job resource and receive stable URLs to stream and cancel it.
 
-Request body uses the same fields as heatmap requests:
-`species_key`, `min_lat`, `min_lon`, `max_lat`, `max_lon`, optional
-`resolution`, `include_source`, `feature_mode`, `max_cells`.
+Request body fields:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `species_key` | int | required | GBIF species key. |
+| `min_lat` | float | required | Southern edge. |
+| `min_lon` | float | required | Western edge. |
+| `max_lat` | float | required | Northern edge. |
+| `max_lon` | float | required | Eastern edge. |
+| `resolution` | float | model native (0.25) | Output cell size in degrees. |
+| `include_source` | bool | false | Include per-cell feature source (`sampled` or `cell_table`) for debugging. |
+| `feature_mode` | string | `prefer_cell_table` | Feature source strategy: `prefer_cell_table` or `cell_table_only`. |
+| `max_cells` | int | 20000 | Hard cap on output cells; oversized requests return 400. |
+
+In `prefer_cell_table`, native/coarser requests use precomputed cell-table
+features first; finer-than-native requests prefer sampled GIS features when
+available, with cell-table fallback for missing samples.
 
 Response includes:
 
@@ -134,8 +78,3 @@ Only one active stream is allowed per job.
 
 Cancel stale jobs. Running streams will stop quickly and emit a
 `cancelled` terminal event.
-
-### `GET /api/predict/info`
-
-Return metadata about the loaded inference model (species count, cell count,
-list of species keys).

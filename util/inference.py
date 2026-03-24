@@ -1,15 +1,17 @@
-"""Lightweight inference for the Darwin SDM.
+"""Streaming heatmap inference for the Darwin SDM.
 
 Loads an inference bundle (exported by ``scripts/machine_learning/train/export.py``)
-and provides a single ``predict(lat, lon)`` function that returns ranked species
-suitability scores for the given coordinate.
+and provides ``predict_heatmap_stream(...)`` for per-species NDJSON heatmap APIs.
 
 Typical startup flow (called once at import / FastAPI startup)::
 
-    from util.inference import load_bundle, predict
+    from util.inference import load_bundle, predict_heatmap_stream
 
     load_bundle("checkpoints/canary_cactus/inference_bundle.pt")
-    results = predict(lat=25.0, lon=-100.0, top_k=10)
+    stream = predict_heatmap_stream(
+        11498251,
+        (24.0, -106.0, 32.0, -94.0),
+    )
 
 By default, runtime inference prefers CUDA when available and otherwise
 falls back to CPU.
@@ -21,11 +23,10 @@ import math
 import os
 import logging
 import queue
-import time
 from importlib import import_module
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple, cast
 
 import torch
 
@@ -45,6 +46,7 @@ _bundle: dict[str, Any] | None = None
 _encoder: torch.nn.Module | None = None
 _heads: dict[int, torch.nn.Module] = {}
 _cell_table: dict[str, dict[str, torch.Tensor]] = {}
+_cell_table_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
 _cell_size_deg: float = 0.25
 _species_meta: dict[int, dict] = {}
 _feature_names: dict[str, list[str]] | None = None
@@ -121,12 +123,6 @@ def _resolve_sampling_workers() -> int:
     if workers < 1:
         raise ValueError("WHEREWILD_INFERENCE_SAMPLE_WORKERS must be >= 1")
     return workers
-
-
-def _profile_enabled() -> bool:
-    """Return True when request-level heatmap profiling is enabled."""
-    raw = os.environ.get("WHEREWILD_INFERENCE_PROFILE", "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
 
 
 def _resolve_sample_chunk_size(score_batch_size: int) -> int:
@@ -222,6 +218,43 @@ def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None
     )
 
 
+def _stack_feature_batch(
+    features: list[torch.Tensor],
+    *,
+    target_device: torch.device | None = None,
+) -> torch.Tensor:
+    """Materialize a contiguous batch tensor from per-cell model inputs.
+
+    Heatmap chunks can mix precomputed cell-table tensors already resident on
+    CUDA with freshly sampled feature tensors created on CPU. When that happens,
+    reconcile devices only for the mixed batch instead of failing inside
+    ``torch.stack``.
+    """
+    if not features:
+        if target_device is None:
+            return torch.empty((0, _input_dim), dtype=torch.float32)
+        return torch.empty((0, _input_dim), dtype=torch.float32, device=target_device)
+
+    devices = {feature.device for feature in features}
+    if len(devices) > 1:
+        stack_device = target_device or next(iter(devices))
+        features = [feature.to(stack_device) for feature in features]
+    return torch.stack(features)
+
+
+def _payload_model_input(payload: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return a model-ready feature tensor from a payload."""
+    features = payload.get("features")
+    mask = payload.get("mask")
+    if isinstance(features, torch.Tensor):
+        if features.ndim != 1:
+            raise ValueError("payload features must be a 1-d torch.Tensor")
+        if int(features.shape[0]) == _input_dim and features.dtype == torch.float32:
+            return features
+        return _coerce_model_input(features, mask)
+    raise ValueError("payload features must be a torch.Tensor")
+
+
 def _sampled_feature_support_status() -> tuple[bool, str | None]:
     """Return whether sampled GIS features can produce model-aligned inputs."""
     if _feature_names is None:
@@ -262,37 +295,35 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
     return True, None
 
 
-def _ensure_sampled_only_available(config: _HeatmapFeatureConfig) -> None:
-    """Raise a clear error when sampled-only mode cannot run."""
-    sampled_only_mode = config.sample_missing and not config.use_cell_table and not config.fallback_to_cell_table
-    if not sampled_only_mode:
-        return
-    sampled_ok, sampled_reason = _sampled_feature_support_status()
-    if not sampled_ok:
-        raise ValueError(f"sampled_only mode unavailable: {sampled_reason}")
-
-
 class _HeatmapFeatureConfig(NamedTuple):
-    use_cell_table: bool
-    sample_missing: bool
-    fallback_to_cell_table: bool
+    primary_source: str
+    allow_fallback: bool
 
 
 def _resolve_heatmap_feature_mode(
     feature_mode: str, resolution: float, native_resolution: float
 ) -> _HeatmapFeatureConfig:
     """Resolve feature lookup behavior for heatmap scoring."""
-    valid_feature_modes = {"auto", "prefer_cell_table", "cell_table_only", "sampled_only"}
-    if feature_mode not in valid_feature_modes:
-        raise ValueError(f"feature_mode must be one of {sorted(valid_feature_modes)}")
+    normalized = feature_mode.strip().lower()
+    if normalized == "auto":
+        normalized = "prefer_cell_table"
 
-    if feature_mode == "prefer_cell_table":
-        return _HeatmapFeatureConfig(True, True, True)
-    if feature_mode == "cell_table_only":
-        return _HeatmapFeatureConfig(True, False, True)
-    if feature_mode == "sampled_only":
-        return _HeatmapFeatureConfig(False, True, False)
-    return _HeatmapFeatureConfig(resolution >= native_resolution, True, True)
+    valid_feature_modes = {"prefer_cell_table", "cell_table_only"}
+    if normalized not in valid_feature_modes:
+        raise ValueError(
+            "feature_mode must be one of ['cell_table_only', 'prefer_cell_table'] "
+            "('auto' is accepted as a backward-compatible alias for 'prefer_cell_table')"
+        )
+
+    if normalized == "cell_table_only":
+        return _HeatmapFeatureConfig("cell_table", False)
+    if resolution >= native_resolution:
+        return _HeatmapFeatureConfig("cell_table", True)
+
+    sampled_ok, _ = _sampled_feature_support_status()
+    if sampled_ok:
+        return _HeatmapFeatureConfig("sampled", True)
+    return _HeatmapFeatureConfig("cell_table", False)
 
 
 def _build_heatmap_coords(
@@ -346,11 +377,46 @@ def _lazy_import_models() -> None:
     SpeciesHead = getattr(module, "SpeciesHead")
 
 
-def _bin_id(lat: float, lon: float, size_deg: float) -> str:
-    """Map a coordinate to the canonical cell-id key for a grid size."""
+def _bin_index(lat: float, lon: float, size_deg: float) -> tuple[int, int]:
+    """Map a coordinate to integer grid bins for a given cell size."""
     lat_bin = int(math.floor(lat / size_deg))
     lon_bin = int(math.floor(lon / size_deg))
+    return lat_bin, lon_bin
+
+
+def _bin_id(lat: float, lon: float, size_deg: float) -> str:
+    """Map a coordinate to the canonical cell-id key for a grid size."""
+    lat_bin, lon_bin = _bin_index(lat, lon, size_deg)
     return f"cell_{lat_bin}_{lon_bin}"
+
+
+def _cell_lookup_by_bin(lat: float, lon: float, size_deg: float) -> dict[str, torch.Tensor] | None:
+    """Lookup a precomputed cell payload without constructing a string key."""
+    cell = _cell_table_by_bin.get(_bin_index(lat, lon, size_deg))
+    if cell is not None:
+        return cell
+    return _cell_table.get(_bin_id(lat, lon, size_deg))
+
+
+def _parse_cell_id(cell_id: str) -> tuple[int, int] | None:
+    """Parse a canonical cell id like ``cell_<lat_bin>_<lon_bin>``."""
+    if not cell_id.startswith("cell_"):
+        return None
+    try:
+        lat_str, lon_str = cell_id[5:].split("_", 1)
+        return int(lat_str), int(lon_str)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_loaded_cell_payload(payload: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Normalize one loaded cell payload so its feature vector is model-ready."""
+    normalized = dict(payload)
+    normalized["features"] = _payload_model_input(payload).to(dtype=torch.float32).contiguous()
+    mask = payload.get("mask")
+    if isinstance(mask, torch.Tensor):
+        normalized["mask"] = mask.to(dtype=torch.float32).contiguous()
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -387,129 +453,6 @@ def _aspect_bin(deg: float) -> int:
     if a < 292.5:
         return 7
     return 8
-
-
-def _sample_raster_value(layer_id: str, lat: float, lon: float) -> float | None:
-    """Point-sample a GIS raster.  Returns ``None`` for nodata/missing."""
-    try:
-        import rasterio
-    except ImportError:
-        return None
-    from util.gis_lookup import get_cog_path
-
-    cog_path = get_cog_path(layer_id, lat, lon)
-    if cog_path is None or not cog_path.exists():
-        return None
-    with rasterio.open(cog_path) as ds:
-        for arr in ds.sample([(lon, lat)]):
-            val = arr[0]
-            if ds.nodata is not None and val == ds.nodata:
-                return None
-            if isinstance(val, float) and val != val:
-                return None
-            return float(val)
-    return None
-
-
-def _compute_dem_derived_single(lat: float, lon: float) -> dict[str, float]:
-    """Slope / aspect / aspect_deg from a 3x3 DEM window (single point)."""
-    import numpy as np
-
-    try:
-        import rasterio
-        from rasterio.windows import Window
-    except ImportError:
-        return {}
-    from util.gis_lookup import get_cog_path
-
-    dem_path = get_cog_path("elevation", lat, lon)
-    if dem_path is None or not dem_path.exists():
-        return {}
-
-    with rasterio.open(dem_path) as ds:
-        row, col = ds.index(lon, lat)
-        if row - 1 < 0 or col - 1 < 0 or row + 1 >= ds.height or col + 1 >= ds.width:
-            return {}
-        win = ds.read(indexes=1, window=Window(col - 1, row - 1, 3, 3), boundless=False)  # type: ignore[call-arg]
-        if win.shape != (3, 3):
-            return {}
-        nodata = ds.nodata
-        if nodata is not None and np.any(win == nodata):
-            return {}
-        if np.any(np.isnan(win)):
-            return {}
-        pw = abs(float(ds.transform.a))
-        ph = abs(float(ds.transform.e))
-
-    m_lat, m_lon = _meters_per_degree(lat)
-    dx = pw * m_lon
-    dy = ph * m_lat
-    if dx == 0 or dy == 0:
-        return {}
-
-    z1, z2, z3 = win[0, 0], win[0, 1], win[0, 2]
-    z4, _, z6 = win[1, 0], win[1, 1], win[1, 2]
-    z7, z8, z9 = win[2, 0], win[2, 1], win[2, 2]
-
-    dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dx)
-    dzdy = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8.0 * dy)
-
-    slope_deg = float(np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))))
-    if dzdx == 0 and dzdy == 0:
-        asp_deg = 0.0
-    else:
-        asp_deg = float(90.0 - np.degrees(np.arctan2(dzdy, -dzdx)))
-        if asp_deg < 0:
-            asp_deg += 360.0
-
-    return {"slope": slope_deg, "aspect": float(_aspect_bin(asp_deg)), "aspect_deg": asp_deg}
-
-
-def _sample_point_features(lat: float, lon: float) -> dict[str, torch.Tensor] | None:
-    """Build a feature + mask vector for an arbitrary point from GIS rasters.
-
-    Static catalog-backed features are sampled from local COG tiles.
-    Temporal and other features are filled with zeros and marked entirely
-    missing so the model relies only on GIS-backed context.
-    Returns ``None`` when feature names are unavailable or rasterio is
-    not installed.
-    """
-    if _feature_names is None:
-        return None
-    try:
-        import rasterio  # noqa: F401
-    except ImportError:
-        return None
-
-    sampled_group_names = {group_name: _feature_group_names(group_name) for group_name in _SAMPLED_FEATURE_GROUPS}
-    temporal_dim: int = len(_feature_names.get("temporal", []))
-    other_dim: int = len(_feature_names.get("other", []))
-
-    needs_dem = _DEM_DERIVED & set(_sampled_static_feature_names())
-    dem_vals = _compute_dem_derived_single(lat, lon) if needs_dem else {}
-
-    features: list[float] = []
-    mask: list[float] = []
-    for group_name in _SAMPLED_FEATURE_GROUPS:
-        for name in sampled_group_names[group_name]:
-            val = dem_vals.get(name) if name in _DEM_DERIVED else _sample_raster_value(name, lat, lon)
-            if val is None:
-                features.append(0.0)
-                mask.append(1.0)
-            else:
-                features.append(val)
-                mask.append(0.0)
-
-    features.extend([0.0] * temporal_dim)
-    mask.extend([1.0] * temporal_dim)
-    features.extend([0.0] * other_dim)
-    mask.extend([1.0] * other_dim)
-
-    feat_t = torch.tensor(features, dtype=torch.float32)
-    mask_t = torch.tensor(mask, dtype=torch.float32)
-    feat_t[mask_t > 0.5] = 0.0
-    model_input = _coerce_model_input(feat_t, mask_t)
-    return {"features": model_input, "mask": mask_t}
 
 
 def _batch_sample_raster(
@@ -764,7 +707,7 @@ def load_bundle(path: str | Path) -> None:
     Safe to call multiple times (reloads the bundle).  Should be called
     once during application startup.
     """
-    global _bundle, _encoder, _heads, _cell_table, _cell_size_deg, _species_meta  # noqa: PLW0603
+    global _bundle, _encoder, _heads, _cell_table, _cell_table_by_bin, _cell_size_deg, _species_meta  # noqa: PLW0603
     global _feature_names, _input_dim, _model_uses_mask, _device  # noqa: PLW0603
 
     _lazy_import_models()
@@ -811,43 +754,26 @@ def load_bundle(path: str | Path) -> None:
 
     raw_dim = _raw_feature_dim_from_names()
     _model_uses_mask = raw_dim is not None and input_dim == raw_dim * 2
-    if _model_uses_mask:
-        normalized_table: dict[str, dict[str, torch.Tensor]] = {}
-        for cid, payload in _cell_table.items():
-            cell_features = payload.get("features")
-            cell_mask = payload.get("mask")
-            if (
-                isinstance(cell_features, torch.Tensor)
-                and isinstance(cell_mask, torch.Tensor)
-                and cell_features.ndim == 1
-                and int(cell_features.shape[0]) == raw_dim
-            ):
-                normalized_table[cid] = {
-                    **payload,
-                    "features": torch.cat([cell_features, cell_mask], dim=0),
-                }
-            else:
-                normalized_table[cid] = payload
-        _cell_table = normalized_table
-
-    # Validate every cell in the table can be coerced to _input_dim.
+    normalized_table: dict[str, dict[str, torch.Tensor]] = {}
+    normalized_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     bad_cells: list[str] = []
     for cid, payload in _cell_table.items():
-        cell_feat = payload.get("features")
-        if not isinstance(cell_feat, torch.Tensor) or cell_feat.ndim != 1:
+        try:
+            normalized_payload = _normalize_loaded_cell_payload(payload)
+        except ValueError:
             bad_cells.append(cid)
             continue
-        width = int(cell_feat.shape[0])
-        if width != _input_dim:
-            cell_mask = payload.get("mask")
-            mask_width = int(cell_mask.shape[0]) if isinstance(cell_mask, torch.Tensor) and cell_mask.ndim == 1 else 0
-            if width + mask_width != _input_dim:
-                bad_cells.append(cid)
+        normalized_table[cid] = normalized_payload
+        cell_key = _parse_cell_id(cid)
+        if cell_key is not None:
+            normalized_by_bin[cell_key] = normalized_payload
     if bad_cells:
         raise ValueError(
             f"{len(bad_cells):,} cell(s) in bundle have incompatible feature width "
             f"(expected {_input_dim}); first bad cell: {bad_cells[0]}"
         )
+    _cell_table = normalized_table
+    _cell_table_by_bin = normalized_by_bin
 
 
 def is_loaded() -> bool:
@@ -870,296 +796,13 @@ def cell_count() -> int:
     return len(_cell_table)
 
 
-def _sigmoid(logit: float) -> float:
-    """Numerically stable scalar sigmoid."""
-    if logit >= 0:
-        z = math.exp(-logit)
-        return 1.0 / (1.0 + z)
-    z = math.exp(logit)
-    return z / (1.0 + z)
-
-
-def _score_heads(
-    embedding: torch.Tensor,
-    heads_to_run: dict[int, torch.nn.Module],
-    score_threshold: float,
-) -> list[dict[str, Any]]:
-    """Score an embedding against species heads and return sorted predictions."""
-    results: list[dict[str, Any]] = []
-    for sp_key, head in heads_to_run.items():
-        logit = float(head(embedding).item())
-        score = _sigmoid(logit)
-        if score >= score_threshold:
-            meta = _species_meta.get(sp_key, {})
-            results.append({
-                "species_key": sp_key,
-                "score": round(score, 6),
-                "prior": meta.get("prior_pi"),
-            })
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results
-
-
-def predict(
-    lat: float,
-    lon: float,
-    *,
-    top_k: int = 0,
-    species_filter: list[int] | None = None,
-    score_threshold: float = 0.0,
-) -> list[dict[str, Any]]:
-    """Run inference for a single (lat, lon) coordinate.
-
-    Args:
-        lat: Latitude in degrees.
-        lon: Longitude in degrees.
-        top_k: If >0, return only the top-k species by score.
-        species_filter: If provided, only score these species keys.
-        score_threshold: Minimum sigmoid score to include in results.
-
-    Returns:
-        Sorted list of dicts ``{species_key, score, prior}`` with the
-        highest-scoring species first.  Returns an empty list when the
-        coordinate falls outside all known cells and GIS rasters are
-        unavailable.
-    """
-    if _encoder is None:
-        raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
-
-    cell_id = _bin_id(lat, lon, _cell_size_deg)
-    cell = _cell_table.get(cell_id)
-    if cell is None:
-        cell = _sample_point_features(lat, lon)
-    if cell is None:
-        return []
-
-    features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0).to(_device)
-
-    with torch.no_grad():
-        embedding = _encoder(features)  # (1, embed_dim)
-
-        heads_to_run = _heads
-        if species_filter is not None:
-            filter_set = set(species_filter)
-            heads_to_run = {k: v for k, v in _heads.items() if k in filter_set}
-
-        results = _score_heads(
-            embedding,
-            heads_to_run,
-            score_threshold,
-        )
-
-    if top_k > 0:
-        results = results[:top_k]
-    return results
-
-
-def predict_heatmap(
-    species_key: int,
-    bbox: tuple[float, float, float, float],
-    *,
-    resolution: float | None = None,
-    include_source: bool = False,
-    feature_mode: str = "auto",
-    max_cells: int | None = HEATMAP_DEFAULT_MAX_CELLS,
-    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
-) -> dict[str, Any]:
-    """Compute a probability grid for a single species over a bounding box.
-
-    All requested grid cells within the bounding box are scored in a single
-    vectorized forward pass. Output points are scored independently at their
-    grid-cell centers for the requested *resolution*.
-
-    Args:
-        species_key: GBIF species key (must be in the loaded bundle).
-        bbox: ``(min_lat, min_lon, max_lat, max_lon)`` in degrees.
-        resolution: Output grid cell size in degrees. Defaults to the
-            model's native cell size (0.25 deg).
-        include_source: Include per-cell feature source (`sampled` or
-            `cell_table`) for debugging map blockiness.
-        feature_mode: Feature lookup strategy for each heatmap point.
-                - ``prefer_cell_table`` (default): use precomputed native cell
-                    features when available; sample GIS only for missing cells.
-                - ``auto``: use cell table only when resolution >= native, else
-                    prefer sampled GIS features.
-                - ``cell_table_only``: use only precomputed native cell features.
-                - ``sampled_only``: use only sampled GIS features.
-        max_cells: Optional hard cap on requested output cells. Requests above
-                this limit raise ``ValueError`` to avoid OOM.
-        score_batch_size: Chunk size for model forward passes during scoring.
-
-    Returns:
-        A dict with:
-        - ``species_key``: echoed input.
-        - ``bbox``: echoed ``(min_lat, min_lon, max_lat, max_lon)``.
-        - ``resolution``: output cell size actually used.
-        - ``native_resolution``: the model's intrinsic cell size.
-        - ``n_cells``: number of output cells with data.
-        - ``cells``: list of ``{lat, lon, score, n_native}`` dicts.
-                    ``lat``/``lon`` are output-cell centers, ``score`` is the predicted
-                    probability at each center, and ``n_native`` is always ``1``.
-    """
-    if _encoder is None:
-        raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
-    if species_key not in _heads:
-        raise KeyError(f"Species {species_key} not in loaded bundle.")
-
-    native = _cell_size_deg
-    res = resolution if resolution is not None else native
-    if res <= 0:
-        raise ValueError("resolution must be > 0")
-    min_lat, min_lon, max_lat, max_lon = bbox
-
-    if min_lat >= max_lat:
-        raise ValueError("min_lat must be less than max_lat")
-    if min_lon >= max_lon:
-        raise ValueError("min_lon must be less than max_lon")
-    if score_batch_size <= 0:
-        raise ValueError("score_batch_size must be > 0")
-
-    profiling = _profile_enabled()
-    profile_t0 = time.perf_counter() if profiling else 0.0
-    lookup_ms = 0.0
-    sampled_ms = 0.0
-    fallback_ms = 0.0
-    scoring_ms = 0.0
-
-    coords, _requested_cells = _build_heatmap_coords(bbox, res, max_cells)
-
-    empty_result: dict[str, Any] = {
-        "species_key": species_key,
-        "bbox": list(bbox),
-        "resolution": res,
-        "native_resolution": native,
-        "n_cells": 0,
-        "cells": [],
-    }
-    if not coords:
-        return empty_result
-
-    feature_config = _resolve_heatmap_feature_mode(
-        feature_mode,
-        res,
-        native,
-    )
-    _ensure_sampled_only_available(feature_config)
-    use_cell_table, sample_missing, fallback_to_cell_table = feature_config
-
-    # Reuse precomputed native-cell features when resolution is native/coarser;
-    # batch sample GIS features for uncovered coordinates.
-    features_per_coord: list[torch.Tensor | None] = [None] * len(coords)
-    feature_source_per_coord: list[str | None] = [None] * len(coords)
-    missing_indices: list[int] = []
-    missing_coords: list[tuple[float, float]] = []
-
-    for i, (lat, lon) in enumerate(coords):
-        if use_cell_table:
-            cell = _cell_table.get(_bin_id(lat, lon, native))
-            if cell is not None:
-                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                feature_source_per_coord[i] = "cell_table"
-                continue
-        missing_indices.append(i)
-        missing_coords.append((lat, lon))
-    if profiling:
-        lookup_ms = (time.perf_counter() - profile_t0) * 1000.0
-
-    if sample_missing and missing_coords:
-        sampled_t0 = time.perf_counter() if profiling else 0.0
-        sampled = _batch_sample_features(missing_coords)
-        for i, cell in zip(missing_indices, sampled):
-            if cell is not None:
-                features_per_coord[i] = cell["features"]
-                feature_source_per_coord[i] = "sampled"
-        if profiling:
-            sampled_ms = (time.perf_counter() - sampled_t0) * 1000.0
-
-    # Fallback: if GIS sampling is unavailable for a point, use the native
-    # precomputed cell feature (if present) so sub-native requests still
-    # produce output instead of dropping the cell entirely.
-    if fallback_to_cell_table:
-        fallback_t0 = time.perf_counter() if profiling else 0.0
-        for i, feat in enumerate(features_per_coord):
-            if feat is not None:
-                continue
-            lat, lon = coords[i]
-            cell = _cell_table.get(_bin_id(lat, lon, native))
-            if cell is not None:
-                features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                feature_source_per_coord[i] = "cell_table"
-        if profiling:
-            fallback_ms = (time.perf_counter() - fallback_t0) * 1000.0
-
-    valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
-    if not valid_indices:
-        return empty_result
-
-    valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
-    if not valid_features:
-        return empty_result
-
-    head = _heads[species_key]
-
-    scores_list: list[float] = []
-    scoring_t0 = time.perf_counter() if profiling else 0.0
-    with torch.no_grad():
-        for start in range(0, len(valid_features), score_batch_size):
-            batch_slice = [feat.to(_device) for feat in valid_features[start : start + score_batch_size]]
-            batch_features = torch.stack(batch_slice)
-            embeddings = _encoder(batch_features)
-            logits = head(embeddings)
-            scores_list.extend(torch.sigmoid(logits).cpu().tolist())
-    if profiling:
-        scoring_ms = (time.perf_counter() - scoring_t0) * 1000.0
-
-    cells_out: list[dict[str, Any]] = []
-    for idx, score in zip(valid_indices, scores_list):
-        lat, lon = coords[idx]
-        cell_entry: dict[str, Any] = {
-            "lat": round(lat, 4),
-            "lon": round(lon, 4),
-            "score": round(score, 6),
-            "n_native": 1,
-        }
-        if include_source:
-            cell_entry["source"] = feature_source_per_coord[idx] or "unknown"
-        cells_out.append(cell_entry)
-
-    cells_out.sort(key=lambda c: (c["lat"], c["lon"]))
-
-    result: dict[str, Any] = {
-        "species_key": species_key,
-        "bbox": list(bbox),
-        "resolution": res,
-        "native_resolution": native,
-        "n_cells": len(cells_out),
-        "cells": cells_out,
-    }
-    if profiling:
-        source_counts: dict[str, int] = {"sampled": 0, "cell_table": 0, "unknown": 0}
-        for src in feature_source_per_coord:
-            key = src or "unknown"
-            source_counts[key] += 1
-        result["profile"] = {
-            "lookup_ms": round(lookup_ms, 3),
-            "sample_ms": round(sampled_ms, 3),
-            "fallback_ms": round(fallback_ms, 3),
-            "score_ms": round(scoring_ms, 3),
-            "total_ms": round((time.perf_counter() - profile_t0) * 1000.0, 3),
-            "n_requested": len(coords),
-            "n_valid": len(valid_indices),
-            "source_counts": source_counts,
-        }
-    return result
-
-
 def predict_heatmap_stream(
     species_key: int,
     bbox: tuple[float, float, float, float],
     *,
     resolution: float | None = None,
     include_source: bool = False,
-    feature_mode: str = "auto",
+    feature_mode: str = "prefer_cell_table",
     max_cells: int | None = HEATMAP_DEFAULT_MAX_CELLS,
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
     cancel_check: Callable[[], bool] | None = None,
@@ -1194,8 +837,7 @@ def predict_heatmap_stream(
         res,
         native,
     )
-    _ensure_sampled_only_available(feature_config)
-    use_cell_table, sample_missing, fallback_to_cell_table = feature_config
+    primary_source, allow_fallback = feature_config
 
     head = _heads[species_key]
     sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
@@ -1205,47 +847,69 @@ def predict_heatmap_stream(
 
     def _prepare_stream_chunk(
         chunk_coords: list[tuple[float, float]],
-    ) -> tuple[list[tuple[float, float]], list[int], list[torch.Tensor], list[str | None]]:
+    ) -> tuple[list[tuple[float, float]], list[int], torch.Tensor | None, list[str | None] | None]:
         """Resolve features for one stream chunk before model scoring."""
         features_per_coord: list[torch.Tensor | None] = [None] * len(chunk_coords)
-        feature_source_per_coord: list[str | None] = [None] * len(chunk_coords)
+        feature_source_per_coord: list[str | None] | None = (
+            cast(list[str | None], [None] * len(chunk_coords)) if include_source else None
+        )
         missing_indices: list[int] = []
         missing_coords: list[tuple[float, float]] = []
 
-        for i, (lat, lon) in enumerate(chunk_coords):
-            if use_cell_table:
-                cell = _cell_table.get(_bin_id(lat, lon, native))
+        if primary_source == "cell_table":
+            for i, (lat, lon) in enumerate(chunk_coords):
+                cell = _cell_lookup_by_bin(lat, lon, native)
                 if cell is not None:
-                    features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                    feature_source_per_coord[i] = "cell_table"
+                    features_per_coord[i] = cell["features"]
+                    if feature_source_per_coord is not None:
+                        feature_source_per_coord[i] = "cell_table"
                     continue
-            missing_indices.append(i)
-            missing_coords.append((lat, lon))
+                missing_indices.append(i)
+                missing_coords.append((lat, lon))
 
-        if sample_missing and missing_coords:
+            if allow_fallback and missing_coords:
+                sampled = _batch_sample_features(
+                    missing_coords,
+                    raster_dataset_cache=raster_dataset_cache,
+                    dem_dataset_cache=dem_dataset_cache,
+                )
+                for i, cell in zip(missing_indices, sampled):
+                    if cell is not None:
+                        features_per_coord[i] = cell["features"]
+                        if feature_source_per_coord is not None:
+                            feature_source_per_coord[i] = "sampled"
+        else:
             sampled = _batch_sample_features(
-                missing_coords,
+                chunk_coords,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
             )
-            for i, cell in zip(missing_indices, sampled):
+            for i, cell in enumerate(sampled):
                 if cell is not None:
                     features_per_coord[i] = cell["features"]
-                    feature_source_per_coord[i] = "sampled"
-
-        if fallback_to_cell_table:
-            for i, feat in enumerate(features_per_coord):
-                if feat is not None:
+                    if feature_source_per_coord is not None:
+                        feature_source_per_coord[i] = "sampled"
                     continue
-                lat, lon = chunk_coords[i]
-                cell = _cell_table.get(_bin_id(lat, lon, native))
-                if cell is not None:
-                    features_per_coord[i] = _coerce_model_input(cell["features"], cell.get("mask"))
-                    feature_source_per_coord[i] = "cell_table"
+                missing_indices.append(i)
+                missing_coords.append(chunk_coords[i])
 
-        valid_indices = [i for i, feat in enumerate(features_per_coord) if feat is not None]
-        valid_features: list[torch.Tensor] = [features_per_coord[i] for i in valid_indices]  # type: ignore[assignment]
-        return chunk_coords, valid_indices, valid_features, feature_source_per_coord
+            if allow_fallback and missing_coords:
+                for i, (lat, lon) in zip(missing_indices, missing_coords, strict=True):
+                    cell = _cell_lookup_by_bin(lat, lon, native)
+                    if cell is not None:
+                        features_per_coord[i] = cell["features"]
+                        if feature_source_per_coord is not None:
+                            feature_source_per_coord[i] = "cell_table"
+
+        valid_indices: list[int] = []
+        valid_features: list[torch.Tensor] = []
+        for i, feat in enumerate(features_per_coord):
+            if feat is None:
+                continue
+            valid_indices.append(i)
+            valid_features.append(feat)
+        stacked_features = _stack_feature_batch(valid_features, target_device=_device) if valid_features else None
+        return chunk_coords, valid_indices, stacked_features, feature_source_per_coord
 
     def _iter_cells() -> Iterator[dict[str, Any]]:
         """Yield scored cells chunk-by-chunk to keep streaming memory-bounded."""
@@ -1254,7 +918,9 @@ def predict_heatmap_stream(
                 # Producer/consumer queue allows multiple prepared chunks to
                 # stay ahead so raster reads overlap scoring and streaming.
                 chunk_queue: queue.Queue[
-                    tuple[list[tuple[float, float]], list[int], list[torch.Tensor], list[str | None]] | Exception | None
+                    tuple[list[tuple[float, float]], list[int], torch.Tensor | None, list[str | None] | None]
+                    | Exception
+                    | None
                 ] = queue.Queue(maxsize=prefetch_chunks)
                 stop_event = Event()
 
@@ -1298,16 +964,15 @@ def predict_heatmap_stream(
                         if isinstance(item, Exception):
                             raise item
 
-                        chunk_coords, valid_indices, valid_features, feature_source_per_coord = item
-                        if not valid_features:
+                        chunk_coords, valid_indices, valid_feature_tensor, feature_source_per_coord = item
+                        if valid_feature_tensor is None or valid_feature_tensor.numel() == 0:
                             continue
 
                         scores_list: list[float] = []
-                        for start in range(0, len(valid_features), score_batch_size):
-                            batch_slice = [
-                                feat.to(_device) for feat in valid_features[start : start + score_batch_size]
-                            ]
-                            batch_features = torch.stack(batch_slice)
+                        for start in range(0, int(valid_feature_tensor.shape[0]), score_batch_size):
+                            batch_features = valid_feature_tensor[start : start + score_batch_size]
+                            if batch_features.device != _device:
+                                batch_features = batch_features.to(_device)
                             embeddings = encoder(batch_features)
                             logits = head(embeddings)
                             scores_list.extend(torch.sigmoid(logits).cpu().tolist())
@@ -1323,7 +988,7 @@ def predict_heatmap_stream(
                                 "score": round(score, 6),
                                 "n_native": 1,
                             }
-                            if include_source:
+                            if include_source and feature_source_per_coord is not None:
                                 cell_entry["source"] = feature_source_per_coord[idx] or "unknown"
                             yield cell_entry
                 finally:
@@ -1353,58 +1018,3 @@ def predict_heatmap_stream(
         "requested_cells": requested_cells,
         "cells": _iter_cells(),
     }
-
-
-def predict_batch(
-    coordinates: list[tuple[float, float]],
-    *,
-    top_k: int = 0,
-    species_filter: list[int] | None = None,
-    score_threshold: float = 0.0,
-) -> list[list[dict[str, Any]]]:
-    """Run inference for multiple coordinates.
-
-    Batches coordinates that fall in the same cell for efficiency.
-    Returns one result list per input coordinate (same ordering).
-    """
-    if _encoder is None:
-        raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
-
-    # Group by cell to avoid redundant encoder passes.
-    cell_to_indices: dict[str, list[int]] = {}
-    for idx, (lat, lon) in enumerate(coordinates):
-        cid = _bin_id(lat, lon, _cell_size_deg)
-        cell_to_indices.setdefault(cid, []).append(idx)
-
-    output: list[list[dict[str, Any]]] = [[] for _ in coordinates]
-
-    heads_to_run = _heads
-    if species_filter is not None:
-        filter_set = set(species_filter)
-        heads_to_run = {k: v for k, v in _heads.items() if k in filter_set}
-
-    with torch.no_grad():
-        for cid, indices in cell_to_indices.items():
-            cell = _cell_table.get(cid)
-            if cell is None:
-                # Try on-the-fly sampling from the first coordinate in this cell.
-                ref_lat, ref_lon = coordinates[indices[0]]
-                cell = _sample_point_features(ref_lat, ref_lon)
-            if cell is None:
-                continue
-
-            features = _coerce_model_input(cell["features"], cell.get("mask")).unsqueeze(0).to(_device)
-            embedding = _encoder(features)
-
-            results = _score_heads(
-                embedding,
-                heads_to_run,
-                score_threshold,
-            )
-            if top_k > 0:
-                results = results[:top_k]
-
-            for idx in indices:
-                output[idx] = results
-
-    return output

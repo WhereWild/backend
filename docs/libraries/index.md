@@ -9,7 +9,7 @@ Start with:
 - `util.summary_stats`: summary stats, categorical distributions, and index-backed slice queries.
 - `util.indexing`: occurrence index builders plus relative ranking/KDE helpers.
 - `util.taxa_navigation`: taxonomy traversal and occurrence parquet filters.
-- `util.inference`: lightweight CPU inference engine for the Darwin SDM. Loads
-  an inference bundle and exposes `predict()`, `predict_batch()`, and
-  `predict_heatmap()`. Supports on-the-fly GIS raster sampling for arbitrary
-  coordinates not present in the pre-computed cell table.
+- `util.inference`: streaming heatmap inference engine for the Darwin SDM.
+  Loads an inference bundle and exposes `predict_heatmap_stream()`. Supports
+  on-the-fly GIS raster sampling for arbitrary heatmap coordinates not present
+  in the pre-computed cell table.
