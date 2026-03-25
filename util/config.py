@@ -68,7 +68,7 @@ class GlobalConfig:
 
     # Pipeline tuning
     root_taxon_id: str = field(
-        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "1")
+        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "6")
     )
     process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False

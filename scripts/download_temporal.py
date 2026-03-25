@@ -51,8 +51,8 @@ def _iter_variables(selected_vars: Iterable[str] | None, selected_models: Iterab
 
 
 def _list_remote_files(model: str, variable: str, start_year: int | None, end_year: int | None) -> List[FileEntry]:
-    # Derived variable has no source files
-    if variable == "weather_code_simple":
+    # Derived variables have no source files
+    if variable in ("weather_code_simple", "vapor_pressure_deficit"):
         return []
     base = f"s3://openmeteo/data/{model}/{variable}"
     fs = fsspec.filesystem("s3", anon=True)
