@@ -508,3 +508,66 @@ def render_aggregate_tile_bytes(variable_id: str, window: str, z: int, x: int, y
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# Maps temporal window hours to forecast offset used for live prediction.
+# Windows beyond the longest available forecast (168 h) use the 168 h frame.
+_TEMPORAL_WINDOW_TO_FORECAST_HOURS: dict[int, int] = {
+    1: 1,
+    8: 8,
+    24: 24,
+    72: 72,
+    168: 168,
+    720: 168,   # best available proxy for 30-day window
+    2160: 168,  # best available proxy for 90-day window
+}
+
+
+def sample_grid_for_tile(
+    variable_id: str,
+    forecast_hours: int,
+    spec: "TileSpec",
+) -> np.ndarray:
+    """Return a (tile_size, tile_size) float32 array of weather values for a tile.
+
+    Reprojects the cached global weather grid for *variable_id* at *forecast_hours*
+    into the tile's Web Mercator bounding box. Returns an all-NaN array when the
+    cache is not populated or the variable is unknown.
+    """
+    actual_hours = _TEMPORAL_WINDOW_TO_FORECAST_HOURS.get(forecast_hours, 168)
+    with _cache_lock:
+        source = _forecast_cache.get(actual_hours, {}) if actual_hours else _cache
+        arr = source.get(variable_id)
+
+    if arr is None:
+        return np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+
+    cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
+    if cfg is None:
+        return np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+
+    model_cfg = MODEL_CONFIGS[cfg["model"]]
+    ny, nx = arr.shape
+    src = np.flipud(arr) if model_cfg["flipud"] else arr
+    src_transform = rasterio_from_bounds(
+        model_cfg["lon_min"], model_cfg["lat_min"],
+        model_cfg["lon_max"], model_cfg["lat_max"],
+        nx, ny,
+    )
+
+    minx, miny, maxx, maxy = tile_bounds_mercator(spec)
+    dst_transform = rasterio_from_bounds(minx, miny, maxx, maxy, spec.tile_size, spec.tile_size)
+
+    dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    reproject(
+        source=src,
+        destination=dest,
+        src_transform=src_transform,
+        src_crs=CRS.from_epsg(4326),
+        src_nodata=np.nan,
+        dst_transform=dst_transform,
+        dst_crs=CRS.from_string(WEB_MERCATOR),
+        dst_nodata=np.nan,
+        resampling=RasterioResampling.bilinear,
+    )
+    return dest

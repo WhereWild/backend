@@ -291,6 +291,14 @@ async def species_heatmap_tile(
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
+    forecast_hours: int = Query(
+        0,
+        ge=0,
+        description=(
+            "Weather forecast offset in hours for temporal model features. "
+            "0 = current snapshot; supported offsets: 0, 1, 8, 24, 72, 168."
+        ),
+    ),
 ) -> Response:
     if await request.is_disconnected():
         return Response(status_code=204)
@@ -322,6 +330,7 @@ async def species_heatmap_tile(
                 model_id=model_id,
                 tile_size=parent_tile_size,
                 reproject=reproject,
+                forecast_hours=forecast_hours,
             )
             if await request.is_disconnected():
                 return Response(status_code=204)
@@ -353,6 +362,7 @@ async def species_heatmap_tile(
                 model_id=model_id,
                 tile_size=tile_size,
                 reproject=reproject,
+                forecast_hours=forecast_hours,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

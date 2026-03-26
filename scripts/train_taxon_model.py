@@ -130,6 +130,25 @@ def _parquet_storage():
     )
 
 
+def _temporal_feature_names() -> list[str]:
+    """Return all temporal column names derivable from config (e.g. temperature_2m_avg_1h)."""
+    cols: list[str] = []
+    for var, windows in CONFIG.temporal_window_hours_by_variable.items():
+        agg = CONFIG.temporal_agg_by_variable.get(var, "avg")
+        for w in windows:
+            cols.append(f"{var}_{agg}_{w}h")
+    # vapor_pressure_deficit is derived but uses avg over the same windows as temperature_2m
+    vpd_windows = CONFIG.temporal_window_hours_by_variable.get(
+        "vapor_pressure_deficit",
+        CONFIG.temporal_window_hours_by_variable.get("temperature_2m", CONFIG.temporal_window_hours_default),
+    )
+    for w in vpd_windows:
+        col = f"vapor_pressure_deficit_avg_{w}h"
+        if col not in cols:
+            cols.append(col)
+    return cols
+
+
 def _load_non_temporal_feature_spec() -> FeatureSpec:
     with _parquet_storage().open_input_file(CONFIG.gis_catalog_path) as handle:
         catalog = json.loads(handle.read())
@@ -176,8 +195,13 @@ def _taxon_occurrence_path(taxon_id: str) -> Path:
 def _read_positive_features_and_coords(
     parquet_path: Path,
     feature_spec: FeatureSpec,
+    *,
+    extra_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    required_columns = list(dict.fromkeys(feature_spec.all_columns + ["decimalLatitude", "decimalLongitude"]))
+    all_wanted = list(feature_spec.all_columns)
+    if extra_columns:
+        all_wanted = list(dict.fromkeys(all_wanted + extra_columns))
+    required_columns = list(dict.fromkeys(all_wanted + ["decimalLatitude", "decimalLongitude"]))
     parquet_file = _parquet_storage().parquet_file(parquet_path)
     available = [col for col in required_columns if col in parquet_file.schema.names]
     if "decimalLatitude" not in available or "decimalLongitude" not in available:
@@ -186,13 +210,13 @@ def _read_positive_features_and_coords(
     table = parquet_file.read(columns=available)
     frame = table.to_pandas()
 
-    for col in feature_spec.all_columns:
+    for col in all_wanted:
         if col not in frame.columns:
             frame[col] = np.nan
 
     lats = pd.to_numeric(frame["decimalLatitude"], errors="coerce").to_numpy(dtype=np.float64)
     lons = pd.to_numeric(frame["decimalLongitude"], errors="coerce").to_numpy(dtype=np.float64)
-    features = frame[feature_spec.all_columns].copy()
+    features = frame[all_wanted].copy()
 
     valid_mask = np.isfinite(lats) & np.isfinite(lons)
     features = features.loc[valid_mask].reset_index(drop=True)
@@ -203,6 +227,65 @@ def _read_positive_features_and_coords(
         raise RuntimeError("No positive rows had valid coordinates.")
 
     return features, lats, lons
+
+
+def _read_phenology_split(
+    parquet_path: Path,
+    feature_spec: FeatureSpec,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split occurrence parquet into reproductively-active (positive) and unannotated (negative).
+
+    Positive = rcs column contains a known reproductive-activity value (flowers, buds, fruits).
+    Negative = rcs is empty/null (unannotated occurrence).
+    Rows with explicitly negative annotations (e.g. "no flowers or fruits") are excluded.
+    """
+    rcs_column = CONFIG.ml_phenology_rcs_column
+    positive_values = set(CONFIG.ml_phenology_rcs_positive_values)
+
+    temporal_cols = _temporal_feature_names()
+    all_wanted = list(dict.fromkeys(
+        feature_spec.all_columns + temporal_cols + [rcs_column, "decimalLatitude", "decimalLongitude"]
+    ))
+    parquet_file = _parquet_storage().parquet_file(parquet_path)
+    available = [col for col in all_wanted if col in parquet_file.schema.names]
+    if "decimalLatitude" not in available or "decimalLongitude" not in available:
+        raise RuntimeError("Occurrence parquet missing decimalLatitude/decimalLongitude.")
+
+    table = parquet_file.read(columns=available)
+    frame = table.to_pandas()
+
+    # Fill missing feature columns with NaN
+    for col in feature_spec.all_columns + temporal_cols:
+        if col not in frame.columns:
+            frame[col] = np.nan
+
+    lats = pd.to_numeric(frame["decimalLatitude"], errors="coerce")
+    lons = pd.to_numeric(frame["decimalLongitude"], errors="coerce")
+    valid_coords = np.isfinite(lats.to_numpy()) & np.isfinite(lons.to_numpy())
+    frame = frame.loc[valid_coords].reset_index(drop=True)
+
+    feature_cols = list(dict.fromkeys(feature_spec.all_columns + temporal_cols))
+
+    if rcs_column in frame.columns:
+        rcs_str = frame[rcs_column].astype(str).str.strip()
+        has_positive = rcs_str.isin(positive_values)
+        # Negatives: empty/null only — exclude explicitly negative annotations
+        is_negative = frame[rcs_column].isna() | (rcs_str == "") | (rcs_str.str.lower() == "none")
+    else:
+        has_positive = pd.Series(False, index=frame.index)
+        is_negative = pd.Series(True, index=frame.index)
+
+    positives = frame.loc[has_positive, feature_cols].reset_index(drop=True)
+    negatives = frame.loc[is_negative, feature_cols].reset_index(drop=True)
+
+    # Ensure all feature columns exist
+    for col in feature_cols:
+        if col not in positives.columns:
+            positives[col] = np.nan
+        if col not in negatives.columns:
+            negatives[col] = np.nan
+
+    return positives[feature_cols], negatives[feature_cols]
 
 
 def _compute_positive_bbox(lats: np.ndarray, lons: np.ndarray) -> BoundingBox:
@@ -1102,39 +1185,16 @@ def _taxon_seed(taxon_id: str) -> int:
     return int(CONFIG.ml_random_seed) + (suffix % 10_000_000)
 
 
-def main() -> None:
-    _configure_storage_modes()
-
-    taxon_id = str(CONFIG.ml_train_taxon_id)
-    feature_spec = _load_non_temporal_feature_spec()
-    rng = np.random.default_rng(_taxon_seed(taxon_id))
-
-    positive_path = _taxon_occurrence_path(taxon_id)
-    print(f"[train] taxon={taxon_id} positives source: {positive_path}")
-    print(
-        f"[train] parquet_storage={CONFIG.ml_parquet_storage_mode} "
-        f"raster_storage={CONFIG.ml_raster_storage_mode}"
-    )
-
-    positives, positive_lats, positive_lons = _read_positive_features_and_coords(
-        positive_path,
-        feature_spec,
-    )
-    positive_bbox = _compute_positive_bbox(positive_lats, positive_lons)
-    target_negative_rows = len(positives) * int(CONFIG.ml_negative_ratio)
-    print(
-        f"[train] positives={len(positives)} target_negatives={target_negative_rows} "
-        f"ratio={CONFIG.ml_negative_ratio}:1"
-    )
-
-    negatives, negative_info = _sample_negative_features(
-        target_negative_rows,
-        feature_spec,
-        positive_bbox,
-        rng,
-    )
-    print(f"[train] negatives collected={len(negatives)}")
-
+def _run_training(
+    taxon_id: str,
+    positives: pd.DataFrame,
+    negatives: pd.DataFrame,
+    feature_spec: FeatureSpec,
+    negative_info: dict[str, Any],
+    *,
+    mode: str,
+) -> None:
+    """Shared training logic used by both standard and phenology modes."""
     X = pd.concat([positives, negatives], ignore_index=True)
     y = np.concatenate(
         [
@@ -1170,67 +1230,32 @@ def main() -> None:
     train_metrics = _compute_metrics(y_train, train_prob)
     test_metrics = _compute_metrics(y_test, test_prob)
     all_positive_prob = _score_frame(positives[pruned_spec.all_columns], preprocessor, model)
-    eval_background_info: dict[str, Any] | None = None
-    eval_background_prob: np.ndarray | None = None
-    if bool(CONFIG.ml_enable_background_eval):
-        background_eval_target = max(4096, min(len(positives) * 2, 25_000))
-        eval_rng = np.random.default_rng(_taxon_seed(f"{taxon_id}_eval_background"))
-        eval_background_frame, eval_background_info = _sample_negative_features(
-            background_eval_target,
-            pruned_spec,
-            positive_bbox,
-            eval_rng,
-        )
-        eval_background_prob = _score_frame(
-            eval_background_frame[pruned_spec.all_columns],
-            preprocessor,
-            model,
-        )
-    else:
-        print("[train] background eval disabled; skipping broad background diagnostics")
 
     metrics = {
         "train": train_metrics,
         "test": test_metrics,
         "all_known_positive_scores": _quantile_summary(all_positive_prob),
-    }
-    if eval_background_prob is not None:
-        metrics["broad_background_scores"] = _quantile_summary(eval_background_prob)
-        metrics["threshold_diagnostics"] = _threshold_metrics(
-            positive_scores=all_positive_prob,
-            background_scores=eval_background_prob,
-        )
-    else:
-        metrics["broad_background_scores"] = {"enabled": False}
-        metrics["threshold_diagnostics"] = _threshold_metrics(
+        "broad_background_scores": {"enabled": False},
+        "threshold_diagnostics": _threshold_metrics(
             positive_scores=all_positive_prob,
             background_scores=None,
-        )
+        ),
+    }
     print(
         "[train] metrics "
         f"train_auc={train_metrics['roc_auc']} test_auc={test_metrics['roc_auc']} "
         f"train_logloss={train_metrics['log_loss']:.4f} test_logloss={test_metrics['log_loss']:.4f}"
     )
     positive_quantiles = metrics["all_known_positive_scores"].get("quantiles", {})
-    if eval_background_prob is not None:
-        background_quantiles = metrics["broad_background_scores"].get("quantiles", {})
-        print(
-            "[train] diagnostics "
-            f"known_positive_p10={positive_quantiles.get('0.10')} "
-            f"known_positive_p50={positive_quantiles.get('0.50')} "
-            f"known_positive_p90={positive_quantiles.get('0.90')} "
-            f"background_p95={background_quantiles.get('0.95')}"
-        )
-    else:
-        print(
-            "[train] diagnostics "
-            f"known_positive_p10={positive_quantiles.get('0.10')} "
-            f"known_positive_p50={positive_quantiles.get('0.50')} "
-            f"known_positive_p90={positive_quantiles.get('0.90')}"
-        )
+    print(
+        "[train] diagnostics "
+        f"known_positive_p10={positive_quantiles.get('0.10')} "
+        f"known_positive_p50={positive_quantiles.get('0.50')} "
+        f"known_positive_p90={positive_quantiles.get('0.90')}"
+    )
 
     run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output_dir = CONFIG.models_root / f"taxon_{taxon_id}_{CONFIG.ml_model_kind}_{run_ts}"
+    output_dir = CONFIG.models_root / f"taxon_{taxon_id}_{CONFIG.ml_model_kind}_{mode}_{run_ts}"
     if model_kind == "gbt":
         model_type = "sklearn_gradient_boosting"
     elif model_kind == "maxent":
@@ -1246,9 +1271,9 @@ def main() -> None:
         "numeric_columns": pruned_spec.numeric_columns,
         "categorical_columns": pruned_spec.categorical_columns,
         "dropped_feature_columns": dropped_columns,
-        "negative_ratio": int(CONFIG.ml_negative_ratio),
         "random_seed": int(CONFIG.ml_random_seed),
         "test_size": float(CONFIG.ml_test_size),
+        "training_mode": mode,
         "parquet_storage_mode": str(CONFIG.ml_parquet_storage_mode),
         "raster_storage_mode": str(CONFIG.ml_raster_storage_mode),
     }
@@ -1256,6 +1281,7 @@ def main() -> None:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "output_dir": str(output_dir),
         "taxon_id": taxon_id,
+        "training_mode": mode,
         "positive_rows": int(len(positives)),
         "negative_rows": int(len(negatives)),
         "total_rows": int(len(X)),
@@ -1268,14 +1294,102 @@ def main() -> None:
             "raster_mode": str(CONFIG.ml_raster_storage_mode),
         },
         "negative_sampling": negative_info,
-        "background_eval_enabled": bool(CONFIG.ml_enable_background_eval),
-        "evaluation_background_sampling": eval_background_info,
     }
     _save_artifacts(output_dir, payload, metrics, summary)
 
     print(f"[train] saved model artifact: {output_dir / 'model.pkl'}")
     print(f"[train] saved metrics: {output_dir / 'metrics.json'}")
     print(f"[train] saved summary: {output_dir / 'summary.json'}")
+
+
+def main() -> None:
+    _configure_storage_modes()
+
+    taxon_id = str(CONFIG.ml_train_taxon_id)
+    gis_feature_spec = _load_non_temporal_feature_spec()
+    temporal_cols = _temporal_feature_names()
+
+    positive_path = _taxon_occurrence_path(taxon_id)
+    print(f"[train] taxon={taxon_id} source: {positive_path}")
+    print(
+        f"[train] parquet_storage={CONFIG.ml_parquet_storage_mode} "
+        f"raster_storage={CONFIG.ml_raster_storage_mode} "
+        f"phenology_mode={CONFIG.ml_phenology_mode}"
+    )
+
+    if CONFIG.ml_phenology_mode:
+        # ── Phenology mode ──────────────────────────────────────────────────
+        # Both positives and negatives are real occurrences read from the parquet.
+        # Positives have a dp (developmental phenology) annotation; negatives do not.
+        # Since all rows come from the parquet they already have temporal enrichment,
+        # so there's no negative-sampling bottleneck.
+        print("[train] mode=phenology (dp annotation as label, no synthetic negatives)")
+        positives, negatives = _read_phenology_split(positive_path, gis_feature_spec)
+        all_temporal_cols = [c for c in temporal_cols if c in positives.columns]
+        full_feature_spec = FeatureSpec(
+            all_columns=gis_feature_spec.all_columns + all_temporal_cols,
+            numeric_columns=gis_feature_spec.numeric_columns + all_temporal_cols,
+            categorical_columns=gis_feature_spec.categorical_columns,
+        )
+        print(
+            f"[train] positives={len(positives)} negatives={len(negatives)} "
+            f"temporal_features={len(all_temporal_cols)}"
+        )
+        if len(positives) == 0:
+            raise RuntimeError(
+                f"Phenology mode: no dp-annotated occurrences found for taxon {taxon_id}. "
+                "Set ml_phenology_mode=False to train a standard SDM instead."
+            )
+        if len(negatives) == 0:
+            raise RuntimeError(
+                f"Phenology mode: all {len(positives)} occurrences for taxon {taxon_id} have "
+                "a dp annotation — no unannotated negatives available. "
+                "Pick a taxon with mixed annotation coverage, or set ml_phenology_mode=False."
+            )
+        negative_info = {
+            "strategy": "phenology_parquet_split",
+            "dp_column": "dp",
+            "positive_rows": int(len(positives)),
+            "negative_rows": int(len(negatives)),
+        }
+        _run_training(
+            taxon_id, positives, negatives, full_feature_spec, negative_info, mode="phenology"
+        )
+
+    else:
+        # ── Standard SDM mode ────────────────────────────────────────────────
+        # mode="sdm" so the artifact is named taxon_{id}_{kind}_sdm_{ts}
+        # Positives: real occurrences from parquet (with temporal features).
+        # Negatives: spatially sampled random coordinates (temporal columns = NaN,
+        #   handled by the median imputer in the preprocessor).
+        print("[train] mode=standard (spatial negative sampling + temporal from parquet)")
+        rng = np.random.default_rng(_taxon_seed(taxon_id))
+
+        positives, positive_lats, positive_lons = _read_positive_features_and_coords(
+            positive_path,
+            gis_feature_spec,
+        )
+        full_feature_spec = gis_feature_spec
+
+        positive_bbox = _compute_positive_bbox(positive_lats, positive_lons)
+        target_negative_rows = len(positives) * int(CONFIG.ml_negative_ratio)
+        print(
+            f"[train] positives={len(positives)} target_negatives={target_negative_rows} "
+            f"ratio={CONFIG.ml_negative_ratio}:1"
+        )
+
+        negatives_gis, negative_info = _sample_negative_features(
+            target_negative_rows,
+            gis_feature_spec,
+            positive_bbox,
+            rng,
+        )
+        negatives = negatives_gis[full_feature_spec.all_columns]
+        print(f"[train] negatives collected={len(negatives)}")
+
+        _run_training(
+            taxon_id, positives, negatives, full_feature_spec, negative_info, mode="sdm"
+        )
 
 
 if __name__ == "__main__":

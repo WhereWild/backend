@@ -68,7 +68,7 @@ class GlobalConfig:
 
     # Pipeline tuning
     root_taxon_id: str = field(
-        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "6")
+        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "1")
     )
     process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False
@@ -120,8 +120,9 @@ class GlobalConfig:
 
     # ML training
     ml_train_taxon_id: str = "3084072"
-    ml_model_kind: str = "maxent"
-    ml_negative_ratio: int = 10
+    ml_phenology_mode: bool = False
+    ml_model_kind: str = "gbt"
+    ml_negative_ratio: int = 3
     ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
     ml_negative_global_growth_factor: float = 5.0
     ml_negative_global_max_extra_rounds: int = 12
@@ -135,6 +136,15 @@ class GlobalConfig:
     ml_enable_background_eval: bool = False
     ml_parquet_storage_mode: str = "local"
     ml_raster_storage_mode: str = "auto"
+    # Phenology mode: column containing reproductive condition summary and positive values
+    ml_phenology_rcs_column: str = "rcs"
+    ml_phenology_rcs_positive_values: tuple[str, ...] = (
+        "flowers",
+        "flower buds",
+        "fruits or seeds",
+        "flowers|flower buds",
+        "fruits or seeds|flower buds",
+    )
 
     # Enrichment
 

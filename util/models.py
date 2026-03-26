@@ -15,8 +15,10 @@ from util.config import load_config
 
 
 CONFIG = load_config("global")
-AUTO_MODEL_ID = f"auto_{str(CONFIG.ml_model_kind).strip().lower() or 'gbt'}"
+_MODEL_KIND = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
+AUTO_MODEL_ID = f"auto_{_MODEL_KIND}_sdm"
 DEFAULT_MODEL_ID = AUTO_MODEL_ID
+AUTO_PHENOLOGY_MODEL_ID = f"auto_{_MODEL_KIND}_phenology"
 
 
 @dataclass(frozen=True)
@@ -59,18 +61,18 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
     if normalized == "":
         if not taxon_key:
             return None
-        model_kind = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
+        # Prefer the new-style sdm artifact; fall back to old-style for existing models.
+        result = _latest_artifact_for_prefix(f"taxon_{taxon_key}_{_MODEL_KIND}_sdm_")
+        return result or _latest_artifact_for_prefix(f"taxon_{taxon_key}_{_MODEL_KIND}_")
 
     if normalized.startswith("auto_"):
-        model_kind = normalized.removeprefix("auto_").strip().lower()
-        if not model_kind or not taxon_key:
+        # Suffix after "auto_" is the full kind+mode string, e.g. "gbt_sdm" or "gbt_phenology".
+        kind_and_mode = normalized.removeprefix("auto_").strip().lower()
+        if not kind_and_mode or not taxon_key:
             return None
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{kind_and_mode}_")
 
-    if normalized.startswith("taxon_") and (
-        normalized.endswith("_gbt") or normalized.endswith("_maxent")
-    ):
+    if normalized.startswith("taxon_"):
         return _latest_artifact_for_prefix(f"{normalized}_")
 
     candidate = _models_root() / normalized
@@ -127,6 +129,10 @@ def model_feature_columns(
     return [str(col) for col in artifact.payload.get("feature_columns") or [] if str(col).strip()]
 
 
+def has_phenology_model(taxon_id: str | int | None) -> bool:
+    return resolve_model_artifact(AUTO_PHENOLOGY_MODEL_ID, taxon_id=taxon_id) is not None
+
+
 def describe_model(
     model_id: str | None,
     *,
@@ -148,6 +154,7 @@ def describe_model(
         "model_dir": str(artifact.model_dir),
         "taxon_id": str(taxon_id) if taxon_id is not None else None,
         "feature_columns": list(artifact.payload.get("feature_columns") or []),
+        "phenology_available": has_phenology_model(taxon_id),
         "summary": summary,
         "metrics": metrics,
     }
