@@ -952,12 +952,14 @@ def _render_feature_stack(
         if m:
             variable_id = m.group(1)
             window_hours = int(m.group(3))
-            effective_hours = _wt._TEMPORAL_WINDOW_TO_FORECAST_HOURS.get(window_hours, window_hours)
-            stack[:, :, idx] = _wt.sample_grid_for_tile(variable_id, effective_hours, spec)
+            stack[:, :, idx] = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
         else:
-            stack[:, :, idx] = _render_layer_values(
-                layer_id, spec, reproject_to_mercator=reproject,
-            )
+            try:
+                stack[:, :, idx] = _render_layer_values(
+                    layer_id, spec, reproject_to_mercator=reproject,
+                )
+            except ValueError:
+                stack[:, :, idx] = np.nan
         if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
             print(
                 f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} "
@@ -977,6 +979,7 @@ def render_model_tile_bytes(
     tile_size: int = 256,
     reproject: bool = True,
     forecast_hours: int = 0,
+    apply_phenology: bool = True,
 ) -> bytes:
     """Render a species habitat-suitability tile.
 
@@ -992,7 +995,7 @@ def render_model_tile_bytes(
 
     # ── Phenology model (optional) ───────────────────────────────────────────
     phenology_layers: list[str] = []
-    if models.has_phenology_model(taxon_id):
+    if apply_phenology and models.has_phenology_model(taxon_id):
         try:
             phenology_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
         except ValueError:

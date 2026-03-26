@@ -73,6 +73,10 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
         return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{kind_and_mode}_")
 
     if normalized.startswith("taxon_"):
+        # Exact match first (full artifact id passed), then prefix search
+        exact = _models_root() / normalized
+        if exact.is_dir() and (exact / "model.pkl").exists():
+            return exact
         return _latest_artifact_for_prefix(f"{normalized}_")
 
     candidate = _models_root() / normalized

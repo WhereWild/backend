@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 
 S3_SPATIAL = "s3://openmeteo/data_spatial"
 
+_TEMPORAL_RASTER_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
+_TEMPORAL_WINDOW_LABELS: dict[int, str] = {
+    1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d",
+}
+
 # Per-model grid configuration
 MODEL_CONFIGS: dict[str, dict] = {
     "ncep_gfs013": {
@@ -525,42 +530,39 @@ _TEMPORAL_WINDOW_TO_FORECAST_HOURS: dict[int, int] = {
 
 def sample_grid_for_tile(
     variable_id: str,
+    window_hours: int,
     forecast_hours: int,
     spec: "TileSpec",
 ) -> np.ndarray:
-    """Return a (tile_size, tile_size) float32 array of weather values for a tile.
+    """Return a (tile_size, tile_size) float32 array from pre-built temporal rasters.
 
-    Reprojects the cached global weather grid for *variable_id* at *forecast_hours*
-    into the tile's Web Mercator bounding box. Returns an all-NaN array when the
-    cache is not populated or the variable is unknown.
+    Reads from data/gis/temporal/rasters/{variable_id}_{window_label}[__f{forecast:03d}h].npy.
+    Returns all-NaN when the file doesn't exist.
     """
-    actual_hours = _TEMPORAL_WINDOW_TO_FORECAST_HOURS.get(forecast_hours, 168)
-    with _cache_lock:
-        source = _forecast_cache.get(actual_hours, {}) if actual_hours else _cache
-        arr = source.get(variable_id)
+    nan_tile = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    window_label = _TEMPORAL_WINDOW_LABELS.get(window_hours)
+    if window_label is None:
+        return nan_tile
 
-    if arr is None:
-        return np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    if forecast_hours == 0:
+        npy_path = _TEMPORAL_RASTER_DIR / f"{variable_id}_{window_label}.npy"
+    else:
+        npy_path = _TEMPORAL_RASTER_DIR / f"{variable_id}_{window_label}__f{forecast_hours:03d}h.npy"
 
-    cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
-    if cfg is None:
-        return np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    if not npy_path.exists():
+        return nan_tile
 
-    model_cfg = MODEL_CONFIGS[cfg["model"]]
+    arr = np.load(npy_path).astype(np.float32)
+    # All temporal rasters are on the ERA5 0.25° grid: 721×1440, lat -90→90, lon -180→180
     ny, nx = arr.shape
-    src = np.flipud(arr) if model_cfg["flipud"] else arr
-    src_transform = rasterio_from_bounds(
-        model_cfg["lon_min"], model_cfg["lat_min"],
-        model_cfg["lon_max"], model_cfg["lat_max"],
-        nx, ny,
-    )
+    src_transform = rasterio_from_bounds(-180.0, -90.0, 180.0, 90.0, nx, ny)
 
     minx, miny, maxx, maxy = tile_bounds_mercator(spec)
     dst_transform = rasterio_from_bounds(minx, miny, maxx, maxy, spec.tile_size, spec.tile_size)
 
-    dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+    dest = nan_tile.copy()
     reproject(
-        source=src,
+        source=arr,
         destination=dest,
         src_transform=src_transform,
         src_crs=CRS.from_epsg(4326),

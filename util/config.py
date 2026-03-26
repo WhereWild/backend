@@ -119,7 +119,7 @@ class GlobalConfig:
     sdm_tile_size: int = 256
 
     # ML training
-    ml_train_taxon_id: str = "3084072"
+    ml_train_taxon_id: str = "11498251"
     ml_phenology_mode: bool = False
     ml_model_kind: str = "gbt"
     ml_negative_ratio: int = 3

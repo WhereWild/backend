@@ -299,6 +299,10 @@ async def species_heatmap_tile(
             "0 = current snapshot; supported offsets: 0, 1, 8, 24, 72, 168."
         ),
     ),
+    apply_phenology: bool = Query(
+        True,
+        description="If true and a phenology model exists, multiply SDM × phenology scores.",
+    ),
 ) -> Response:
     if await request.is_disconnected():
         return Response(status_code=204)
@@ -331,6 +335,7 @@ async def species_heatmap_tile(
                 tile_size=parent_tile_size,
                 reproject=reproject,
                 forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
             )
             if await request.is_disconnected():
                 return Response(status_code=204)
@@ -363,8 +368,10 @@ async def species_heatmap_tile(
                 tile_size=tile_size,
                 reproject=reproject,
                 forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
             )
         except ValueError as exc:
+            import traceback; traceback.print_exc()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if await request.is_disconnected():
