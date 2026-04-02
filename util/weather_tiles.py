@@ -206,6 +206,10 @@ def _populate_cache_from_hits(model: str, ref_time: str, disk_hits: dict[str, np
             arr = disk_hits.get(cfg.get("fetch_as", var_id))
             if arr is not None:
                 target[var_id] = arr
+                # Save current snapshot to disk so the API can read it without an in-memory cache
+                if forecast_hours == 0:
+                    _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    np.save(_DISK_CACHE_DIR / f"current_{model}_{var_id}.npy", arr)
         if forecast_hours == 0:
             _cache_ref_times[model] = ref_time
         else:
@@ -397,11 +401,17 @@ def _colorize(arr: np.ndarray, stops: np.ndarray, lo: float, hi: float) -> np.nd
 def render_weather_tile_bytes(variable_id: str, z: int, x: int, y: int,
                                tile_size: int = 256,
                                forecast_hours: int = 0) -> bytes | None:
-    """Render a tile PNG from the in-memory cache. Returns None if cache not populated.
-    Cache is populated by load_from_disk() on startup or preload_all_forecasts() from the build script.
+    """Render a tile PNG for the current snapshot or a forecast offset.
+    Reads from in-memory cache if warm, falls back to the current-snapshot disk file.
     """
     with _cache_lock:
         arr = (_forecast_cache.get(forecast_hours, {}) if forecast_hours else _cache).get(variable_id)
+    if arr is None and forecast_hours == 0:
+        cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
+        if cfg is not None:
+            p = _DISK_CACHE_DIR / f"current_{cfg['model']}_{variable_id}.npy"
+            if p.exists():
+                arr = np.load(p)
     if arr is None:
         return None
 

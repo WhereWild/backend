@@ -67,6 +67,8 @@ def _preload_gis_legends() -> None:
 def _load_weather_cache() -> None:
     import threading
     threading.Thread(target=weather_tiles.load_from_disk, daemon=True, name="weather-cache").start()
+
+
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:

@@ -613,14 +613,11 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
         except Exception as e:
             print(f"  GFS {gv}: ERROR {e}")
 
-    # ── Process each variable ─────────────────────────────────────────────
+    # ── Pre-build all ERA5 chunk indices ─────────────────────────────────────
+    print("=== ERA5 chunk indices ===")
     era5_cidx_by_var: dict[str, dict[str, list]] = {}
-
     for var_id, cfg in var_configs.items():
-        print(f"\n=== {var_id} ===")
         era5_model = cfg["era5_model"]
-
-        # Build ERA5 chunk indices for this var
         era5_cidx: dict[str, list] = {}
         for rv in _era5_raw_vars(cfg):
             try:
@@ -628,35 +625,12 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                     era5_model, rv, resolution_s, era5_end_ts,
                     window_start_ts=window_start_ts, chunk_time_length=era5_chunk_length,
                 )
-                print(f"  ERA5 {rv}: {len(era5_cidx[rv])} chunk(s)")
+                print(f"  ERA5 {var_id}/{rv}: {len(era5_cidx[rv])} chunk(s)")
             except Exception as e:
-                print(f"  ERA5 {rv}: ERROR {e}")
+                print(f"  ERA5 {var_id}/{rv}: ERROR {e}")
         era5_cidx_by_var[var_id] = era5_cidx
 
-        for window_h, window_label in windows:
-            sums, old_meta = _load_state(var_id, window_label)
-
-            if force or sums is None:
-                print(f"  [{window_label}] full build ...", flush=True)
-                _full_build(var_id, cfg, window_h, window_label,
-                            now_ts, era5_end_ts, gfs_end_ts, resolution_s,
-                            era5_cidx, gfs_cidx)
-            else:
-                hours_stale = (now_ts - old_meta["gfs_end_ts"]) / 3600
-                print(f"  [{window_label}] incremental update ({hours_stale:.1f}h stale) ...", flush=True)
-                _incremental_update(var_id, cfg, window_h, window_label,
-                                    sums, old_meta,
-                                    now_ts, era5_end_ts, gfs_end_ts, resolution_s,
-                                    era5_cidx, gfs_cidx)
-
-    # ── Build forecast aggregate rasters ──────────────────────────────────
-    build_forecast_aggregates(
-        FORECAST_HOURS, var_configs, windows,
-        now_ts, era5_end_ts, gfs_data_end_ts,
-        resolution_s, era5_cidx_by_var, gfs_cidx,
-    )
-
-    # ── Clean up stale downloaded chunks ──────────────────────────────────
+    # ── Clean up stale cached chunks before downloading anything new ──────────
     needed_chunks: set[str] = set()
     indexed_prefixes: set[str] = set()
     for gv, idx_list in gfs_cidx.items():
@@ -671,16 +645,49 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                 needed_chunks.add(chunk_name)
     _cleanup_stale_chunks(needed_chunks, indexed_prefixes)
 
+    # ── Process windows shortest-first, all vars per window ──────────────────
+    for window_h, window_label in windows:
+        print(f"\n=== window {window_label} ===")
+        for var_id, cfg in var_configs.items():
+            era5_cidx = era5_cidx_by_var.get(var_id, {})
+            sums, old_meta = _load_state(var_id, window_label)
+
+            if force or sums is None:
+                print(f"  [{window_label}] {var_id} full build ...", flush=True)
+                _full_build(var_id, cfg, window_h, window_label,
+                            now_ts, era5_end_ts, gfs_end_ts, resolution_s,
+                            era5_cidx, gfs_cidx)
+            else:
+                hours_stale = (now_ts - old_meta["gfs_end_ts"]) / 3600
+                print(f"  [{window_label}] {var_id} incremental ({hours_stale:.1f}h stale) ...", flush=True)
+                _incremental_update(var_id, cfg, window_h, window_label,
+                                    sums, old_meta,
+                                    now_ts, era5_end_ts, gfs_end_ts, resolution_s,
+                                    era5_cidx, gfs_cidx)
+
+    # ── Build forecast aggregate rasters ──────────────────────────────────
+    build_forecast_aggregates(
+        FORECAST_HOURS, var_configs, windows,
+        now_ts, era5_end_ts, gfs_data_end_ts,
+        resolution_s, era5_cidx_by_var, gfs_cidx,
+    )
+
 
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from util.config import GlobalConfig
+    from util import weather_tiles
 
     cfg = GlobalConfig()
 
     only_vars    = list(cfg.temporal_raster_vars)    or None
     only_windows = list(cfg.temporal_raster_windows) or None
+
+    # Preload live tiles first so the API has current data while rasters build
+    print("=== preloading live tiles (pre-build) ===")
+    weather_tiles.preload_all_forecasts()
+    weather_tiles.cleanup_weather_disk_cache(datetime.now(timezone.utc).timestamp())
 
     main(only_vars=only_vars, only_windows=only_windows, force=cfg.temporal_raster_force_rebuild)
 
@@ -700,7 +707,8 @@ if __name__ == "__main__":
         else:
             print("  upload complete")
 
-    print("\n=== preloading forecast tiles ===")
-    from util import weather_tiles
+    # Preload again after build to pick up newest GFS run if it changed during build
+    print("\n=== preloading forecast tiles (post-build) ===")
+    _post_build_ts = datetime.now(timezone.utc).timestamp()
     weather_tiles.preload_all_forecasts()
-    weather_tiles.cleanup_weather_disk_cache(now_ts)
+    weather_tiles.cleanup_weather_disk_cache(_post_build_ts)
