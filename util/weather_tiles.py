@@ -207,9 +207,9 @@ def _populate_cache_from_hits(model: str, ref_time: str, disk_hits: dict[str, np
             if arr is not None:
                 target[var_id] = arr
                 # Save current snapshot to disk so the API can read it without an in-memory cache
-                if forecast_hours == 0:
-                    _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    np.save(_DISK_CACHE_DIR / f"current_{model}_{var_id}.npy", arr)
+                _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                suffix = f"__f{forecast_hours:03d}h" if forecast_hours else ""
+                np.save(_DISK_CACHE_DIR / f"current_{model}_{var_id}{suffix}.npy", arr)
         if forecast_hours == 0:
             _cache_ref_times[model] = ref_time
         else:
@@ -264,10 +264,17 @@ def _load_model(model: str, forecast_hours: int = 0) -> None:
     # Fetch missing vars from S3
     need = [v for v in raw_needs if v not in disk_hits]
     if need:
-        path = _s3_path(model, ref_dt, valid)
-        print(f"[weather_tiles] S3 fetch {tag}: {need} from {model}", flush=True)
-        backend = fsspec.open(path, mode="rb", s3={"anon": True})
-        root = OmFileReader(backend)
+        s3_path = _s3_path(model, ref_dt, valid)
+        safe_valid = valid.strftime("%Y%m%dT%HZ")
+        local_om = _DISK_CACHE_DIR / f"{model}__{safe_valid}.om"
+        _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        if not local_om.exists():
+            print(f"[weather_tiles] S3 fetch {tag}: {need} from {model}", flush=True)
+            fs_anon = fsspec.filesystem("s3", anon=True)
+            fs_anon.get(s3_path, str(local_om))
+        else:
+            print(f"[weather_tiles] S3 om file from disk {tag} from {model}", flush=True)
+        root = OmFileReader(str(local_om))
         available = {root.get_child_by_index(i).name for i in range(root.num_children)}
         for var_id in need:
             if var_id not in available:
@@ -358,7 +365,7 @@ def cleanup_weather_disk_cache(now_ts: float, keep_hours: int = 24) -> None:
         return
     cutoff = now_ts - keep_hours * 3600
     removed = 0
-    for path in _DISK_CACHE_DIR.glob("*.npy"):
+    for path in list(_DISK_CACHE_DIR.glob("*.npy")) + list(_DISK_CACHE_DIR.glob("*.om")):
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -406,10 +413,11 @@ def render_weather_tile_bytes(variable_id: str, z: int, x: int, y: int,
     """
     with _cache_lock:
         arr = (_forecast_cache.get(forecast_hours, {}) if forecast_hours else _cache).get(variable_id)
-    if arr is None and forecast_hours == 0:
+    if arr is None:
         cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
         if cfg is not None:
-            p = _DISK_CACHE_DIR / f"current_{cfg['model']}_{variable_id}.npy"
+            suffix = f"__f{forecast_hours:03d}h" if forecast_hours else ""
+            p = _DISK_CACHE_DIR / f"current_{cfg['model']}_{variable_id}{suffix}.npy"
             if p.exists():
                 arr = np.load(p)
     if arr is None:

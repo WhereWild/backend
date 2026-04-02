@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -131,8 +132,10 @@ def _download_chunk(chunk_name: str, model: str, var: str) -> str:
     if not os.path.exists(local):
         s3 = f"{MODELS[model]['s3']}/{var}/{chunk_name}"
         print(f"    dl {model}/{var}/{chunk_name} ...", end=" ", flush=True)
+        t0 = time.perf_counter()
         fs.get(s3, local)
-        print("done", flush=True)
+        mb = os.path.getsize(local) / 1e6
+        print(f"done ({mb:.0f}MB, {time.perf_counter()-t0:.1f}s)", flush=True)
     return local
 
 
@@ -141,6 +144,7 @@ def _reproject_to_output(arr: np.ndarray, model: str) -> np.ndarray:
     src = np.flipud(arr) if m["flipud"] else arr
     ny, nx = src.shape
     dest = np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32)
+    t0 = time.perf_counter()
     reproject(
         source=src, destination=dest,
         src_transform=rasterio_from_bounds(m["lon_min"], m["lat_min"], m["lon_max"], m["lat_max"], nx, ny),
@@ -149,6 +153,7 @@ def _reproject_to_output(arr: np.ndarray, model: str) -> np.ndarray:
         dst_crs=WGS84, dst_nodata=np.nan,
         resampling=Resampling.bilinear,
     )
+    print(f"      reproject {model} {src.shape}→{dest.shape}: {time.perf_counter()-t0:.2f}s", flush=True)
     return dest
 
 
@@ -221,7 +226,10 @@ def _accumulate(model: str, var: str, start_ts: float, end_ts: float,
         ny, nx, _ = root.shape
         if native_acc is None:
             native_acc = np.zeros((ny, nx), dtype=np.float64)
-        native_acc += np.nansum(root.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))), axis=2)
+        t_read = time.perf_counter()
+        slice_data = root.read_array((slice(0, ny), slice(0, nx), slice(t0, t1)))
+        print(f"      read_array {chunk_name}[{t0}:{t1}] {slice_data.shape}: {time.perf_counter()-t_read:.2f}s", flush=True)
+        native_acc += np.nansum(slice_data, axis=2)
         n_hours += (t1 - t0)
 
     if native_acc is None:
@@ -289,12 +297,13 @@ def _save_state(var_id: str, window_label: str, cfg: dict,
                 sums: dict[str, np.ndarray], meta: dict, suffix: str = "") -> None:
     npy_p, meta_p, sums_p = _state_paths(var_id, window_label, suffix)
     result = _compute_final(var_id, cfg, sums, meta["n_era5"], meta["n_gfs"])
+    t0 = time.perf_counter()
     np.save(npy_p, result)
     with open(meta_p, "w") as f:
         json.dump(meta, f, indent=2)
     np.savez(sums_p, **sums)
     print(f"  [{window_label:4s}] {meta['n_era5']}h ERA5 + {meta['n_gfs']}h GFS  "
-          f"range=[{result.min():.3f}, {result.max():.3f}]  → {npy_p.name}")
+          f"range=[{result.min():.3f}, {result.max():.3f}]  → {npy_p.name}  (save {time.perf_counter()-t0:.2f}s)")
 
 
 # ── ERA5 raw var lists ────────────────────────────────────────────────────────
@@ -652,6 +661,7 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
             era5_cidx = era5_cidx_by_var.get(var_id, {})
             sums, old_meta = _load_state(var_id, window_label)
 
+            _t = time.perf_counter()
             if force or sums is None:
                 print(f"  [{window_label}] {var_id} full build ...", flush=True)
                 _full_build(var_id, cfg, window_h, window_label,
@@ -664,6 +674,7 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                                     sums, old_meta,
                                     now_ts, era5_end_ts, gfs_end_ts, resolution_s,
                                     era5_cidx, gfs_cidx)
+            print(f"  [{window_label}] {var_id} done in {time.perf_counter()-_t:.2f}s", flush=True)
 
     # ── Build forecast aggregate rasters ──────────────────────────────────
     build_forecast_aggregates(
@@ -683,7 +694,6 @@ if __name__ == "__main__":
 
     only_vars    = list(cfg.temporal_raster_vars)    or None
     only_windows = list(cfg.temporal_raster_windows) or None
-
     # Preload live tiles first so the API has current data while rasters build
     print("=== preloading live tiles (pre-build) ===")
     weather_tiles.preload_all_forecasts()
