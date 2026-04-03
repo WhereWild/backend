@@ -832,6 +832,17 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
     print(f"ERA5 gap  : {(now - era5_end_dt).total_seconds()/3600:.1f}h (filled by GFS)")
     print(f"Max window: {max_window_h}h  Force rebuild: {force}\n")
 
+    if not force:
+        # Check any existing meta file to see if S3 data has changed since last run
+        existing = sorted(OUT_DIR.glob("*.meta.json"))
+        if existing:
+            with open(existing[0]) as f:
+                sample = json.load(f)
+            if (sample.get("era5_end_ts") == era5_end_ts
+                    and sample.get("gfs_end_ts") == gfs_end_ts):
+                print("=== no new data on S3 since last run, skipping ===")
+                return
+
     window_start_ts = now_ts - max_window_h * 3600
 
     # ── Collect GFS raw vars needed ───────────────────────────────────────
