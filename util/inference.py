@@ -357,6 +357,165 @@ def _build_heatmap_coords(
     return coords, requested_cells
 
 
+def _prepare_feature_batch_for_coords(
+    coords: list[tuple[float, float]],
+    *,
+    resolution_hint: float,
+    include_source: bool,
+    feature_mode: str,
+    raster_dataset_cache: dict[tuple[str, str], Any] | None = None,
+    dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
+) -> tuple[list[int], torch.Tensor | None, list[str | None] | None]:
+    """Resolve model-ready feature rows for arbitrary coordinates."""
+    native = _cell_size_deg
+    feature_config = _resolve_heatmap_feature_mode(
+        feature_mode,
+        resolution_hint,
+        native,
+    )
+    primary_source, allow_fallback = feature_config
+
+    features_per_coord: list[torch.Tensor | None] = [None] * len(coords)
+    feature_source_per_coord: list[str | None] | None = (
+        cast(list[str | None], [None] * len(coords)) if include_source else None
+    )
+    missing_indices: list[int] = []
+    missing_coords: list[tuple[float, float]] = []
+
+    if primary_source == "cell_table":
+        for i, (lat, lon) in enumerate(coords):
+            cell = _cell_lookup_by_bin(lat, lon, native)
+            if cell is not None:
+                features_per_coord[i] = cell["features"]
+                if feature_source_per_coord is not None:
+                    feature_source_per_coord[i] = "cell_table"
+                continue
+            missing_indices.append(i)
+            missing_coords.append((lat, lon))
+
+        if allow_fallback and missing_coords:
+            sampled = _batch_sample_features(
+                missing_coords,
+                raster_dataset_cache=raster_dataset_cache,
+                dem_dataset_cache=dem_dataset_cache,
+            )
+            for i, cell in zip(missing_indices, sampled):
+                if cell is not None:
+                    features_per_coord[i] = cell["features"]
+                    if feature_source_per_coord is not None:
+                        feature_source_per_coord[i] = "sampled"
+    else:
+        sampled = _batch_sample_features(
+            coords,
+            raster_dataset_cache=raster_dataset_cache,
+            dem_dataset_cache=dem_dataset_cache,
+        )
+        for i, cell in enumerate(sampled):
+            if cell is not None:
+                features_per_coord[i] = cell["features"]
+                if feature_source_per_coord is not None:
+                    feature_source_per_coord[i] = "sampled"
+                continue
+            missing_indices.append(i)
+            missing_coords.append(coords[i])
+
+        if allow_fallback and missing_coords:
+            for i, (lat, lon) in zip(missing_indices, missing_coords, strict=True):
+                cell = _cell_lookup_by_bin(lat, lon, native)
+                if cell is not None:
+                    features_per_coord[i] = cell["features"]
+                    if feature_source_per_coord is not None:
+                        feature_source_per_coord[i] = "cell_table"
+
+    valid_indices: list[int] = []
+    valid_features: list[torch.Tensor] = []
+    for i, feat in enumerate(features_per_coord):
+        if feat is None:
+            continue
+        valid_indices.append(i)
+        valid_features.append(feat)
+    stacked_features = _stack_feature_batch(valid_features, target_device=_device) if valid_features else None
+    return valid_indices, stacked_features, feature_source_per_coord
+
+
+def _score_species_feature_tensor(
+    species_key: int,
+    feature_tensor: torch.Tensor,
+    *,
+    score_batch_size: int,
+) -> list[float]:
+    """Score one species head for a prebuilt feature tensor batch."""
+    if _encoder is None:
+        raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
+    if species_key not in _heads:
+        raise KeyError(f"Species {species_key} not in loaded bundle.")
+
+    encoder = _encoder
+    head = _heads[species_key]
+    scores_list: list[float] = []
+    with torch.no_grad():
+        for start in range(0, int(feature_tensor.shape[0]), score_batch_size):
+            batch_features = feature_tensor[start : start + score_batch_size]
+            if batch_features.device != _device:
+                batch_features = batch_features.to(_device)
+            embeddings = encoder(batch_features)
+            logits = head(embeddings)
+            scores_list.extend(torch.sigmoid(logits).cpu().tolist())
+    return scores_list
+
+
+def score_species_coords(
+    species_key: int,
+    coords: list[tuple[float, float]],
+    *,
+    resolution_hint: float,
+    feature_mode: str = "prefer_cell_table",
+    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
+    include_source: bool = False,
+) -> tuple[list[float | None], list[str | None] | None]:
+    """Score one species for arbitrary coordinates.
+
+    Returns one score slot per input coordinate. Coordinates that cannot be
+    resolved to model-ready features are returned as ``None``.
+    """
+    sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
+    scores_per_coord: list[float | None] = [None] * len(coords)
+    feature_source_per_coord: list[str | None] | None = (
+        cast(list[str | None], [None] * len(coords)) if include_source else None
+    )
+    raster_dataset_cache: dict[tuple[str, str], Any] = {}
+    dem_dataset_cache: dict[tuple[str, str], Any] = {}
+    try:
+        for chunk_start in range(0, len(coords), sample_chunk_size):
+            chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
+            valid_indices, feature_tensor, chunk_sources = _prepare_feature_batch_for_coords(
+                chunk_coords,
+                resolution_hint=resolution_hint,
+                include_source=include_source,
+                feature_mode=feature_mode,
+                raster_dataset_cache=raster_dataset_cache,
+                dem_dataset_cache=dem_dataset_cache,
+            )
+            if chunk_sources is not None and feature_source_per_coord is not None:
+                for local_index, source in enumerate(chunk_sources):
+                    feature_source_per_coord[chunk_start + local_index] = source
+            if feature_tensor is None or feature_tensor.numel() == 0:
+                continue
+
+            chunk_scores = _score_species_feature_tensor(
+                species_key,
+                feature_tensor,
+                score_batch_size=score_batch_size,
+            )
+            for local_index, score in zip(valid_indices, chunk_scores):
+                scores_per_coord[chunk_start + local_index] = score
+    finally:
+        _close_dataset_cache(raster_dataset_cache)
+        _close_dataset_cache(dem_dataset_cache)
+
+    return scores_per_coord, feature_source_per_coord
+
+
 def _lazy_import_models() -> None:
     """Import model classes from the training package on first use."""
     global SharedEncoder, SpeciesHead  # noqa: PLW0603
@@ -791,9 +950,19 @@ def species_meta() -> dict[int, dict]:
     return dict(_species_meta)
 
 
+def has_species(species_key: int) -> bool:
+    """Return whether the loaded bundle contains the requested species head."""
+    return species_key in _heads
+
+
 def cell_count() -> int:
     """Return the number of cells in the loaded lookup table."""
     return len(_cell_table)
+
+
+def native_resolution() -> float:
+    """Return the loaded model's native cell size in degrees."""
+    return _cell_size_deg
 
 
 def predict_heatmap_stream(
@@ -816,7 +985,6 @@ def predict_heatmap_stream(
         raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
     if species_key not in _heads:
         raise KeyError(f"Species {species_key} not in loaded bundle.")
-    encoder = _encoder
 
     native = _cell_size_deg
     res = resolution if resolution is not None else native
@@ -832,14 +1000,6 @@ def predict_heatmap_stream(
         raise ValueError("score_batch_size must be > 0")
 
     coords, requested_cells = _build_heatmap_coords(bbox, res, max_cells)
-    feature_config = _resolve_heatmap_feature_mode(
-        feature_mode,
-        res,
-        native,
-    )
-    primary_source, allow_fallback = feature_config
-
-    head = _heads[species_key]
     sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
     prefetch_chunks = _resolve_stream_prefetch_chunks()
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
@@ -849,66 +1009,14 @@ def predict_heatmap_stream(
         chunk_coords: list[tuple[float, float]],
     ) -> tuple[list[tuple[float, float]], list[int], torch.Tensor | None, list[str | None] | None]:
         """Resolve features for one stream chunk before model scoring."""
-        features_per_coord: list[torch.Tensor | None] = [None] * len(chunk_coords)
-        feature_source_per_coord: list[str | None] | None = (
-            cast(list[str | None], [None] * len(chunk_coords)) if include_source else None
+        valid_indices, stacked_features, feature_source_per_coord = _prepare_feature_batch_for_coords(
+            chunk_coords,
+            resolution_hint=res,
+            include_source=include_source,
+            feature_mode=feature_mode,
+            raster_dataset_cache=raster_dataset_cache,
+            dem_dataset_cache=dem_dataset_cache,
         )
-        missing_indices: list[int] = []
-        missing_coords: list[tuple[float, float]] = []
-
-        if primary_source == "cell_table":
-            for i, (lat, lon) in enumerate(chunk_coords):
-                cell = _cell_lookup_by_bin(lat, lon, native)
-                if cell is not None:
-                    features_per_coord[i] = cell["features"]
-                    if feature_source_per_coord is not None:
-                        feature_source_per_coord[i] = "cell_table"
-                    continue
-                missing_indices.append(i)
-                missing_coords.append((lat, lon))
-
-            if allow_fallback and missing_coords:
-                sampled = _batch_sample_features(
-                    missing_coords,
-                    raster_dataset_cache=raster_dataset_cache,
-                    dem_dataset_cache=dem_dataset_cache,
-                )
-                for i, cell in zip(missing_indices, sampled):
-                    if cell is not None:
-                        features_per_coord[i] = cell["features"]
-                        if feature_source_per_coord is not None:
-                            feature_source_per_coord[i] = "sampled"
-        else:
-            sampled = _batch_sample_features(
-                chunk_coords,
-                raster_dataset_cache=raster_dataset_cache,
-                dem_dataset_cache=dem_dataset_cache,
-            )
-            for i, cell in enumerate(sampled):
-                if cell is not None:
-                    features_per_coord[i] = cell["features"]
-                    if feature_source_per_coord is not None:
-                        feature_source_per_coord[i] = "sampled"
-                    continue
-                missing_indices.append(i)
-                missing_coords.append(chunk_coords[i])
-
-            if allow_fallback and missing_coords:
-                for i, (lat, lon) in zip(missing_indices, missing_coords, strict=True):
-                    cell = _cell_lookup_by_bin(lat, lon, native)
-                    if cell is not None:
-                        features_per_coord[i] = cell["features"]
-                        if feature_source_per_coord is not None:
-                            feature_source_per_coord[i] = "cell_table"
-
-        valid_indices: list[int] = []
-        valid_features: list[torch.Tensor] = []
-        for i, feat in enumerate(features_per_coord):
-            if feat is None:
-                continue
-            valid_indices.append(i)
-            valid_features.append(feat)
-        stacked_features = _stack_feature_batch(valid_features, target_device=_device) if valid_features else None
         return chunk_coords, valid_indices, stacked_features, feature_source_per_coord
 
     def _iter_cells() -> Iterator[dict[str, Any]]:
@@ -968,14 +1076,11 @@ def predict_heatmap_stream(
                         if valid_feature_tensor is None or valid_feature_tensor.numel() == 0:
                             continue
 
-                        scores_list: list[float] = []
-                        for start in range(0, int(valid_feature_tensor.shape[0]), score_batch_size):
-                            batch_features = valid_feature_tensor[start : start + score_batch_size]
-                            if batch_features.device != _device:
-                                batch_features = batch_features.to(_device)
-                            embeddings = encoder(batch_features)
-                            logits = head(embeddings)
-                            scores_list.extend(torch.sigmoid(logits).cpu().tolist())
+                        scores_list = _score_species_feature_tensor(
+                            species_key,
+                            valid_feature_tensor,
+                            score_batch_size=score_batch_size,
+                        )
 
                         for idx, score in zip(valid_indices, scores_list):
                             if cancel_check is not None and cancel_check():

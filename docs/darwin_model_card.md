@@ -142,9 +142,14 @@ Expected outcome: most compute spent once in shared encoder; species updates are
 
 ### 5.2 Runtime
 
-- The inference engine (`util/inference.py`) loads the bundle at startup and runs on CPU.
-- No CUDA, AMP, or heavy ML dependencies are needed on the server.
+- The inference engine (`util/inference.py`) loads the bundle at startup and
+    runs on CPU by default, with optional CUDA inference enabled via runtime env
+    configuration.
+- No training-time CUDA/AMP stack is required to serve the model, but PyTorch
+    and optional CUDA runtime support are still used for inference.
 - FastAPI prediction endpoints currently exposed:
+    - `/api/species/{taxon_id}/heatmap` (tile metadata)
+    - `/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png` (species heatmap PNG tiles)
     - `/api/predict/heatmap-jobs` (create async heatmap job)
     - `/api/predict/heatmap-jobs/{job_id}/stream` (stream async heatmap job progress/results)
     - `/api/predict/heatmap-jobs/{job_id}` (delete/cancel heatmap job)
@@ -163,9 +168,14 @@ This enables predictions at any land coordinate on Earth.
 ### 5.4 Latency strategy
 
 - Pre-computed cell table gives instant lookup for training-covered areas.
-- On-the-fly GIS sampling adds sub-millisecond overhead per query for uncovered areas (rasterio COG reads are fast with local files).
-- Heatmap endpoint scores all cells in a single vectorized forward pass.
-- Variable resolution aggregation allows zoom-dependent level of detail.
+- On-the-fly GIS sampling is substantially more expensive than cell-table
+    lookup, especially for tile requests that evaluate many output pixels.
+- Heatmap job streaming scores chunked coordinate batches rather than one giant
+    all-cells tensor.
+- Tile rendering currently computes PNG tiles on demand and does not persist a
+    server-side rendered-tile cache.
+- High zoom tile requests may be served by rendering a nearby parent tile under
+    the configured size cap and cropping the requested subtile.
 
 ## 6. Data Splits and Validation (avoid leakage)
 

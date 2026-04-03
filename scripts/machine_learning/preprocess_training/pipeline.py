@@ -43,6 +43,8 @@ LOG_SLOW_FILE_SECONDS = 20.0
 LOG_SLOW_READ_SECONDS = 8.0
 SCHEMA_LOG_INTERVAL_FILES = 500
 FINAL_WRITE_USE_THREADS = False
+BACKGROUND_SCAN_BATCH_ROWS = 32_768
+FINAL_WRITE_SCAN_BATCH_ROWS = 32_768
 
 
 def _species_inverse_frequency_weights(
@@ -81,23 +83,24 @@ def _species_inverse_frequency_weights(
     return weights
 
 
-def _build_background_table_for_split(
+def _iter_background_tables_for_split(
     split_table: pa.Table,
     *,
     split_name: str,
     background_ratio: float,
     rng: np.random.Generator,
-) -> pa.Table | None:
-    """Generate pooled other-species unlabeled rows for one split."""
+    output_rows_per_shard: int,
+):
+    """Yield pooled other-species unlabeled rows for one split in bounded shards."""
     if split_table.num_rows == 0 or background_ratio <= 0:
-        return None
+        return
 
     species = split_table.column("species_key").to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
     cell_ids = split_table.column("cell_id").to_numpy(zero_copy_only=False)
     year_month = split_table.column("year_month").to_numpy(zero_copy_only=False)
 
     if len(species) == 0:
-        return None
+        return
 
     key_frame = pd.DataFrame({"cell_id": cell_ids, "year_month": year_month})
     key_ids = pd.util.hash_pandas_object(key_frame, index=False).to_numpy(dtype=np.uint64, copy=False)
@@ -161,35 +164,43 @@ def _build_background_table_for_split(
 
     if not sampled_donor_indices:
         print(f"Background generation | split={split_name} | no valid donor rows")
-        return None
+        return
 
     donor_indices_all = np.concatenate(sampled_donor_indices)
     target_species_all = np.concatenate(sampled_target_species)
     donor_species_all = species[donor_indices_all]
     sample_weights = _species_inverse_frequency_weights(donor_species_all, target_species_all)
-    take_indices = pa.array(donor_indices_all, type=pa.int64())
-    sampled = split_table.take(take_indices)
+    output_rows_per_shard = max(1, int(output_rows_per_shard))
 
-    n_rows = sampled.num_rows
-    arrays: list[pa.Array] = []
-    names = sampled.schema.names
-    for name in names:
-        if name == "sample_id":
-            arrays.append(pa.array([str(uuid.uuid4()) for _ in range(n_rows)], type=pa.string()))
-        elif name == "observation_id":
-            arrays.append(pa.array([None] * n_rows, type=pa.string()))
-        elif name == "species_key":
-            arrays.append(pa.array(target_species_all, type=pa.int64()))
-        elif name == "presence_label":
-            arrays.append(pa.array(np.zeros(n_rows, dtype=np.int8), type=pa.int8()))
-        elif name == "sample_weight":
-            arrays.append(pa.array(sample_weights, type=pa.float32()))
-        elif name == "source":
-            arrays.append(pa.array(["generated_background"] * n_rows, type=pa.string()))
-        else:
-            arrays.append(sampled.column(name))
+    for start in range(0, donor_indices_all.shape[0], output_rows_per_shard):
+        end = min(start + output_rows_per_shard, donor_indices_all.shape[0])
+        shard_donor_indices = donor_indices_all[start:end]
+        shard_target_species = target_species_all[start:end]
+        shard_sample_weights = sample_weights[start:end]
 
-    return pa.Table.from_arrays(arrays, names=names)
+        take_indices = pa.array(shard_donor_indices, type=pa.int64())
+        sampled = split_table.take(take_indices)
+
+        n_rows = sampled.num_rows
+        arrays: list[pa.Array] = []
+        names = sampled.schema.names
+        for name in names:
+            if name == "sample_id":
+                arrays.append(pa.array([str(uuid.uuid4()) for _ in range(n_rows)], type=pa.string()))
+            elif name == "observation_id":
+                arrays.append(pa.array([None] * n_rows, type=pa.string()))
+            elif name == "species_key":
+                arrays.append(pa.array(shard_target_species, type=pa.int64()))
+            elif name == "presence_label":
+                arrays.append(pa.array(np.zeros(n_rows, dtype=np.int8), type=pa.int8()))
+            elif name == "sample_weight":
+                arrays.append(pa.array(shard_sample_weights, type=pa.float32()))
+            elif name == "source":
+                arrays.append(pa.array(["generated_background"] * n_rows, type=pa.string()))
+            else:
+                arrays.append(sampled.column(name))
+
+        yield pa.Table.from_arrays(arrays, names=names)
 
 
 def generate_pooled_background_shards(
@@ -198,6 +209,7 @@ def generate_pooled_background_shards(
     staging_dir: Path,
     background_ratio: float,
     split_chunk_rows: int,
+    output_rows_per_shard: int,
 ) -> tuple[list[Path], int]:
     """Generate unlabeled rows from pooled other-species positives per split.
 
@@ -217,7 +229,7 @@ def generate_pooled_background_shards(
         scanner = dataset.scanner(
             filter=pc.field("split") == split_name,
             use_threads=True,
-            batch_size=65_536,
+            batch_size=BACKGROUND_SCAN_BATCH_ROWS,
         )
         split_generated_rows = 0
         split_generated_shards = 0
@@ -237,19 +249,24 @@ def generate_pooled_background_shards(
                 return 0, shard_index
 
             chunk_table = pa.Table.from_batches(batches)
-            background_table = _build_background_table_for_split(
+            rows_written = 0
+            next_shard_index = shard_index
+            for background_table in _iter_background_tables_for_split(
                 chunk_table,
                 split_name=split_name,
                 background_ratio=background_ratio,
                 rng=rng,
-            )
-            if background_table is None or background_table.num_rows == 0:
-                return 0, shard_index
+                output_rows_per_shard=output_rows_per_shard,
+            ):
+                if background_table.num_rows == 0:
+                    continue
+                out_path = staging_dir / f"background_pooled_{split_name}_{next_shard_index:05d}.parquet"
+                pq.write_table(background_table, out_path, compression="zstd")
+                generated_paths.append(out_path)
+                rows_written += int(background_table.num_rows)
+                next_shard_index += 1
 
-            out_path = staging_dir / f"background_pooled_{split_name}_{shard_index:05d}.parquet"
-            pq.write_table(background_table, out_path, compression="zstd")
-            generated_paths.append(out_path)
-            return int(background_table.num_rows), shard_index + 1
+            return rows_written, next_shard_index
 
         for batch in scanner.to_batches():
             if batch.num_rows == 0:
@@ -295,6 +312,57 @@ def clear_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _list_parquet_files(root: Path) -> list[Path]:
+    """Return all parquet files below a dataset root in deterministic order."""
+    return sorted(path for path in root.rglob("*.parquet") if path.is_file())
+
+
+def _verify_parquet_dataset(root: Path) -> tuple[int, int]:
+    """Validate that every parquet file under ``root`` has a readable footer."""
+    parquet_files = _list_parquet_files(root)
+    if not parquet_files:
+        raise RuntimeError(f"Final write produced no parquet files under {root}")
+
+    invalid_files: list[str] = []
+    total_rows = 0
+    for path in parquet_files:
+        try:
+            parquet_file = pq.ParquetFile(path)
+            metadata = getattr(parquet_file, "metadata", None)
+            num_rows = getattr(metadata, "num_rows", None)
+            if num_rows is None:
+                raise RuntimeError(f"Parquet file metadata missing num_rows: {path}")
+            total_rows += int(num_rows)
+        except Exception as exc:
+            invalid_files.append(f"{path}: {exc}")
+
+    if invalid_files:
+        sample = "\n".join(f"  - {item}" for item in invalid_files[:20])
+        extra = ""
+        if len(invalid_files) > 20:
+            extra = f"\n  ... and {len(invalid_files) - 20} more"
+        raise RuntimeError(
+            f"Final parquet verification failed. The written dataset contains unreadable files:\n{sample}{extra}"
+        )
+
+    return len(parquet_files), total_rows
+
+
+def _publish_directory(temp_root: Path, output_root: Path) -> None:
+    """Swap a verified temp dataset into place without exposing partial output."""
+    backup_root = output_root.parent / f".{output_root.name}_backup_{uuid.uuid4().hex}"
+    try:
+        if output_root.exists():
+            output_root.rename(backup_root)
+        temp_root.rename(output_root)
+    except OSError:
+        if backup_root.exists() and not output_root.exists():
+            backup_root.rename(output_root)
+        raise
+    else:
+        clear_dir(backup_root)
+
+
 def print_failure_summary(failures: list[tuple[Path, str]], *, limit: int = 20) -> None:
     """Print a bounded summary of file-level failures."""
     if not failures:
@@ -306,35 +374,123 @@ def print_failure_summary(failures: list[tuple[Path, str]], *, limit: int = 20) 
         print(f"  ... and {len(failures) - limit} more")
 
 
+def _drop_partition_columns(table: pa.Table, partition_columns: set[str]) -> pa.Table:
+    names_to_keep = [name for name in table.schema.names if name not in partition_columns]
+    return table.select(names_to_keep)
+
+
+def _iter_split_tables(record_batch: pa.RecordBatch, split_values: tuple[str, ...]) -> tuple[tuple[str, pa.Table], ...]:
+    table = pa.Table.from_batches([record_batch])
+    outputs: list[tuple[str, pa.Table]] = []
+    split_column = table.column("split")
+    for split_name in split_values:
+        mask = pc.equal(split_column, split_name)
+        filtered = table.filter(mask)
+        if filtered.num_rows <= 0:
+            continue
+        outputs.append((split_name, _drop_partition_columns(filtered, {"split"})))
+    return tuple(outputs)
+
+
+class _SplitParquetSink:
+    """Write one split into sequential parquet part files capped by row count."""
+
+    def __init__(self, split_root: Path, *, max_rows_per_file: int) -> None:
+        self.split_root = split_root
+        self.max_rows_per_file = max(1, int(max_rows_per_file))
+        self.split_root.mkdir(parents=True, exist_ok=True)
+        self._writer: pq.ParquetWriter | None = None
+        self._schema: pa.Schema | None = None
+        self._file_index = 0
+        self._rows_in_current_file = 0
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+    def _next_path(self) -> Path:
+        path = self.split_root / f"part-{self._file_index:05d}.parquet"
+        self._file_index += 1
+        return path
+
+    def _ensure_writer(self, schema: pa.Schema) -> None:
+        if self._writer is not None:
+            return
+        if self._schema is None:
+            self._schema = schema
+        writer_path = self._next_path()
+        self._writer = pq.ParquetWriter(writer_path, self._schema)
+        self._rows_in_current_file = 0
+
+    def write_table(self, table: pa.Table) -> None:
+        if table.num_rows <= 0:
+            return
+        if self._schema is None:
+            self._schema = table.schema
+
+        start = 0
+        while start < table.num_rows:
+            if self._writer is None or self._rows_in_current_file >= self.max_rows_per_file:
+                self.close()
+                self._ensure_writer(table.schema)
+
+            remaining = self.max_rows_per_file - self._rows_in_current_file
+            slice_len = min(remaining, table.num_rows - start)
+            piece = table.slice(start, slice_len)
+            self._writer.write_table(piece, row_group_size=min(self.max_rows_per_file, piece.num_rows))
+            self._rows_in_current_file += slice_len
+            start += slice_len
+
+
 def write_partitioned_dataset(
     shard_paths: list[Path],
     output_root: Path,
     max_rows_per_file: int,
+    metadata_payloads: dict[str, object] | None = None,
 ) -> None:
     """Write staging shards into a split-partitioned hive-style parquet dataset."""
-    output_root.mkdir(parents=True, exist_ok=True)
+    temp_root = output_root.parent / f".{output_root.name}_write_{uuid.uuid4().hex}"
+    clear_dir(temp_root)
+    temp_root.mkdir(parents=True, exist_ok=True)
 
-    partition_schema = pa.schema([pa.field("split", pa.string())])
+    split_names = ("train", "val", "test")
+    sinks = {
+        split_name: _SplitParquetSink(temp_root / f"split={split_name}", max_rows_per_file=max_rows_per_file)
+        for split_name in split_names
+    }
 
     heartbeat_stop, heartbeat_thread = start_phase_heartbeat("Final write", PROGRESS_INTERVAL_SECONDS)
     try:
-        staged_dataset = ds.dataset(shard_paths, format="parquet")
-        ds.write_dataset(
-            data=staged_dataset,
-            base_dir=output_root,
-            format="parquet",
-            partitioning=ds.partitioning(partition_schema, flavor="hive"),
-            basename_template="part-{i}.parquet",
-            max_rows_per_file=max_rows_per_file,
-            max_rows_per_group=max_rows_per_file,
-            max_open_files=512,
-            max_partitions=8192,
-            use_threads=FINAL_WRITE_USE_THREADS,
-            existing_data_behavior="overwrite_or_ignore",
-        )
+        for shard_index, shard_path in enumerate(shard_paths, start=1):
+            if shard_index % 1000 == 0 or shard_index == len(shard_paths):
+                print(f"Final write progress | source shards: {shard_index:,}/{len(shard_paths):,}")
+
+            parquet_file = pq.ParquetFile(shard_path)
+            for record_batch in parquet_file.iter_batches(batch_size=FINAL_WRITE_SCAN_BATCH_ROWS, use_threads=False):
+                for split_name, split_table in _iter_split_tables(record_batch, split_names):
+                    sinks[split_name].write_table(split_table)
+        if metadata_payloads:
+            meta_root = temp_root / "_meta"
+            meta_root.mkdir(parents=True, exist_ok=True)
+            for relative_path, payload in metadata_payloads.items():
+                target_path = temp_root / relative_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(target_path, "w") as handle:
+                    json.dump(payload, handle, indent=2)
     finally:
+        for sink in sinks.values():
+            sink.close()
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2.0)
+
+    try:
+        file_count, row_count = _verify_parquet_dataset(temp_root)
+        print(f"Final write verification passed | files: {file_count:,} | rows: {row_count:,}")
+        _publish_directory(temp_root, output_root)
+    except Exception:
+        clear_dir(temp_root)
+        raise
 
 
 def start_phase_heartbeat(label: str, interval_seconds: float) -> tuple[threading.Event, threading.Thread]:
@@ -362,7 +518,6 @@ def run_preprocess(args) -> int:
         staging_dir = output_root.parent / f".{output_root.name}_staging"
 
     if args.overwrite_output:
-        clear_dir(output_root)
         clear_dir(staging_dir)
 
     if not input_root.exists():
@@ -417,15 +572,13 @@ def run_preprocess(args) -> int:
     print(f"Feature template sizes | {format_feature_group_counts(feature_template)}")
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
 
-    output_root.mkdir(parents=True, exist_ok=True)
-    meta_dir = output_root / "_meta"
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    template_json_path = meta_dir / "feature_template.json"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_meta_dir = staging_dir / "_meta"
+    staging_meta_dir.mkdir(parents=True, exist_ok=True)
+    template_json_path = staging_meta_dir / "feature_template.json"
     with open(template_json_path, "w") as _ft_fh:
         json.dump(feature_template_dict(feature_template), _ft_fh, indent=2)
     print(f"Saved feature template to {template_json_path}")
-
-    staging_dir.mkdir(parents=True, exist_ok=True)
 
     written = 0
     staged_paths: list[Path] = []
@@ -532,6 +685,7 @@ def run_preprocess(args) -> int:
             staging_dir=staging_dir,
             background_ratio=args.background_ratio,
             split_chunk_rows=args.background_split_chunk_rows,
+            output_rows_per_shard=max(1, int(args.max_rows_per_file)),
         )
         staged_paths.extend(background_paths)
         written += int(background_rows)
@@ -541,6 +695,12 @@ def run_preprocess(args) -> int:
             f"shards: {len(background_paths):,} | duration: {bg_seconds:.1f}s"
         )
 
+    uncatalogued_summary = get_uncatalogued_summary()
+    metadata_payloads = {
+        "_meta/feature_template.json": feature_template_dict(feature_template),
+        "_meta/uncatalogued_columns.json": uncatalogued_summary,
+    }
+
     print(f"Starting final dataset write from staging: {staging_dir}")
     write_start = time.perf_counter()
     print(f"Final write | shards: {len(staged_paths):,}")
@@ -548,6 +708,7 @@ def run_preprocess(args) -> int:
         staged_paths,
         output_root=output_root,
         max_rows_per_file=args.max_rows_per_file,
+        metadata_payloads=metadata_payloads,
     )
     write_seconds = time.perf_counter() - write_start
 
@@ -557,12 +718,8 @@ def run_preprocess(args) -> int:
     print(f"Static context merged rows: {static_join_rows_total:,}")
     print(f"Temporal context merged rows: {temporal_join_rows_total:,}")
     print(f"Final write duration: {write_seconds:.1f}s")
-
-    uncatalogued_summary = get_uncatalogued_summary()
-    uncatalogued_summary_path = meta_dir / "uncatalogued_columns.json"
-    with open(uncatalogued_summary_path, "w") as handle:
-        json.dump(uncatalogued_summary, handle, indent=2)
-    print(f"Saved uncatalogued column summary to {uncatalogued_summary_path}")
+    print(f"Saved feature template to {output_root / '_meta' / 'feature_template.json'}")
+    print(f"Saved uncatalogued column summary to {output_root / '_meta' / 'uncatalogued_columns.json'}")
 
     if failures:
         print_failure_summary(failures)

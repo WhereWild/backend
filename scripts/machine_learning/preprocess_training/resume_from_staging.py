@@ -24,13 +24,11 @@ normalize_feature_template = _feature_contract.normalize_feature_template
 
 try:
     from .pipeline import (
-        clear_dir,
         generate_pooled_background_shards,
         write_partitioned_dataset,
     )
 except ImportError:
     from pipeline import (  # type: ignore[no-redef]
-        clear_dir,
         generate_pooled_background_shards,
         write_partitioned_dataset,
     )
@@ -41,8 +39,36 @@ except ImportError:
     from transform import classify_feature_name, is_numeric_arrow_type  # type: ignore[no-redef]
 
 
+DEFAULT_MAX_ROWS_PER_FILE = 150_000
+DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 250_000
+
+
 def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
     return {group: len(template.get(group, [])) for group in FEATURE_GROUPS}
+
+
+def _normalize_template_payload(raw: dict[str, Any]) -> dict[str, list[str]]:
+    """Normalize modern or legacy feature-template payloads to current groups."""
+    template = normalize_feature_template(raw)
+    if any(_template_counts(template).values()):
+        return template
+
+    legacy = empty_feature_template()
+    for legacy_group in ("env", "habitat", "weather"):
+        values = raw.get(legacy_group, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, str) or not value:
+                continue
+            group = classify_feature_name(value)
+            if group is None:
+                group = "other"
+            legacy[group].append(value)
+
+    for group in FEATURE_GROUPS:
+        legacy[group] = sorted(set(legacy[group]))
+    return legacy
 
 
 def _format_feature_dims(dims: dict[str, int] | None) -> str:
@@ -148,6 +174,7 @@ def _find_matching_template_in_sibling_datasets(
     for search_root in search_roots:
         candidates.extend(sorted(search_root.glob("species_observation*/_meta/feature_template.json")))
 
+    normalized_candidates: list[dict[str, list[str]]] = []
     for candidate in candidates:
         try:
             if candidate.resolve() == target_meta:
@@ -157,9 +184,27 @@ def _find_matching_template_in_sibling_datasets(
         template = _read_existing_template(candidate)
         if template is None:
             continue
+        normalized_candidates.append(template)
         if _template_matches_dims(template, dims):
             return template
-    return None
+
+    if dims is None:
+        return None
+
+    composed = empty_feature_template()
+    for group in FEATURE_GROUPS:
+        expected = int(dims.get(group, 0))
+        if expected <= 0:
+            continue
+        for candidate in normalized_candidates:
+            values = list(candidate.get(group, []))
+            if len(values) == expected:
+                composed[group] = values
+                break
+        else:
+            return None
+
+    return composed
 
 
 def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
@@ -170,8 +215,18 @@ def _read_existing_template(template_path: Path) -> dict[str, list[str]] | None:
             raw: dict[str, Any] = json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
-    template = normalize_feature_template(raw)
+    template = _normalize_template_payload(raw)
     return template if any(_template_counts(template).values()) else None
+
+
+def _read_json_payload(path: Path) -> Any | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _write_feature_template_from_output(output_root: Path) -> Path:
@@ -285,13 +340,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--background-split-chunk-rows",
         type=int,
-        default=2_000_000,
+        default=DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS,
         help="Row cap per split chunk during pooled background generation.",
     )
     parser.add_argument(
         "--max-rows-per-file",
         type=int,
-        default=250_000,
+        default=DEFAULT_MAX_ROWS_PER_FILE,
         help="Max rows per output parquet file in final dataset.",
     )
     parser.add_argument(
@@ -340,12 +395,14 @@ def main() -> int:
 
     output_root = args.output_root.resolve()
 
-    if not any([
-        args.resume_base_files,
-        args.resume_background_files,
-        args.resume_output_files,
-        args.resume_feature_template_file,
-    ]):
+    if not any(
+        [
+            args.resume_base_files,
+            args.resume_background_files,
+            args.resume_output_files,
+            args.resume_feature_template_file,
+        ]
+    ):
         print(
             "No resume actions requested. "
             "Use one or more of: --resume-base-files, --resume-background-files, "
@@ -424,6 +481,7 @@ def main() -> int:
             staging_dir=staging_dir,
             background_ratio=args.background_ratio,
             split_chunk_rows=args.background_split_chunk_rows,
+            output_rows_per_shard=max(1, int(args.max_rows_per_file)),
         )
         print(
             f"Background generation complete | rows: {generated_background_rows:,} | shards: {len(background_paths):,}"
@@ -441,13 +499,19 @@ def main() -> int:
                 "Add --resume-base-files and/or --resume-background-files."
             )
 
-        clear_dir(output_root)
-
         print(f"Starting final dataset write | shards: {len(final_paths):,}")
+        metadata_payloads: dict[str, object] = {}
+        existing_feature_template = _read_json_payload(output_root / "_meta" / "feature_template.json")
+        if existing_feature_template is not None:
+            metadata_payloads["_meta/feature_template.json"] = existing_feature_template
+        existing_uncatalogued = _read_json_payload(output_root / "_meta" / "uncatalogued_columns.json")
+        if existing_uncatalogued is not None:
+            metadata_payloads["_meta/uncatalogued_columns.json"] = existing_uncatalogued
         write_partitioned_dataset(
             final_paths,
             output_root=output_root,
             max_rows_per_file=args.max_rows_per_file,
+            metadata_payloads=metadata_payloads or None,
         )
         print(f"Final dataset written to {output_root}")
 
