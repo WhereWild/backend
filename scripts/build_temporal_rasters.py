@@ -347,8 +347,12 @@ def _accumulate(model: str, var: str, start_ts: float, end_ts: float,
         ny, nx, _ = root.shape
         if native_acc is None:
             native_acc = np.zeros((ny, nx), dtype=np.float64)
-        slice_data = root.read_array((slice(0, ny), slice(0, nx), slice(t0, t1)))
-        native_acc += np.nansum(slice_data, axis=2)
+        # Read in 24-step slices to cap peak memory per thread to ~600MB (ERA5-land)
+        step = 24
+        for ts in range(t0, t1, step):
+            te = min(ts + step, t1)
+            slice_data = root.read_array((slice(0, ny), slice(0, nx), slice(ts, te)))
+            native_acc += np.nansum(slice_data, axis=2)
         n_hours += (t1 - t0)
 
     if native_acc is None:

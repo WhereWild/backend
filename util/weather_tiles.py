@@ -151,6 +151,7 @@ _cache: dict[str, np.ndarray] = {}                       # var_id → arr  (fore
 _forecast_cache: dict[int, dict[str, np.ndarray]] = {}   # forecast_hours → var_id → arr
 _cache_ref_times: dict[str, str] = {}                    # model → ref_time (current)
 _forecast_ref_times: dict[int, dict[str, str]] = {}      # forecast_hours → model → ref_time
+_cache_mtimes: dict[str, float] = {}                     # "fh:var_id" → mtime of current_*.npy
 _cache_lock = threading.Lock()
 _forecast_load_locks: dict[int, threading.Lock] = {}     # one lock per forecast offset
 _forecast_load_locks_lock = threading.Lock()             # protects the dict above
@@ -206,10 +207,11 @@ def _populate_cache_from_hits(model: str, ref_time: str, disk_hits: dict[str, np
             arr = disk_hits.get(cfg.get("fetch_as", var_id))
             if arr is not None:
                 target[var_id] = arr
-                # Save current snapshot to disk so the API can read it without an in-memory cache
                 _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 suffix = f"__f{forecast_hours:03d}h" if forecast_hours else ""
-                np.save(_DISK_CACHE_DIR / f"current_{model}_{var_id}{suffix}.npy", arr)
+                p = _DISK_CACHE_DIR / f"current_{model}_{var_id}{suffix}.npy"
+                np.save(p, arr)
+                _cache_mtimes[f"{forecast_hours}:{var_id}"] = p.stat().st_mtime
         if forecast_hours == 0:
             _cache_ref_times[model] = ref_time
         else:
@@ -411,19 +413,31 @@ def render_weather_tile_bytes(variable_id: str, z: int, x: int, y: int,
     """Render a tile PNG for the current snapshot or a forecast offset.
     Reads from in-memory cache if warm, falls back to the current-snapshot disk file.
     """
+    cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
+    if cfg is None:
+        return None
+    suffix = f"__f{forecast_hours:03d}h" if forecast_hours else ""
+    disk_p = _DISK_CACHE_DIR / f"current_{cfg['model']}_{variable_id}{suffix}.npy"
+    mtime_key = f"{forecast_hours}:{variable_id}"
+    try:
+        disk_mtime = disk_p.stat().st_mtime
+    except FileNotFoundError:
+        disk_mtime = None
+
     with _cache_lock:
         arr = (_forecast_cache.get(forecast_hours, {}) if forecast_hours else _cache).get(variable_id)
-    if arr is None:
-        cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
-        if cfg is not None:
-            suffix = f"__f{forecast_hours:03d}h" if forecast_hours else ""
-            p = _DISK_CACHE_DIR / f"current_{cfg['model']}_{variable_id}{suffix}.npy"
-            if p.exists():
-                arr = np.load(p)
+        cached_mtime = _cache_mtimes.get(mtime_key)
+
+    if disk_mtime is not None and cached_mtime != disk_mtime:
+        arr = np.load(disk_p)
+        with _cache_lock:
+            target = _cache if forecast_hours == 0 else _forecast_cache.setdefault(forecast_hours, {})
+            target[variable_id] = arr
+            _cache_mtimes[mtime_key] = disk_mtime
+
     if arr is None:
         return None
 
-    cfg = LIVE_WEATHER_VARIABLES[variable_id]
     model_cfg = MODEL_CONFIGS[cfg["model"]]
     ny, nx = arr.shape
 
