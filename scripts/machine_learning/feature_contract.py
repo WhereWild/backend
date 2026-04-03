@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-FEATURE_GROUPS = ("bioclimate", "landclass", "terrain", "edaphic", "temporal", "other")
-SAMPLED_FEATURE_GROUPS = ("bioclimate", "landclass", "terrain", "edaphic")
+FEATURE_GROUPS = ("bioclimate", "landclass", "terrain", "temporal", "other")
+SAMPLED_FEATURE_GROUPS = ("bioclimate", "landclass", "terrain")
 UNSAMPLED_FEATURE_GROUPS = ("temporal", "other")
 
 FEATURE_COLUMNS = tuple(f"{group}_features" for group in FEATURE_GROUPS)
@@ -14,6 +14,17 @@ MASK_COLUMNS = tuple(f"{group}_missing_mask" for group in FEATURE_GROUPS)
 GROUP_TO_FEATURE_COLUMN = dict(zip(FEATURE_GROUPS, FEATURE_COLUMNS, strict=True))
 GROUP_TO_MASK_COLUMN = dict(zip(FEATURE_GROUPS, MASK_COLUMNS, strict=True))
 FEATURE_COLUMN_TO_GROUP = dict(zip(FEATURE_COLUMNS, FEATURE_GROUPS, strict=True))
+
+
+def classify_catalog_layer_group(*, layer_id: str, category_name: str) -> str | None:
+    """Map a catalog layer to the ML feature group contract.
+
+    The active ML grouping follows the catalog's category layout directly.
+    """
+    normalized_category = str(category_name).strip().lower()
+    if normalized_category in FEATURE_GROUPS:
+        return normalized_category
+    return None
 
 
 def empty_feature_template() -> dict[str, list[str]]:

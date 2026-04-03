@@ -267,7 +267,6 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
         bioclimate_dim = len(_feature_names.get("bioclimate", []))
         landclass_dim = len(_feature_names.get("landclass", []))
         terrain_dim = len(_feature_names.get("terrain", []))
-        edaphic_dim = len(_feature_names.get("edaphic", []))
         temporal_dim = len(_feature_names.get("temporal", []))
         other_dim = len(_feature_names.get("other", []))
         return (
@@ -275,7 +274,7 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
             "bundle sampled feature template is empty "
             "("
             f"bioclimate={bioclimate_dim}, landclass={landclass_dim}, terrain={terrain_dim}, "
-            f"edaphic={edaphic_dim}, temporal={temporal_dim}, other={other_dim}"
+            f"temporal={temporal_dim}, other={other_dim}"
             ")",
         )
 

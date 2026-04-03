@@ -37,8 +37,10 @@ MASK_COLUMNS = import_local_symbol("data", "MASK_COLUMNS")
 _list_column_to_2d_numpy = import_local_symbol("data", "_list_column_to_2d_numpy")
 _feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
+classify_catalog_layer_group = _feature_contract.classify_catalog_layer_group
 format_feature_group_counts = _feature_contract.format_feature_group_counts
 normalize_feature_template = _feature_contract.normalize_feature_template
+classify_feature_name = import_module("scripts.machine_learning.preprocess_training.transform").classify_feature_name
 
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
@@ -139,7 +141,22 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         if template_path.exists():
             with open(template_path) as f:
                 raw = json.load(f)
-            return normalize_feature_template(raw)
+            template = normalize_feature_template(raw)
+            if any(len(values) for values in template.values()):
+                return template
+
+            rebuilt = {group: set[str]() for group in FEATURE_GROUPS}
+            for values in raw.values():
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    if not isinstance(value, str) or not value:
+                        continue
+                    group = classify_feature_name(value)
+                    if group is None:
+                        group = "other"
+                    rebuilt[group].add(value)
+            return {group: sorted(values) for group, values in rebuilt.items()}
 
     # Fallback: derive from the GIS catalog using the same classification rules
     # the preprocessing pipeline uses.
@@ -161,14 +178,16 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
                 lid = layer.get("id")
                 if not isinstance(lid, str) or not lid:
                     continue
-                category_name = str(category.get("name", "")).strip().lower()
-                if category_name in grouped:
-                    grouped[category_name].add(lid)
+                feature_group = classify_catalog_layer_group(
+                    layer_id=lid,
+                    category_name=str(category.get("name", "")).strip().lower(),
+                )
+                if feature_group in grouped:
+                    grouped[feature_group].add(lid)
         return {
             "bioclimate": sorted(grouped["bioclimate"]),
             "landclass": sorted(grouped["landclass"]),
             "terrain": sorted(grouped["terrain"]),
-            "edaphic": sorted(grouped["edaphic"]),
             "temporal": sorted(grouped["temporal"]),
             "other": [],
         }

@@ -54,9 +54,8 @@ def _normalize_template_payload(raw: dict[str, Any]) -> dict[str, list[str]]:
         return template
 
     legacy = empty_feature_template()
-    for legacy_group in ("env", "habitat", "weather"):
-        values = raw.get(legacy_group, [])
-        if not isinstance(values, list):
+    for group_name, values in raw.items():
+        if group_name in FEATURE_GROUPS or not isinstance(values, list):
             continue
         for value in values:
             if not isinstance(value, str) or not value:
@@ -122,34 +121,19 @@ def _load_catalog_feature_template() -> dict[str, list[str]] | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    bioclimate: set[str] = set()
-    landclass: set[str] = set()
-    terrain: set[str] = set()
-    edaphic: set[str] = set()
-    temporal: set[str] = set()
+    grouped: dict[str, set[str]] = {group: set() for group in FEATURE_GROUPS if group != "other"}
     for category in catalog.get("categories", []):
         for layer in category.get("layers", []):
             layer_id = layer.get("id")
             if not isinstance(layer_id, str) or not layer_id:
                 continue
             group = classify_feature_name(layer_id)
-            if group == "bioclimate":
-                bioclimate.add(layer_id)
-            elif group == "landclass":
-                landclass.add(layer_id)
-            elif group == "terrain":
-                terrain.add(layer_id)
-            elif group == "edaphic":
-                edaphic.add(layer_id)
-            elif group == "temporal":
-                temporal.add(layer_id)
+            if group in grouped:
+                grouped[group].add(layer_id)
 
     template = empty_feature_template()
-    template["bioclimate"] = sorted(bioclimate)
-    template["landclass"] = sorted(landclass)
-    template["terrain"] = sorted(terrain)
-    template["edaphic"] = sorted(edaphic)
-    template["temporal"] = sorted(temporal)
+    for group_name, values in grouped.items():
+        template[group_name] = sorted(values)
     return template if any(_template_counts(template).values()) else None
 
 
@@ -235,33 +219,18 @@ def _write_feature_template_from_output(output_root: Path) -> Path:
     schema = dataset.schema
     feature_dims = _feature_dims_from_vectors(dataset)
 
-    bioclimate: set[str] = set()
-    landclass: set[str] = set()
-    terrain: set[str] = set()
-    edaphic: set[str] = set()
-    temporal: set[str] = set()
+    grouped: dict[str, set[str]] = {group: set() for group in FEATURE_GROUPS if group != "other"}
 
     for field in schema:
         if not is_numeric_arrow_type(field.type):
             continue
         group = classify_feature_name(field.name)
-        if group == "bioclimate":
-            bioclimate.add(field.name)
-        elif group == "landclass":
-            landclass.add(field.name)
-        elif group == "terrain":
-            terrain.add(field.name)
-        elif group == "edaphic":
-            edaphic.add(field.name)
-        elif group == "temporal":
-            temporal.add(field.name)
+        if group in grouped:
+            grouped[group].add(field.name)
 
     rebuilt_template = empty_feature_template()
-    rebuilt_template["bioclimate"] = sorted(bioclimate)
-    rebuilt_template["landclass"] = sorted(landclass)
-    rebuilt_template["terrain"] = sorted(terrain)
-    rebuilt_template["edaphic"] = sorted(edaphic)
-    rebuilt_template["temporal"] = sorted(temporal)
+    for group_name, values in grouped.items():
+        rebuilt_template[group_name] = sorted(values)
 
     meta_dir = output_root / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)

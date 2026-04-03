@@ -58,6 +58,7 @@ _feature_contract = import_module("scripts.machine_learning._compat").import_fea
 FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
 GROUP_TO_FEATURE_COLUMN = _feature_contract.GROUP_TO_FEATURE_COLUMN
 GROUP_TO_MASK_COLUMN = _feature_contract.GROUP_TO_MASK_COLUMN
+classify_catalog_layer_group = _feature_contract.classify_catalog_layer_group
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,6 @@ class FeatureGroups:
     bioclimate: list[str]
     landclass: list[str]
     terrain: list[str]
-    edaphic: list[str]
     temporal: list[str]
     other: list[str]
 
@@ -86,7 +86,6 @@ class CatalogFeatureRules:
     bioclimate_exact: frozenset[str]
     landclass_exact: frozenset[str]
     terrain_exact: frozenset[str]
-    edaphic_exact: frozenset[str]
     temporal_exact: frozenset[str]
     temporal_prefixes: tuple[str, ...]
 
@@ -280,7 +279,6 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
     bioclimate_exact: set[str] = set()
     landclass_exact: set[str] = set()
     terrain_exact: set[str] = set()
-    edaphic_exact: set[str] = set()
     temporal_exact: set[str] = set()
     temporal_prefixes: set[str] = set()
 
@@ -299,34 +297,25 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
             if not layer_id:
                 continue
 
-            if category_name == "bioclimate":
+            feature_group = classify_catalog_layer_group(layer_id=layer_id, category_name=category_name)
+            if feature_group == "bioclimate":
                 bioclimate_exact.add(layer_id)
-            elif category_name == "landclass":
+            elif feature_group == "landclass":
                 landclass_exact.add(layer_id)
-            elif category_name == "terrain":
+            elif feature_group == "terrain":
                 terrain_exact.add(layer_id)
-            elif category_name == "temporal":
+            elif feature_group == "temporal":
                 temporal_exact.add(layer_id)
                 temporal_prefixes.add(f"{layer_id}_")
-            elif category_name == "edaphic":
-                edaphic_exact.add(layer_id)
-
     rules = CatalogFeatureRules(
         bioclimate_exact=frozenset(bioclimate_exact),
         landclass_exact=frozenset(landclass_exact),
         terrain_exact=frozenset(terrain_exact),
-        edaphic_exact=frozenset(edaphic_exact),
         temporal_exact=frozenset(temporal_exact),
         temporal_prefixes=tuple(sorted(temporal_prefixes)),
     )
 
-    if not (
-        rules.bioclimate_exact
-        or rules.landclass_exact
-        or rules.terrain_exact
-        or rules.edaphic_exact
-        or rules.temporal_exact
-    ):
+    if not (rules.bioclimate_exact or rules.landclass_exact or rules.terrain_exact or rules.temporal_exact):
         raise ValueError(f"GIS catalog produced no feature rules: {catalog_path}")
 
     return rules
@@ -590,9 +579,9 @@ def classify_feature_name(column_name: str) -> str | None:
         return "landclass"
     if name in catalog_rules.terrain_exact:
         return "terrain"
-    if name in catalog_rules.edaphic_exact:
-        return "edaphic"
-    if name in catalog_rules.temporal_exact or any(name.startswith(prefix) for prefix in catalog_rules.temporal_prefixes):
+    if name in catalog_rules.temporal_exact or any(
+        name.startswith(prefix) for prefix in catalog_rules.temporal_prefixes
+    ):
         return "temporal"
 
     return None
@@ -618,7 +607,6 @@ def build_feature_template(
     bioclimate: set[str] = set()
     landclass: set[str] = set()
     terrain: set[str] = set()
-    edaphic: set[str] = set()
     temporal: set[str] = set()
     other: set[str] = set()
 
@@ -680,8 +668,6 @@ def build_feature_template(
                 landclass.add(field.name)
             elif feature_group == "terrain":
                 terrain.add(field.name)
-            elif feature_group == "edaphic":
-                edaphic.add(field.name)
             elif feature_group == "temporal":
                 temporal.add(field.name)
             elif field.name.lower() not in _EXCLUDED_FEATURE_COLUMNS_LOWER:
@@ -718,7 +704,6 @@ def build_feature_template(
         bioclimate=sorted(bioclimate),
         landclass=sorted(landclass),
         terrain=sorted(terrain),
-        edaphic=sorted(edaphic),
         temporal=sorted(temporal),
         other=sorted(other),
     )
@@ -826,10 +811,12 @@ def transform_frame(
 
     low_cell_warnings: list[str] = []
     if warn_min_cells_per_species > 0:
-        species_cells = pd.DataFrame({
-            "species_key": species_key.to_numpy(),
-            "cell_id": np.asarray(cell_ids, dtype=object),
-        })
+        species_cells = pd.DataFrame(
+            {
+                "species_key": species_key.to_numpy(),
+                "cell_id": np.asarray(cell_ids, dtype=object),
+            }
+        )
         min_cells = species_cells.groupby("species_key", sort=False)["cell_id"].nunique(dropna=True).astype(int)
         flagged = min_cells[min_cells < int(warn_min_cells_per_species)]
         for sp_key, cell_count in flagged.items():
