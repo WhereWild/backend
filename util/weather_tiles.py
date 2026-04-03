@@ -123,7 +123,7 @@ LIVE_WEATHER_VARIABLES: dict[str, dict] = {
 }
 
 # --- Disk cache ---
-_DISK_CACHE_DIR = Path("/tmp/wherewild_weather_cache")
+_DISK_CACHE_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "cache"
 
 
 def _disk_path(model: str, ref_time: str, var_id: str, forecast_hours: int = 0) -> Path:

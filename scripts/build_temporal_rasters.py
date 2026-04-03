@@ -66,7 +66,8 @@ MODELS: dict[str, dict] = {
 }
 
 WGS84   = CRS.from_epsg(4326)
-OUT_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
+OUT_DIR    = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
+CHUNK_DIR  = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "chunks"
 
 WINDOW_HOURS  = [1, 8, 24, 72, 168, 720, 2160]
 WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
@@ -141,7 +142,8 @@ def _chunk_lock(local: str) -> threading.Lock:
 
 def _download_chunk(chunk_name: str, model: str, var: str) -> str:
     short = model.replace("copernicus_", "")
-    local = f"/tmp/{short}_{var}_{chunk_name}"
+    CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+    local = str(CHUNK_DIR / f"{short}_{var}_{chunk_name}")
     if os.path.exists(local):
         return local
     with _chunk_lock(local):
@@ -647,7 +649,7 @@ def _cleanup_stale_chunks(needed_chunks: set[str], indexed_prefixes: set[str]) -
     accidentally delete chunks for vars we didn't process).
     """
     removed = 0
-    for path in Path("/tmp").glob("*_chunk_*.om"):
+    for path in CHUNK_DIR.glob("*_chunk_*.om"):
         name = path.name
         idx = name.find("_chunk_")
         if idx == -1:
