@@ -500,12 +500,8 @@ def render_aggregate_tile_bytes(variable_id: str, window: str, z: int, x: int, y
 
     arr = np.load(npy_path)  # [721, 1440], ERA5 grid, lat ascending
     cfg = LIVE_WEATHER_VARIABLES.get(variable_id)
-    if cfg is None or cfg.get("categorical"):
+    if cfg is None:
         return None
-
-    overrides = _AGG_RANGE_OVERRIDES.get(variable_id, {}).get(window, {})
-    lo = overrides.get("lo", cfg["lo"])
-    hi = overrides.get("hi", cfg["hi"])
 
     ny, nx = arr.shape
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
@@ -522,11 +518,25 @@ def render_aggregate_tile_bytes(variable_id: str, window: str, z: int, x: int, y
         dst_transform=rasterio_from_bounds(minx, miny, maxx, maxy, tile_size, tile_size),
         dst_crs=CRS.from_string(WEB_MERCATOR),
         dst_nodata=np.nan,
-        resampling=RasterioResampling.bilinear,
+        resampling=RasterioResampling.nearest if cfg.get("categorical") else RasterioResampling.bilinear,
     )
 
-    rgba = _colorize(dest, cfg["stops"], lo, hi)
-    rgba[~np.isfinite(dest), 3] = 0
+    if cfg.get("categorical"):
+        rgba = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
+        for code, rgb in _WEATHER_CODE_COLORS.items():
+            mask = (dest == code)
+            rgba[mask, 0] = rgb[0]
+            rgba[mask, 1] = rgb[1]
+            rgba[mask, 2] = rgb[2]
+            rgba[mask, 3] = 210
+        rgba[~np.isfinite(dest), 3] = 0
+    else:
+        overrides = _AGG_RANGE_OVERRIDES.get(variable_id, {}).get(window, {})
+        lo = overrides.get("lo", cfg["lo"])
+        hi = overrides.get("hi", cfg["hi"])
+        rgba = _colorize(dest, cfg["stops"], lo, hi)
+        rgba[~np.isfinite(dest), 3] = 0
+
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")

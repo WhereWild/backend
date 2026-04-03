@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -69,6 +71,8 @@ OUT_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
 WINDOW_HOURS  = [1, 8, 24, 72, 168, 720, 2160]
 WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
 FORECAST_HOURS = [1, 8, 24, 72, 168]
+
+WC_CODES = [0, 1, 2, 3, 51, 53, 55, 61, 63, 65, 71, 73, 75]
 
 VAR_CONFIGS: dict[str, dict] = {
     "temperature_2m": {
@@ -119,23 +123,40 @@ VAR_CONFIGS: dict[str, dict] = {
         "gfs_var":    "snowfall_water_equivalent",
         "agg": "sum",
     },
+    "weather_code_simple": {
+        "era5_model": "copernicus_era5",  # uses era5 vars for cloud/precip/snow
+        "agg": "mode",
+        "gfs_needs": ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+        "era5_needs": ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+    },
 }
 
 # ── S3 / download helpers ─────────────────────────────────────────────────────
 
 fs = fsspec.filesystem("s3", anon=True)
 
+_chunk_dl_locks: dict[str, threading.Lock] = {}
+_chunk_dl_locks_mu = threading.Lock()
+
+def _chunk_lock(local: str) -> threading.Lock:
+    with _chunk_dl_locks_mu:
+        if local not in _chunk_dl_locks:
+            _chunk_dl_locks[local] = threading.Lock()
+        return _chunk_dl_locks[local]
+
 
 def _download_chunk(chunk_name: str, model: str, var: str) -> str:
     short = model.replace("copernicus_", "")
     local = f"/tmp/{short}_{var}_{chunk_name}"
-    if not os.path.exists(local):
-        s3 = f"{MODELS[model]['s3']}/{var}/{chunk_name}"
-        print(f"    dl {model}/{var}/{chunk_name} ...", end=" ", flush=True)
-        t0 = time.perf_counter()
-        fs.get(s3, local)
-        mb = os.path.getsize(local) / 1e6
-        print(f"done ({mb:.0f}MB, {time.perf_counter()-t0:.1f}s)", flush=True)
+    if os.path.exists(local):
+        return local
+    with _chunk_lock(local):
+        if not os.path.exists(local):  # recheck after acquiring lock
+            s3 = f"{MODELS[model]['s3']}/{var}/{chunk_name}"
+            print(f"    dl {model}/{var}/{chunk_name} ...", end=" ", flush=True)
+            fs.get(s3, local)
+            mb = os.path.getsize(local) / 1e6
+            print(f"done ({mb:.0f}MB)", flush=True)
     return local
 
 
@@ -144,7 +165,6 @@ def _reproject_to_output(arr: np.ndarray, model: str) -> np.ndarray:
     src = np.flipud(arr) if m["flipud"] else arr
     ny, nx = src.shape
     dest = np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32)
-    t0 = time.perf_counter()
     reproject(
         source=src, destination=dest,
         src_transform=rasterio_from_bounds(m["lon_min"], m["lat_min"], m["lon_max"], m["lat_max"], nx, ny),
@@ -153,7 +173,6 @@ def _reproject_to_output(arr: np.ndarray, model: str) -> np.ndarray:
         dst_crs=WGS84, dst_nodata=np.nan,
         resampling=Resampling.bilinear,
     )
-    print(f"      reproject {model} {src.shape}→{dest.shape}: {time.perf_counter()-t0:.2f}s", flush=True)
     return dest
 
 
@@ -168,6 +187,112 @@ def _derive_dew_point(T: np.ndarray, RH: np.ndarray) -> np.ndarray:
     RH_c  = np.clip(RH, 1.0, 100.0)
     gamma = np.log(RH_c / 100.0) + 17.625 * T / (243.04 + T)
     return (243.04 * gamma / (17.625 - gamma)).astype(np.float32)
+
+
+def _derive_weather_code_grid(cloud_cover: np.ndarray, precipitation: np.ndarray,
+                               snowfall_water_equivalent: np.ndarray) -> np.ndarray:
+    """Derive weather code grid from cloud cover, precipitation, and snowfall arrays.
+    All arrays must have the same shape representing one time step.
+    Returns integer weather code array matching the WC_CODES values.
+    """
+    code = np.full(cloud_cover.shape, 3, dtype=np.int32)
+    code[cloud_cover < 80] = 2
+    code[cloud_cover < 50] = 1
+    code[cloud_cover < 20] = 0
+    rain_rate = precipitation
+    code[rain_rate >= 0.01] = 51
+    code[rain_rate >= 0.5]  = 53
+    code[rain_rate >= 1.0]  = 55
+    code[rain_rate >= 1.3]  = 61
+    code[rain_rate >= 2.5]  = 63
+    code[rain_rate >= 7.6]  = 65
+    snow_rate = snowfall_water_equivalent / 10.0
+    code[snow_rate >= 0.01] = 71
+    code[snow_rate >= 0.2]  = 73
+    code[snow_rate >= 0.8]  = 75
+    return code
+
+
+def _accumulate_mode(model: str, start_ts: float, end_ts: float,
+                     resolution_s: float,
+                     cc_cidx: list, pr_cidx: list, sw_cidx: list,
+                     ) -> dict[str, np.ndarray]:
+    """Accumulate per-code-value counts for weather_code_simple mode aggregation.
+    Returns dict of {"wc_{code}": count_array} for each WC_CODE, on the ERA5 output grid.
+    """
+    counts: dict[str, np.ndarray] = {f"wc_{c}": np.zeros((ERA5_NY, ERA5_NX), dtype=np.int32)
+                                      for c in WC_CODES}
+
+    def _cidx_lookup(cidx: list, ts: float) -> tuple[str, float, float, int] | None:
+        """Find the chunk entry that contains timestamp ts."""
+        for entry in cidx:
+            chunk_name, chunk_start_ts, chunk_end_ts, time_len = entry
+            if chunk_start_ts <= ts <= chunk_end_ts:
+                return entry
+        return None
+
+    def _load_slice_at_ts(cidx: list, var: str, ts: float) -> np.ndarray | None:
+        """Load a single time step from the chunk containing ts. Returns None if not found."""
+        entry = _cidx_lookup(cidx, ts)
+        if entry is None:
+            return None
+        chunk_name, chunk_start_ts, chunk_end_ts, time_len = entry
+        t_idx = int(round((ts - chunk_start_ts) / resolution_s))
+        if t_idx < 0 or t_idx >= time_len:
+            return None
+        local = _download_chunk(chunk_name, model, var)
+        root = OmFileReader(local)
+        ny, nx, _ = root.shape
+        data = root.read_array((slice(0, ny), slice(0, nx), slice(t_idx, t_idx + 1)))
+        return data[:, :, 0]  # shape (ny, nx)
+
+    # Iterate over chunks in cc_cidx; for each overlapping time step load all 3 vars
+    for chunk_name, chunk_start_ts, chunk_end_ts, time_len in cc_cidx:
+        if chunk_end_ts < start_ts:
+            break
+        if chunk_start_ts > end_ts:
+            continue
+
+        t0_idx = max(0, int(round((max(chunk_start_ts, start_ts) - chunk_start_ts) / resolution_s)))
+        t1_idx = min(time_len, int(round((min(chunk_end_ts, end_ts) - chunk_start_ts) / resolution_s)) + 1)
+        if t1_idx <= t0_idx:
+            continue
+
+        # Load entire slice range for cloud_cover from this chunk
+        local_cc = _download_chunk(chunk_name, model, "cloud_cover")
+        root_cc = OmFileReader(local_cc)
+        ny, nx, _ = root_cc.shape
+        cc_slice = root_cc.read_array((slice(0, ny), slice(0, nx), slice(t0_idx, t1_idx)))
+
+        for i in range(t1_idx - t0_idx):
+            step_ts = chunk_start_ts + (t0_idx + i) * resolution_s
+            if step_ts < start_ts or step_ts > end_ts:
+                continue
+
+            cc_grid = cc_slice[:, :, i]
+
+            pr_grid = _load_slice_at_ts(pr_cidx, "precipitation", step_ts)
+            if pr_grid is None:
+                pr_grid = np.zeros((ny, nx), dtype=np.float32)
+
+            sw_grid = _load_slice_at_ts(sw_cidx, "snowfall_water_equivalent", step_ts)
+            if sw_grid is None:
+                sw_grid = np.zeros((ny, nx), dtype=np.float32)
+
+            code_grid = _derive_weather_code_grid(cc_grid, pr_grid, sw_grid)
+
+            # Reproject to ERA5 output grid if needed
+            if model != "copernicus_era5":
+                code_grid_f = _reproject_to_output(code_grid.astype(np.float32), model)
+                # Round back to nearest WC_CODE after reprojection
+                code_reprojected = np.round(code_grid_f).astype(np.int32)
+            else:
+                code_reprojected = code_grid
+
+            for c in WC_CODES:
+                counts[f"wc_{c}"] += (code_reprojected == c).astype(np.int32)
+
+    return counts
 
 
 # ── Chunk index ───────────────────────────────────────────────────────────────
@@ -226,9 +351,7 @@ def _accumulate(model: str, var: str, start_ts: float, end_ts: float,
         ny, nx, _ = root.shape
         if native_acc is None:
             native_acc = np.zeros((ny, nx), dtype=np.float64)
-        t_read = time.perf_counter()
         slice_data = root.read_array((slice(0, ny), slice(0, nx), slice(t0, t1)))
-        print(f"      read_array {chunk_name}[{t0}:{t1}] {slice_data.shape}: {time.perf_counter()-t_read:.2f}s", flush=True)
         native_acc += np.nansum(slice_data, axis=2)
         n_hours += (t1 - t0)
 
@@ -245,8 +368,15 @@ def _accumulate(model: str, var: str, start_ts: float, end_ts: float,
 def _compute_final(var_id: str, cfg: dict, sums: dict[str, np.ndarray],
                    n_era5: int, n_gfs: int) -> np.ndarray:
     agg     = cfg["agg"]
-    n_total = max(n_era5 + n_gfs, 1)
     zero    = np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32)
+
+    if agg == "mode":
+        counts = np.stack([sums.get(f"wc_{c}", np.zeros((ERA5_NY, ERA5_NX), dtype=np.int32))
+                           for c in WC_CODES], axis=0)
+        best_idx = np.argmax(counts, axis=0)
+        return np.array(WC_CODES, dtype=np.float32)[best_idx]
+
+    n_total = max(n_era5 + n_gfs, 1)
 
     if var_id == "vapor_pressure_deficit":
         T_e  = sums.get("era5_temperature_2m", zero) / max(n_era5, 1)
@@ -297,23 +427,26 @@ def _save_state(var_id: str, window_label: str, cfg: dict,
                 sums: dict[str, np.ndarray], meta: dict, suffix: str = "") -> None:
     npy_p, meta_p, sums_p = _state_paths(var_id, window_label, suffix)
     result = _compute_final(var_id, cfg, sums, meta["n_era5"], meta["n_gfs"])
-    t0 = time.perf_counter()
     np.save(npy_p, result)
     with open(meta_p, "w") as f:
         json.dump(meta, f, indent=2)
     np.savez(sums_p, **sums)
     print(f"  [{window_label:4s}] {meta['n_era5']}h ERA5 + {meta['n_gfs']}h GFS  "
-          f"range=[{result.min():.3f}, {result.max():.3f}]  → {npy_p.name}  (save {time.perf_counter()-t0:.2f}s)")
+          f"range=[{result.min():.3f}, {result.max():.3f}]  → {npy_p.name}")
 
 
 # ── ERA5 raw var lists ────────────────────────────────────────────────────────
 
 def _era5_raw_vars(cfg: dict) -> list[str]:
+    if "era5_needs" in cfg:
+        return list(cfg["era5_needs"])
     ev = cfg.get("era5_var")
     return ([ev] if ev else []) + cfg.get("era5_derived_needs", [])
 
 
 def _gfs_raw_vars(cfg: dict) -> list[str]:
+    if "gfs_needs" in cfg:
+        return list(cfg["gfs_needs"])
     gv = cfg.get("gfs_var")
     return ([gv] if gv else []) + cfg.get("gfs_derived_needs", [])
 
@@ -327,30 +460,76 @@ def _full_build(var_id: str, cfg: dict, window_h: int, window_label: str,
                 suffix: str = "") -> None:
     era5_model = cfg["era5_model"]
     w_start    = now_ts - window_h * 3600
+    agg        = cfg["agg"]
 
     sums: dict[str, np.ndarray] = {}
     n_era5_total = 0
+    n_gfs_total  = 0
 
-    for rv in _era5_raw_vars(cfg):
-        if rv not in era5_cidx:
-            continue
-        acc, n = _accumulate(era5_model, rv, w_start, era5_end_ts, resolution_s, era5_cidx[rv])
-        sums[f"era5_{rv}"] = acc
-        n_era5_total = max(n_era5_total, n)
+    if agg == "mode":
+        # ERA5 mode accumulation
+        cc_cidx = era5_cidx.get("cloud_cover", [])
+        pr_cidx = era5_cidx.get("precipitation", [])
+        sw_cidx = era5_cidx.get("snowfall_water_equivalent", [])
+        if cc_cidx:
+            era5_counts = _accumulate_mode(
+                era5_model, w_start, era5_end_ts, resolution_s,
+                cc_cidx, pr_cidx, sw_cidx,
+            )
+            for k, v in era5_counts.items():
+                sums[f"era5_{k}"] = v
+            # Estimate n_era5 from time range covered
+            n_era5_total = max(0, int(round((era5_end_ts - w_start) / resolution_s)))
+        else:
+            print(f"  [{window_label}] no ERA5 data, skipping")
+            return
 
-    if not sums:
-        print(f"  [{window_label}] no ERA5 data, skipping")
-        return
-
-    n_gfs_total = 0
-    for gv in _gfs_raw_vars(cfg):
-        if gv not in gfs_cidx:
-            continue
-        # GFS covers era5_end → gfs_end
+        # GFS mode accumulation
+        gfs_cc_cidx = gfs_cidx.get("cloud_cover", [])
+        gfs_pr_cidx = gfs_cidx.get("precipitation", [])
+        gfs_sw_cidx = gfs_cidx.get("snowfall_water_equivalent", [])
         gfs_start = max(era5_end_ts, w_start)
-        acc, n = _accumulate("ncep_gfs013", gv, gfs_start, gfs_end_ts, resolution_s, gfs_cidx[gv])
-        sums[f"gfs_{gv}"] = acc
-        n_gfs_total = max(n_gfs_total, n)
+        if gfs_cc_cidx and gfs_start < gfs_end_ts:
+            gfs_counts = _accumulate_mode(
+                "ncep_gfs013", gfs_start, gfs_end_ts, resolution_s,
+                gfs_cc_cidx, gfs_pr_cidx, gfs_sw_cidx,
+            )
+            for k, v in gfs_counts.items():
+                era5_key = f"era5_{k}"
+                gfs_key  = f"gfs_{k}"
+                sums[gfs_key] = v
+                # Merge GFS counts into unified wc_ counts (sum era5 + gfs counts)
+                sums[era5_key] = (sums.get(era5_key,
+                                            np.zeros((ERA5_NY, ERA5_NX), dtype=np.int32)) + v)
+            n_gfs_total = max(0, int(round((gfs_end_ts - gfs_start) / resolution_s)))
+
+        # For mode, sums stores unified wc_ counts (era5 + gfs combined) keyed as era5_wc_{code}
+        # Drop the separate gfs_wc_ keys since _compute_final only looks for wc_{code}
+        unified: dict[str, np.ndarray] = {}
+        for c in WC_CODES:
+            unified[f"wc_{c}"] = sums.get(f"era5_wc_{c}", np.zeros((ERA5_NY, ERA5_NX), dtype=np.int32))
+        sums = unified
+
+    else:
+        for rv in _era5_raw_vars(cfg):
+            if rv not in era5_cidx:
+                continue
+            acc, n = _accumulate(era5_model, rv, w_start, era5_end_ts, resolution_s, era5_cidx[rv])
+            sums[f"era5_{rv}"] = acc
+            n_era5_total = max(n_era5_total, n)
+
+        if not sums:
+            print(f"  [{window_label}] no ERA5 data, skipping")
+            return
+
+        for gv in _gfs_raw_vars(cfg):
+            if gv not in gfs_cidx:
+                continue
+            # GFS covers era5_end → gfs_end
+            gfs_start = max(era5_end_ts, w_start)
+            acc, n = _accumulate("ncep_gfs013", gv, gfs_start, gfs_end_ts, resolution_s, gfs_cidx[gv])
+            sums[f"gfs_{gv}"] = acc
+            n_gfs_total = max(n_gfs_total, n)
 
     meta = {
         "var_id": var_id, "window_h": window_h, "window_label": window_label,
@@ -370,10 +549,19 @@ def _incremental_update(var_id: str, cfg: dict, window_h: int, window_label: str
                         now_ts: float, era5_end_ts: float, gfs_end_ts: float,
                         resolution_s: float,
                         era5_cidx: dict[str, list], gfs_cidx: dict[str, list]) -> None:
+    agg        = cfg["agg"]
     era5_model = cfg["era5_model"]
     new_w_start = now_ts - window_h * 3600
     old_w_start = old_meta["era5_window_start_ts"]
     old_gfs_end = old_meta["gfs_end_ts"]
+
+    # Mode vars: counts can't be easily subtracted (weather code grids needed for drop),
+    # so always do a full rebuild for correctness.
+    if agg == "mode":
+        print(f"  [{window_label}] {var_id} mode var → full rebuild for correctness")
+        _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
+                    resolution_s, era5_cidx, gfs_cidx)
+        return
 
     # If ERA5 has advanced since last build, trigger a full rebuild for accuracy
     old_era5_end = old_meta["era5_end_ts"]
@@ -496,9 +684,17 @@ def build_forecast_aggregates(
         for var_id, cfg in var_configs.items():
             era5_cidx  = era5_cidx_by_var.get(var_id, {})
             era5_model = cfg["era5_model"]
+            agg        = cfg["agg"]
 
             for window_h, window_label in windows:
                 print(f"  [{window_label:4s}] {var_id} +{forecast_h}h ...", flush=True)
+
+                # Mode vars can't incrementally drop/add counts, always do a full build
+                if agg == "mode":
+                    _full_build(var_id, cfg, window_h, window_label,
+                                future_ts, era5_end_ts, gfs_end_for_fc,
+                                resolution_s, era5_cidx, gfs_cidx, suffix=suffix)
+                    continue
 
                 # Load the "now" state built in the main loop
                 now_sums, now_meta = _load_state(var_id, window_label)
@@ -572,6 +768,8 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
          force: bool = False) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    _main_start = time.perf_counter()
+
     var_configs = {k: v for k, v in VAR_CONFIGS.items()
                    if only_vars is None or k in only_vars}
     windows = [(h, WINDOW_LABELS[h]) for h in WINDOW_HOURS
@@ -588,7 +786,7 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
     with fs.open(f"{MODELS['ncep_gfs013']['s3']}/static/meta.json") as f:
         gfs_meta = json.load(f)
     gfs_chunk_length = int(gfs_meta.get("chunk_time_length", 481))
-    now_ts         = datetime.now(timezone.utc).timestamp()
+    now_ts         = round(datetime.now(timezone.utc).timestamp() / 3600) * 3600  # snap to hour
     gfs_data_end_ts = float(gfs_meta["data_end_time"])   # actual chunk anchor (may be future forecast)
     gfs_end_ts      = min(gfs_data_end_ts, now_ts)        # capped to now for accumulation bounds
 
@@ -655,26 +853,30 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
     _cleanup_stale_chunks(needed_chunks, indexed_prefixes)
 
     # ── Process windows shortest-first, all vars per window ──────────────────
+    def _process_var(var_id: str, cfg: dict, window_h: int, window_label: str) -> None:
+        era5_cidx = era5_cidx_by_var.get(var_id, {})
+        sums, old_meta = _load_state(var_id, window_label)
+        if force or sums is None:
+            print(f"  [{window_label}] {var_id} full build ...", flush=True)
+            _full_build(var_id, cfg, window_h, window_label,
+                        now_ts, era5_end_ts, gfs_end_ts, resolution_s,
+                        era5_cidx, gfs_cidx)
+        else:
+            hours_stale = (now_ts - old_meta["gfs_end_ts"]) / 3600
+            print(f"  [{window_label}] {var_id} incremental ({hours_stale:.1f}h stale) ...", flush=True)
+            _incremental_update(var_id, cfg, window_h, window_label,
+                                sums, old_meta,
+                                now_ts, era5_end_ts, gfs_end_ts, resolution_s,
+                                era5_cidx, gfs_cidx)
+
     for window_h, window_label in windows:
         print(f"\n=== window {window_label} ===")
-        for var_id, cfg in var_configs.items():
-            era5_cidx = era5_cidx_by_var.get(var_id, {})
-            sums, old_meta = _load_state(var_id, window_label)
-
-            _t = time.perf_counter()
-            if force or sums is None:
-                print(f"  [{window_label}] {var_id} full build ...", flush=True)
-                _full_build(var_id, cfg, window_h, window_label,
-                            now_ts, era5_end_ts, gfs_end_ts, resolution_s,
-                            era5_cidx, gfs_cidx)
-            else:
-                hours_stale = (now_ts - old_meta["gfs_end_ts"]) / 3600
-                print(f"  [{window_label}] {var_id} incremental ({hours_stale:.1f}h stale) ...", flush=True)
-                _incremental_update(var_id, cfg, window_h, window_label,
-                                    sums, old_meta,
-                                    now_ts, era5_end_ts, gfs_end_ts, resolution_s,
-                                    era5_cidx, gfs_cidx)
-            print(f"  [{window_label}] {var_id} done in {time.perf_counter()-_t:.2f}s", flush=True)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_process_var, vid, cfg, window_h, window_label): vid
+                       for vid, cfg in var_configs.items()}
+            for fut in as_completed(futures):
+                if exc := fut.exception():
+                    print(f"  ERROR {futures[fut]}: {exc}", flush=True)
 
     # ── Build forecast aggregate rasters ──────────────────────────────────
     build_forecast_aggregates(
@@ -682,6 +884,8 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
         now_ts, era5_end_ts, gfs_data_end_ts,
         resolution_s, era5_cidx_by_var, gfs_cidx,
     )
+
+    print(f"\n=== done in {time.perf_counter() - _main_start:.1f}s ===")
 
 
 if __name__ == "__main__":
