@@ -13,3 +13,4 @@ Start with:
   Loads an inference bundle and exposes `predict_heatmap_stream()`. Supports
   on-the-fly GIS raster sampling for arbitrary heatmap coordinates not present
   in the pre-computed cell table.
+- `util.tiles`: heatmap tile rendering helpers built on top of `util.inference`.

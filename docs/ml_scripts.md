@@ -365,6 +365,8 @@ docker compose up -d gdal
 
 ### Prediction endpoints
 
+- `GET /api/species/{taxon_id}/heatmap` -- heatmap tile metadata for one species.
+- `GET /api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png` -- rendered PNG heatmap tiles.
 - `POST /api/predict/heatmap-jobs` -- create a cancellable heatmap job.
 - `GET /api/predict/heatmap-jobs/{job_id}/stream` -- stream heatmap NDJSON events.
 - `DELETE /api/predict/heatmap-jobs/{job_id}` -- cancel a stale or running heatmap job.

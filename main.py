@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from io import BytesIO
 import math
 import os
 import json
@@ -10,13 +11,15 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, inference
+from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, inference, tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -40,6 +43,14 @@ forced_categorical_variables = frozenset({"landcover"})
 default_species_limit = 12
 
 max_species_limit = 100
+
+heatmap_tile_default_size = int(getattr(CONFIG, "sdm_tile_size", 256))
+
+heatmap_tile_max_size = int(getattr(CONFIG, "sdm_tile_max_size", 2048))
+
+heatmap_tile_cache_seconds = int(getattr(CONFIG, "sdm_tile_cache_seconds", 60))
+
+heatmap_tile_default_max_native_zoom = int(getattr(CONFIG, "sdm_tile_max_native_zoom", 8))
 
 
 app = FastAPI(title=api_title, version=api_version)
@@ -1112,6 +1123,101 @@ class HeatmapJobDeleteResponse(BaseModel):
     status: str
 
 
+@app.get("/api/species/{taxon_id}/heatmap")
+def species_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
+    """Return metadata for the species heatmap tile surface."""
+    if not inference.is_loaded():
+        return {"available": False, "species_key": taxon_id}
+    available = inference.has_species(taxon_id)
+    return {
+        "available": available,
+        "species_key": taxon_id,
+        "native_resolution": inference.native_resolution(),
+        "tile_url": f"/api/species/{taxon_id}/heatmap/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
+    }
+
+
+@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
+async def species_heatmap_tile(
+    request: Request,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = Query(heatmap_tile_default_size, ge=32, le=heatmap_tile_max_size),
+    feature_mode: str = Query(
+        "prefer_cell_table",
+        description="Feature source strategy: prefer_cell_table or cell_table_only.",
+    ),
+    max_native_zoom: int = Query(
+        heatmap_tile_default_max_native_zoom,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+) -> Response:
+    """Render a species heatmap tile as PNG."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    try:
+        if z > max_native_zoom:
+            max_parent_scale = max(1, heatmap_tile_max_size // tile_size)
+            max_parent_zoom_diff = int(math.floor(math.log2(max_parent_scale))) if max_parent_scale > 1 else 0
+            parent_zoom = max(max_native_zoom, z - max_parent_zoom_diff)
+            zoom_diff = z - parent_zoom
+            scale = 2**zoom_diff
+            parent_x = x // scale
+            parent_y = y // scale
+            subtile_x = x % scale
+            subtile_y = y % scale
+            parent_tile_size = tile_size * scale
+            parent_payload = await run_in_threadpool(
+                tiles.render_heatmap_tile_bytes,
+                taxon_id,
+                parent_zoom,
+                parent_x,
+                parent_y,
+                tile_size=parent_tile_size,
+                feature_mode=feature_mode,
+            )
+            if await request.is_disconnected():
+                return Response(status_code=204)
+
+            parent_img = Image.open(BytesIO(parent_payload))
+            subtile_size = parent_tile_size // scale
+            left = subtile_x * subtile_size
+            top = subtile_y * subtile_size
+            tile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+            if subtile_size != tile_size:
+                tile_img = tile_img.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+            buffer = BytesIO()
+            tile_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
+        else:
+            payload = await run_in_threadpool(
+                tiles.render_heatmap_tile_bytes,
+                taxon_id,
+                z,
+                x,
+                y,
+                tile_size=tile_size,
+                feature_mode=feature_mode,
+            )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {"Cache-Control": f"public, max-age={heatmap_tile_cache_seconds}"}
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
 _heatmap_jobs_lock = threading.Lock()
 _heatmap_jobs: dict[str, dict[str, Any]] = {}
 _HEATMAP_JOB_TTL_SECONDS = 6 * 60 * 60
@@ -1362,6 +1468,8 @@ def cancel_predict_heatmap_job(job_id: str) -> HeatmapJobDeleteResponse:
         current_status = job["status"]
 
     return HeatmapJobDeleteResponse(job_id=job_id, status=current_status)
+
+
 if __name__ == "__main__":
     import uvicorn
 

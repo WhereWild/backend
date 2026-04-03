@@ -30,6 +30,45 @@ Runtime device env vars:
   Controls how many prepared stream chunks can queue ahead.
   Increase for more read-ahead overlap (uses more memory).
 
+### `GET /api/species/{taxon_id}/heatmap`
+
+Return tile-surface metadata for one species.
+
+Response fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `available` | bool | Whether the loaded bundle includes that species key. |
+| `species_key` | int | Echoed species key. |
+| `native_resolution` | float | Native model resolution in degrees. |
+| `tile_url` | string\|null | URL template for PNG tiles when available. |
+
+### `GET /api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png`
+
+Render a Web Mercator PNG tile for one species.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `z` | int | required | Slippy-map zoom level. |
+| `x` | int | required | Tile x coordinate. |
+| `y` | int | required | Tile y coordinate. |
+| `tile_size` | int | `256` | Output PNG size in pixels. |
+| `feature_mode` | string | `prefer_cell_table` | Feature source strategy: `prefer_cell_table` or `cell_table_only`. |
+| `max_native_zoom` | int | `8` | Render parent tiles above this zoom, then crop subtiles. |
+
+Tiles are rendered from the current bundle-backed per-species heatmap scorer and
+returned as `image/png`.
+
+Notes:
+
+- Tile requests are request-scoped, not background jobs.
+- The response advertises `Cache-Control`, but the backend does not currently
+  persist a rendered-tile cache. Repeated requests may be recomputed unless a
+  browser, proxy, or CDN serves them from cache.
+- Tile renders are not currently mid-flight cancellable once scoring starts.
+- High zoom requests may render the closest reusable parent tile that still
+  fits under the configured tile-size cap, then crop the requested subtile.
+
 ### Job resource model for stale-call cancellation
 
 For robust client workflows, use cancellable heatmap jobs:
