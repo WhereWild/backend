@@ -35,7 +35,6 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 100 \
-    --threads 8 \
     --overwrite-output
 ```
 
@@ -50,10 +49,8 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 1000 \
-    --threads 16 \
     --overwrite-output \
-    --drop-missing-time \
-    --background-ratio 1.0
+    --drop-missing-time
 ```
 
 ### Large run (OOM-safer schema scan)
@@ -63,11 +60,8 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 10000 \
-    --threads 8 \
     --overwrite-output \
-    --background-ratio 1.0 \
     --template-scan-max-files 50000 \
-    --max-rows-per-file 500000 \
     --keep-staging
 ```
 
@@ -79,14 +73,17 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
     --output-root ./data_ml/species_observation_canary_plants \
     --max-files 0 \
     --template-scan-max-files 50000 \
-    --threads 8 \
     --overwrite-output \
-    --background-ratio 1.0 \
-    --max-rows-per-file 500000 \
     --keep-staging
 ```
 
-If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files` (for example to `20000`).
+If you still see OOM kills (`exit code 137`), reduce `--background-split-chunk-rows`,
+reduce `--max-rows-per-file`, or lower `--template-scan-max-files`.
+
+Background generation now writes bounded background staging shards internally
+instead of materializing one large generated table per split chunk. This lowers
+peak RAM during pooled background generation, especially when `--background-ratio`
+is greater than `1.0`.
 
 ### Important flags
 
@@ -99,12 +96,21 @@ If you still see OOM kills (`exit code 137`), reduce `--template-scan-max-files`
     - Donors come from other-species positives in the same split (`train`, `val`, `test` kept separate).
     - Rows that conflict with target-species positives on `(cell_id, year_month)` are excluded.
     - Set `0.0` for positives-only debug runs.
+- `--background-split-chunk-rows`
+    - Default is `250000`.
+    - Lower values reduce peak RAM during pooled background generation.
+    - Higher values can improve throughput but increase the size of in-memory split chunks.
+- `--max-rows-per-file`
+    - Default is `150000`.
+    - Lower values reduce per-file write pressure during final parquet output.
+    - Higher values reduce file counts but increase memory pressure during final write.
+- `--overwrite-output`
+    - Clears the staging directory before a fresh run.
+    - Keeps the previous published dataset in place until the replacement dataset has been written and verified.
 - `--template-scan-max-files`
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).
 - `--warn-min-cells-per-species`
     - Logs warning lines when a species has too few unique cells in a shard (helps detect split brittleness).
-- `--final-write-batch-files`
-    - Batches staged shards during final write to reduce file-descriptor and memory pressure.
 - `--static-context-template` / `--static-context-path`
     - Optional static context join source keyed by `cell_id`.
 - `--temporal-context-template` / `--temporal-context-path`
@@ -146,14 +152,12 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
     --resume-background-files \
     --reuse-existing-background \
     --resume-output-files \
-    --resume-feature-template-file \
-    --background-ratio 1.0 \
-    --background-split-chunk-rows 500000
+    --resume-feature-template-file
 ```
 
 Notes:
 
-- `--resume-output-files` always clears the output directory before writing (full rewrite from staging).
+- `--resume-output-files` writes a verified replacement dataset to a temporary directory and only publishes it after parquet verification passes.
 - Use `--regenerate-background` with `--resume-background-files` to delete and rebuild existing `background_pooled_*.parquet` shards.
 - If background shards already exist in staging, the resume CLI requires either `--reuse-existing-background` or `--regenerate-background` when `--resume-background-files` is set.
 - Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
@@ -175,9 +179,7 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
     --output-root ./data_ml/species_observation_canary_plants \
     --resume-base-files \
     --resume-background-files \
-    --regenerate-background \
-    --background-ratio 1.0 \
-    --background-split-chunk-rows 500000
+    --regenerate-background
 ```
 
 ## 2. Validate output schema
@@ -223,9 +225,7 @@ Current Stage B objective is masked reconstruction of observed feature values.
 ```bash
 uv run python -m scripts.machine_learning.train.cli encoder \
     --data-root ./data_ml/species_observation_canary_plants \
-    --output-dir ./checkpoints/canary_plants/encoder \
-    --epochs 50 \
-    --batch-size 32768
+    --output-dir ./checkpoints/canary_plants/encoder
 ```
 
 On CPU (slower, no AMP):
@@ -234,7 +234,6 @@ On CPU (slower, no AMP):
 uv run python -m scripts.machine_learning.train.cli encoder \
     --data-root ./data_ml/species_observation_canary_plants \
     --output-dir ./checkpoints/canary_plants/encoder \
-    --epochs 50 \
     --batch-size 2048 \
     --device cpu \
     --no-amp
@@ -254,10 +253,7 @@ uv run python -m scripts.machine_learning.train.cli heads \
 ```bash
 uv run python -m scripts.machine_learning.train.cli all \
     --data-root ./data_ml/species_observation_canary_plants \
-    --output-dir ./checkpoints/canary_plants \
-    --epochs 50 \
-    --head-epochs 50 \
-    --batch-size 32768
+    --output-dir ./checkpoints/canary_plants
 ```
 
 ### Training flags
@@ -272,7 +268,7 @@ uv run python -m scripts.machine_learning.train.cli all \
 - `--lr`: encoder peak learning rate (default 1e-3).
 - `--head-lr`: species head learning rate (default 1e-2).
 - `--recon-weight`: reconstruction loss weight for encoder pretraining.
-- `--min-positives`: skip species with fewer positives (default 5).
+- `--min-positives`: skip species with fewer positives (default 50).
 - `--device`: auto (default), cuda, mps, cpu.
 - `--no-amp`: disable automatic mixed precision.
 
@@ -298,7 +294,7 @@ The bundle contains:
 - Encoder architecture config and weights.
 - Per-species head weights and metadata (prior, val_loss, counts).
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
-- Feature names per group (env, habitat, weather, other). GIS sampling only reconstructs catalog-backed env/habitat features; weather and other are emitted as missing in sampled-only paths.
+- Feature names per group (`bioclimate`, `landclass`, `terrain`, `edaphic`, `temporal`, `other`). GIS sampling only reconstructs catalog-backed static groups; `temporal` and `other` are emitted as missing in sampled-only paths.
 
 The preprocessing step also writes `feature_template.json` under
 `<output-root>/_meta/`. Export reads this file automatically. If it is missing (e.g. older
@@ -371,12 +367,20 @@ docker compose up -d gdal
 - `GET /api/predict/heatmap-jobs/{job_id}/stream` -- stream heatmap NDJSON events.
 - `DELETE /api/predict/heatmap-jobs/{job_id}` -- cancel a stale or running heatmap job.
 
+Tile endpoint notes:
+
+- Tile requests are synchronous request/response renders, not job resources.
+- The backend currently relies on client/proxy caching headers rather than a
+    built-in rendered-tile cache.
+- High zoom tiles may render a reusable parent tile and crop the requested
+    subtile.
+
 ### On-the-fly GIS sampling
 
 When a query coordinate does not fall in a pre-computed cell (i.e. no training
 observations existed there), the inference engine samples static environmental
 features (bioclim, elevation, slope, aspect, landcover, Koppen-Geiger) directly
-from local GIS COG rasters via rasterio. Weather features are marked as
+from local GIS COG rasters via rasterio. Temporal features are marked as
 all-missing since they are time-dependent and not available without a timestamp.
 The model was trained with masked inputs and tolerates this gracefully.
 

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 try:
     from .pipeline import run_preprocess
 except ImportError:
     from pipeline import run_preprocess  # type: ignore[no-redef]
+
+
+DEFAULT_PREPROCESS_THREADS = 8
+DEFAULT_MAX_ROWS_PER_FILE = 150_000
+DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 250_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threads",
         type=int,
-        default=max(2, (os.cpu_count() or 8) // 2),
+        default=DEFAULT_PREPROCESS_THREADS,
         help="File-level worker threads.",
     )
     parser.add_argument(
@@ -62,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-rows-per-file",
         type=int,
-        default=250_000,
+        default=DEFAULT_MAX_ROWS_PER_FILE,
         help="Max rows per output parquet file in final partitioned dataset.",
     )
     parser.add_argument(
@@ -82,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--background-split-chunk-rows",
         type=int,
-        default=2_000_000,
+        default=DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS,
         help=(
             "Row cap per split chunk during pooled background generation. "
             "Lower values reduce peak memory usage on very large datasets."
@@ -91,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        help="Delete output and staging directories before writing.",
+        help="Delete the staging directory before writing and replace the output dataset only after the new write succeeds.",
     )
     parser.add_argument(
         "--keep-staging",
