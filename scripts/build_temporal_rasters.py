@@ -653,6 +653,8 @@ def _cleanup_stale_chunks(needed_chunks: set[str], indexed_prefixes: set[str]) -
     accidentally delete chunks for vars we didn't process).
     """
     removed = 0
+    if not CHUNK_DIR.exists():
+        return
     for path in CHUNK_DIR.glob("*_chunk_*.om"):
         name = path.name
         idx = name.find("_chunk_")
@@ -664,7 +666,7 @@ def _cleanup_stale_chunks(needed_chunks: set[str], indexed_prefixes: set[str]) -
             path.unlink(missing_ok=True)
             removed += 1
     if removed:
-        print(f"  cleaned {removed} stale .om chunk(s) from /tmp/")
+        print(f"  cleaned {removed} stale .om chunk(s) from {CHUNK_DIR}")
 
 
 # ── Forecast aggregate builds ─────────────────────────────────────────────────
