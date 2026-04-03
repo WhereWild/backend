@@ -123,12 +123,6 @@ VAR_CONFIGS: dict[str, dict] = {
         "gfs_var":    "snowfall_water_equivalent",
         "agg": "sum",
     },
-    "weather_code_simple": {
-        "era5_model": "copernicus_era5",  # uses era5 vars for cloud/precip/snow
-        "agg": "mode",
-        "gfs_needs": ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
-        "era5_needs": ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
-    },
 }
 
 # ── S3 / download helpers ─────────────────────────────────────────────────────
@@ -555,24 +549,40 @@ def _incremental_update(var_id: str, cfg: dict, window_h: int, window_label: str
     old_w_start = old_meta["era5_window_start_ts"]
     old_gfs_end = old_meta["gfs_end_ts"]
 
-    # Mode vars: counts can't be easily subtracted (weather code grids needed for drop),
-    # so always do a full rebuild for correctness.
+    # Mode vars can't be incrementally updated — leave existing file as-is.
     if agg == "mode":
-        print(f"  [{window_label}] {var_id} mode var → full rebuild for correctness")
-        _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
-                    resolution_s, era5_cidx, gfs_cidx)
         return
 
-    # If ERA5 has advanced since last build, trigger a full rebuild for accuracy
-    old_era5_end = old_meta["era5_end_ts"]
-    if era5_end_ts > old_era5_end + 3600:
-        print(f"  [{window_label}] ERA5 advanced by {(era5_end_ts-old_era5_end)/3600:.0f}h → full rebuild")
-        _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
-                    resolution_s, era5_cidx, gfs_cidx)
-        return
-
+    old_era5_end  = old_meta["era5_end_ts"]
+    old_gfs_start = old_meta["gfs_start_ts"]
     n_era5 = old_meta["n_era5"]
     n_gfs  = old_meta["n_gfs"]
+
+    # If ERA5 has advanced, swap the newly-covered hours from GFS sums → ERA5 sums.
+    # Those hours were already counted as GFS; replace with more accurate ERA5 data.
+    if era5_end_ts > old_era5_end + 3600:
+        swap_start = max(old_era5_end, old_w_start)
+        swap_end   = min(era5_end_ts,  old_gfs_end)
+        if swap_end > swap_start:
+            swap_steps = int(round((swap_end - swap_start) / resolution_s))
+            for rv in _era5_raw_vars(cfg):
+                if rv not in era5_cidx:
+                    continue
+                added, _ = _accumulate(era5_model, rv, swap_start, swap_end,
+                                       resolution_s, era5_cidx[rv])
+                sums[f"era5_{rv}"] = (sums.get(f"era5_{rv}",
+                                                np.zeros((ERA5_NY, ERA5_NX), np.float32))
+                                      + added).astype(np.float32)
+            for gv in _gfs_raw_vars(cfg):
+                key = f"gfs_{gv}"
+                if gv not in gfs_cidx or key not in sums:
+                    continue
+                dropped, _ = _accumulate("ncep_gfs013", gv, swap_start, swap_end,
+                                          resolution_s, gfs_cidx[gv])
+                sums[key] = (sums[key] - dropped).astype(np.float32)
+            n_era5     += swap_steps
+            n_gfs      -= swap_steps
+            old_gfs_start = era5_end_ts  # GFS now starts where ERA5 ends
 
     # ── 1. Drop oldest hours that fell off the window ──────────────────────
     if new_w_start > old_w_start:
@@ -588,7 +598,7 @@ def _incremental_update(var_id: str, cfg: dict, window_h: int, window_label: str
             n_era5 -= int(round((drop_end - old_w_start) / resolution_s))
 
         # Drop from GFS if window start is now in the GFS region
-        gfs_drop_start = max(old_w_start, old_meta["gfs_start_ts"])
+        gfs_drop_start = max(old_w_start, old_gfs_start)
         gfs_drop_end   = min(new_w_start, old_gfs_end)
         if gfs_drop_end > gfs_drop_start:
             for gv in _gfs_raw_vars(cfg):
@@ -618,6 +628,7 @@ def _incremental_update(var_id: str, cfg: dict, window_h: int, window_label: str
 
     meta = {
         **old_meta,
+        "era5_end_ts": era5_end_ts,
         "era5_window_start_ts": new_w_start,
         "gfs_start_ts": max(era5_end_ts, new_w_start),
         "gfs_end_ts": gfs_end_ts,
@@ -673,93 +684,106 @@ def build_forecast_aggregates(
     This makes each forecast offset O(forecast_hours) rather than O(window_size).
     Falls back to a full build if the "now" state is missing.
     """
+    def _process_fc_var_window(var_id, cfg, window_h, window_label,
+                               forecast_h, future_ts, gfs_end_for_fc, suffix):
+        era5_cidx  = era5_cidx_by_var.get(var_id, {})
+        era5_model = cfg["era5_model"]
+        agg        = cfg["agg"]
+
+        # Mode vars can't be incrementally updated — skip forecast aggregates for them
+        if agg == "mode":
+            return
+
+        # Load the "now" state built in the main loop
+        now_sums, now_meta = _load_state(var_id, window_label)
+        if now_sums is None:
+            _full_build(var_id, cfg, window_h, window_label,
+                        future_ts, era5_end_ts, gfs_end_for_fc,
+                        resolution_s, era5_cidx, gfs_cidx, suffix=suffix)
+            return
+
+        sums          = {k: v.copy() for k, v in now_sums.items()}
+        n_era5        = now_meta["n_era5"]
+        n_gfs         = now_meta["n_gfs"]
+        old_w_start   = now_meta["era5_window_start_ts"]
+        old_gfs_end   = now_meta["gfs_end_ts"]
+        old_gfs_start = now_meta["gfs_start_ts"]
+        new_w_start   = old_w_start + forecast_h * 3600
+
+        # 1. Drop oldest forecast_h hours from the ERA5 tail
+        drop_end = min(new_w_start, era5_end_ts)
+        if drop_end > old_w_start:
+            for rv in _era5_raw_vars(cfg):
+                key = f"era5_{rv}"
+                if key not in sums or rv not in era5_cidx:
+                    continue
+                dropped, _ = _accumulate(era5_model, rv, old_w_start, drop_end,
+                                         resolution_s, era5_cidx[rv])
+                sums[key] = (sums[key] - dropped).astype(np.float32)
+            n_era5 -= int(round((drop_end - old_w_start) / resolution_s))
+
+        # Drop from GFS if the old window start was already in the GFS region
+        gfs_drop_end = min(new_w_start, old_gfs_end)
+        if gfs_drop_end > old_gfs_start:
+            for gv in _gfs_raw_vars(cfg):
+                key = f"gfs_{gv}"
+                if key not in sums or gv not in gfs_cidx:
+                    continue
+                dropped, _ = _accumulate("ncep_gfs013", gv, old_gfs_start, gfs_drop_end,
+                                         resolution_s, gfs_cidx[gv])
+                sums[key] = (sums[key] - dropped).astype(np.float32)
+            n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution_s))
+
+        # 2. Add new GFS forecast hours [old_gfs_end → future_ts]
+        if gfs_end_for_fc > old_gfs_end:
+            for gv in _gfs_raw_vars(cfg):
+                key = f"gfs_{gv}"
+                if gv not in gfs_cidx:
+                    continue
+                added, n_add = _accumulate("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc,
+                                           resolution_s, gfs_cidx[gv])
+                sums[key] = (sums.get(key, np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32))
+                             + added).astype(np.float32)
+            n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution_s))
+
+        n_era5 = max(n_era5, 0)
+        n_gfs  = max(n_gfs,  0)
+        meta = {
+            **now_meta,
+            "era5_window_start_ts": new_w_start,
+            "gfs_start_ts": max(era5_end_ts, new_w_start),
+            "gfs_end_ts": gfs_end_for_fc,
+            "n_era5": n_era5, "n_gfs": n_gfs,
+            "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+        }
+        _save_state(var_id, window_label, cfg, sums, meta, suffix=suffix)
+
     print("\n=== forecast aggregate builds ===")
     for forecast_h in forecast_hours_list:
         future_ts      = now_ts + forecast_h * 3600
         gfs_end_for_fc = min(gfs_data_end_ts, future_ts)
         suffix         = f"__f{forecast_h:03d}h"
         future_dt      = datetime.fromtimestamp(future_ts, tz=timezone.utc)
-        print(f"\n--- +{forecast_h}h forecast | anchor={future_dt.strftime('%Y-%m-%dT%HZ')} ---")
+        print(f"\n--- +{forecast_h}h forecast | anchor={future_dt.strftime('%Y-%m-%dT%HZ')} ---",
+              flush=True)
+        t0 = time.perf_counter()
 
-        for var_id, cfg in var_configs.items():
-            era5_cidx  = era5_cidx_by_var.get(var_id, {})
-            era5_model = cfg["era5_model"]
-            agg        = cfg["agg"]
+        combos = [(vid, cfg, wh, wl)
+                  for vid, cfg in var_configs.items()
+                  for wh, wl in windows]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(_process_fc_var_window,
+                            vid, cfg, wh, wl, forecast_h, future_ts, gfs_end_for_fc, suffix
+                            ): (vid, wl)
+                for vid, cfg, wh, wl in combos
+            }
+            for fut in as_completed(futures):
+                if exc := fut.exception():
+                    vid, wl = futures[fut]
+                    print(f"  ERROR [{wl}] {vid} +{forecast_h}h: {exc}", flush=True)
 
-            for window_h, window_label in windows:
-                print(f"  [{window_label:4s}] {var_id} +{forecast_h}h ...", flush=True)
-
-                # Mode vars can't incrementally drop/add counts, always do a full build
-                if agg == "mode":
-                    _full_build(var_id, cfg, window_h, window_label,
-                                future_ts, era5_end_ts, gfs_end_for_fc,
-                                resolution_s, era5_cidx, gfs_cidx, suffix=suffix)
-                    continue
-
-                # Load the "now" state built in the main loop
-                now_sums, now_meta = _load_state(var_id, window_label)
-                if now_sums is None:
-                    # State missing — fall back to full build
-                    _full_build(var_id, cfg, window_h, window_label,
-                                future_ts, era5_end_ts, gfs_end_for_fc,
-                                resolution_s, era5_cidx, gfs_cidx, suffix=suffix)
-                    continue
-
-                sums   = {k: v.copy() for k, v in now_sums.items()}
-                n_era5 = now_meta["n_era5"]
-                n_gfs  = now_meta["n_gfs"]
-                old_w_start  = now_meta["era5_window_start_ts"]
-                old_gfs_end  = now_meta["gfs_end_ts"]
-                old_gfs_start = now_meta["gfs_start_ts"]
-                new_w_start  = old_w_start + forecast_h * 3600
-
-                # 1. Drop oldest forecast_h hours from the ERA5 tail
-                drop_end = min(new_w_start, era5_end_ts)
-                if drop_end > old_w_start:
-                    for rv in _era5_raw_vars(cfg):
-                        key = f"era5_{rv}"
-                        if key not in sums or rv not in era5_cidx:
-                            continue
-                        dropped, _ = _accumulate(era5_model, rv, old_w_start, drop_end,
-                                                 resolution_s, era5_cidx[rv])
-                        sums[key] = (sums[key] - dropped).astype(np.float32)
-                    n_era5 -= int(round((drop_end - old_w_start) / resolution_s))
-
-                # Drop from GFS if the old window start was already in the GFS region
-                gfs_drop_end = min(new_w_start, old_gfs_end)
-                if gfs_drop_end > old_gfs_start:
-                    for gv in _gfs_raw_vars(cfg):
-                        key = f"gfs_{gv}"
-                        if key not in sums or gv not in gfs_cidx:
-                            continue
-                        dropped, _ = _accumulate("ncep_gfs013", gv, old_gfs_start, gfs_drop_end,
-                                                 resolution_s, gfs_cidx[gv])
-                        sums[key] = (sums[key] - dropped).astype(np.float32)
-                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution_s))
-
-                # 2. Add new GFS forecast hours [old_gfs_end → future_ts]
-                if gfs_end_for_fc > old_gfs_end:
-                    for gv in _gfs_raw_vars(cfg):
-                        key = f"gfs_{gv}"
-                        if gv not in gfs_cidx:
-                            continue
-                        added, n_add = _accumulate("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc,
-                                                   resolution_s, gfs_cidx[gv])
-                        sums[key] = (sums.get(key, np.zeros((ERA5_NY, ERA5_NX), dtype=np.float32))
-                                     + added).astype(np.float32)
-                    n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution_s))
-
-                n_era5 = max(n_era5, 0)
-                n_gfs  = max(n_gfs,  0)
-                meta = {
-                    **now_meta,
-                    "era5_window_start_ts": new_w_start,
-                    "gfs_start_ts": max(era5_end_ts, new_w_start),
-                    "gfs_end_ts": gfs_end_for_fc,
-                    "n_era5": n_era5, "n_gfs": n_gfs,
-                    "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
-                }
-                _save_state(var_id, window_label, cfg, sums, meta, suffix=suffix)
+        print(f"  +{forecast_h}h done in {time.perf_counter()-t0:.1f}s", flush=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -869,6 +893,7 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
                                 now_ts, era5_end_ts, gfs_end_ts, resolution_s,
                                 era5_cidx, gfs_cidx)
 
+    _windows_start = time.perf_counter()
     for window_h, window_label in windows:
         print(f"\n=== window {window_label} ===")
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -877,13 +902,16 @@ def main(only_vars: list[str] | None, only_windows: list[str] | None,
             for fut in as_completed(futures):
                 if exc := fut.exception():
                     print(f"  ERROR {futures[fut]}: {exc}", flush=True)
+    print(f"\n=== main windows done in {time.perf_counter()-_windows_start:.1f}s ===")
 
     # ── Build forecast aggregate rasters ──────────────────────────────────
+    _fc_start = time.perf_counter()
     build_forecast_aggregates(
         FORECAST_HOURS, var_configs, windows,
         now_ts, era5_end_ts, gfs_data_end_ts,
         resolution_s, era5_cidx_by_var, gfs_cidx,
     )
+    print(f"=== forecast aggregates done in {time.perf_counter()-_fc_start:.1f}s ===")
 
     print(f"\n=== done in {time.perf_counter() - _main_start:.1f}s ===")
 
