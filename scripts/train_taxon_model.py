@@ -613,7 +613,6 @@ def _sample_negative_features(
     if target_rows <= 0:
         return pd.DataFrame(columns=feature_spec.all_columns), {"rows_collected": 0}
 
-    negatives: list[pd.DataFrame] = []
     total_sampled_points = 0
     windows: list[dict[str, Any]] = []
     window_plan = _build_negative_window_plan(positive_bbox)
