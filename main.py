@@ -16,7 +16,7 @@ from starlette.concurrency import run_in_threadpool
 import pandas as pd
 
 from util.config import load_config
-from util import custom_upload_processing, descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles
+from util import custom_upload_processing, descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles, weather_tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -58,6 +58,8 @@ async def lifespan(app: FastAPI):
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+    import threading
+    threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
     yield
 
 
@@ -104,6 +106,15 @@ def _map_enabled_variables() -> frozenset[str]:
     if not enabled:
         enabled.update({"landcover", "koppen_geiger"})
     return frozenset(sorted(enabled))
+
+
+@app.get("/api/weather/status", summary="Live weather cache status")
+def weather_cache_status() -> dict:
+    return {
+        "ref_times": weather_tiles._cache_ref_times,
+        "cached_variables": list(weather_tiles._cache.keys()),
+        "ready": len(weather_tiles._cache) == len(weather_tiles.LIVE_WEATHER_VARIABLES),
+    }
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -159,6 +170,19 @@ async def variable_tile(
     layer_id = (variable_id or "").strip().lower()
     if not layer_id:
         raise HTTPException(status_code=400, detail="variable_id is required.")
+
+    # Live weather variables bypass the GeoTIFF pipeline entirely
+    if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
+        payload = await run_in_threadpool(
+            weather_tiles.render_weather_tile_bytes,
+            variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+        )
+        if payload is None:
+            # Cache not yet populated — return transparent tile
+            return Response(status_code=204)
+        headers = {"Cache-Control": f"public, max-age={variable_tile_cache_seconds}"}
+        return Response(content=payload, media_type="image/png", headers=headers)
+
     enabled_variables = _map_enabled_variables()
     if layer_id not in enabled_variables:
         allowed = ", ".join(sorted(enabled_variables))
@@ -257,6 +281,8 @@ async def species_heatmap_tile(
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
+    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
+    apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
 ) -> Response:
     if await request.is_disconnected():
         return Response(status_code=204)
@@ -288,6 +314,8 @@ async def species_heatmap_tile(
                 model_id=model_id,
                 tile_size=parent_tile_size,
                 reproject=reproject,
+                forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
             )
             if await request.is_disconnected():
                 return Response(status_code=204)
@@ -319,6 +347,8 @@ async def species_heatmap_tile(
                 model_id=model_id,
                 tile_size=tile_size,
                 reproject=reproject,
+                forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -139,6 +139,16 @@ class GlobalConfig:
     ml_negative_taxa_candidate_pool: int = 10000
     ml_parquet_storage_mode: str = "local"
     ml_raster_storage_mode: str = "auto"
+    ml_phenology_mode: bool = True
+    # Phenology mode: column containing reproductive condition summary and positive values
+    ml_phenology_rcs_column: str = "rcs"
+    ml_phenology_rcs_positive_values: tuple[str, ...] = (
+        "flowers",
+        "flower buds",
+        "fruits or seeds",
+        "flowers|flower buds",
+        "fruits or seeds|flower buds",
+    )
 
     # Enrichment
 
@@ -241,6 +251,15 @@ class GlobalConfig:
             "copernicus_era5_ensemble": "lat_asc_lon_pm180",
         }
     )
+    # Temporal raster builder settings
+    temporal_raster_b2_dest: str = "wherewild-localdev-writer:wherewild-data/gis/temporal/rasters"
+    temporal_raster_upload_enabled: bool = True
+    temporal_raster_force_rebuild: bool = False
+    # Subset of VAR_CONFIGS keys to build; empty tuple = build all
+    temporal_raster_vars: tuple[str, ...] = ()
+    # Subset of window labels to build; empty tuple = build all
+    temporal_raster_windows: tuple[str, ...] = ()
+
     # Cap the number of occurrence rows per worklist batch to bound memory.
     # Set to 0 to disable batching (process all rows at once).
     temporal_worklist_batch_rows: int = 1_500_000

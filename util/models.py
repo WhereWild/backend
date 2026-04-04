@@ -15,7 +15,9 @@ from util.config import load_config
 
 
 CONFIG = load_config("global")
-AUTO_MODEL_ID = f"auto_{str(CONFIG.ml_model_kind).strip().lower() or 'gbt'}"
+_MODEL_KIND = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
+AUTO_MODEL_ID = f"auto_{_MODEL_KIND}_sdm"
+AUTO_PHENOLOGY_MODEL_ID = f"auto_{_MODEL_KIND}_phenology"
 DEFAULT_MODEL_ID = AUTO_MODEL_ID
 
 
@@ -68,15 +70,25 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
         return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}")
 
     if normalized.startswith("auto_"):
-        model_kind = normalized.removeprefix("auto_").strip().lower()
-        if not model_kind or not taxon_key:
+        # Suffix after "auto_" is the full kind+mode string, e.g. "gbt_sdm" or "gbt_phenology".
+        kind_and_mode = normalized.removeprefix("auto_").strip().lower()
+        if not kind_and_mode or not taxon_key:
             return None
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}")
+        # New-style: taxon_{key}_gbt_sdm_TIMESTAMP
+        result = _latest_artifact_for_prefix(f"taxon_{taxon_key}_{kind_and_mode}_")
+        if result is not None:
+            return result
+        # Old-style fallback (no mode suffix): taxon_{key}_gbt_TIMESTAMP
+        # Strip the mode part (e.g. "_sdm", "_phenology") — only applies to SDM, not phenology
+        base_kind = kind_and_mode.rsplit("_", 1)[0] if "_" in kind_and_mode else kind_and_mode
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{base_kind}_")
 
-    if normalized.startswith("taxon_") and (
-        normalized.endswith("_gbt") or normalized.endswith("_maxent")
-    ):
-        return _latest_artifact_for_prefix(normalized)
+    if normalized.startswith("taxon_"):
+        # Exact match first (full artifact id passed), then prefix search
+        exact = _models_root() / normalized
+        if exact.is_dir() and (exact / "model.pkl").exists():
+            return exact
+        return _latest_artifact_for_prefix(f"{normalized}_")
 
     candidate = _models_root() / normalized
     if candidate.is_dir() and (candidate / "model.pkl").exists():
@@ -155,7 +167,12 @@ def describe_model(
         "feature_columns": list(artifact.payload.get("feature_columns") or []),
         "summary": summary,
         "metrics": metrics,
+        "phenology_available": has_phenology_model(taxon_id),
     }
+
+
+def has_phenology_model(taxon_id: str | int | None) -> bool:
+    return resolve_model_artifact(AUTO_PHENOLOGY_MODEL_ID, taxon_id=taxon_id) is not None
 
 
 def predict(

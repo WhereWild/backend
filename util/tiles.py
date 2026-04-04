@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import colorsys
+import re as _re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
@@ -23,6 +24,13 @@ from util import gis_lookup, models, units
 
 CONFIG = load_config("global")
 WEB_MERCATOR = "EPSG:3857"
+
+# Matches temporal columns produced by build_temporal_rasters.py, e.g. temperature_2m_avg_168h
+_TEMPORAL_COL_RE = _re.compile(r"^(.+?)_(avg|sum)_(\d+)h$")
+
+
+def _is_temporal_column(col: str) -> bool:
+    return bool(_TEMPORAL_COL_RE.match(col))
 WGS84_CRS = "EPSG:4326"
 
 LANDCOVER_ID = "landcover"
@@ -911,14 +919,57 @@ def _load_model_layers(
             f"No feature columns available for taxon {taxon_id} and model '{requested}'."
         )
 
+    # Temporal columns don't live in the GIS catalog — only validate non-temporal ones.
     layer_meta = gis_lookup.load_layer_metadata()
-    unknown = [layer for layer in layer_list if layer not in layer_meta]
-    if unknown:
+    unknown_gis = [
+        layer for layer in layer_list
+        if not _is_temporal_column(layer) and layer not in layer_meta
+    ]
+    if unknown_gis:
         raise ValueError(
             "Model feature columns are not available in the GIS catalog: "
-            + ", ".join(sorted(unknown))
+            + ", ".join(sorted(unknown_gis))
         )
     return layer_list
+
+
+def _render_feature_stack(
+    layer_list: list[str],
+    spec: "TileSpec",
+    reproject: bool,
+    forecast_hours: int,
+) -> np.ndarray:
+    """Render a (tile_size, tile_size, C) feature tensor for the given layer list."""
+    from util import weather_tiles as _wt
+    tile_size = spec.tile_size
+    stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
+    for idx, layer_id in enumerate(layer_list):
+        m = _TEMPORAL_COL_RE.match(layer_id)
+        if m:
+            variable_id = m.group(1)
+            window_hours = int(m.group(3))
+            try:
+                stack[:, :, idx] = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
+            except Exception as exc:
+                stack[:, :, idx] = np.nan
+                print(f"[model-tile] WARNING: temporal layer {layer_id} failed: {exc}")
+        else:
+            try:
+                stack[:, :, idx] = _render_layer_values(
+                    layer_id, spec, reproject_to_mercator=reproject,
+                )
+            except Exception as exc:
+                stack[:, :, idx] = np.nan
+                print(
+                    f"[model-tile] WARNING: layer {layer_id} read failed for tile "
+                    f"z={spec.z} x={spec.x} y={spec.y} — filling NaN. Error: {exc}"
+                )
+        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
+            print(
+                f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} "
+                f"current_layer={layer_id}"
+            )
+    return stack
 
 
 def render_model_tile_bytes(
@@ -931,36 +982,45 @@ def render_model_tile_bytes(
     layers: Sequence[str] | None = None,
     tile_size: int = 256,
     reproject: bool = True,
+    forecast_hours: int = 0,
+    apply_phenology: bool = True,
 ) -> bytes:
-    layer_list = _load_model_layers(taxon_id, model_id, layers)
+    """Render a species habitat-suitability tile.
+
+    If a phenology model exists for the taxon it is multiplied with the SDM output
+    pixel-wise, giving "habitat suitability × current-weather flowering likelihood".
+    Temporal feature channels are sampled from the live/forecast weather cache at
+    *forecast_hours* (0 = current snapshot, 8/24/72/168 = GFS forecast offsets).
+    """
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
-    stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
 
-    for idx, layer_id in enumerate(layer_list):
+    # ── SDM model ────────────────────────────────────────────────────────────
+    sdm_layers = _load_model_layers(taxon_id, model_id, layers)
+
+    # ── Phenology model (optional) ───────────────────────────────────────────
+    phenology_layers: list[str] = []
+    if apply_phenology and models.has_phenology_model(taxon_id):
         try:
-            stack[:, :, idx] = _render_layer_values(
-                layer_id,
-                spec,
-                reproject_to_mercator=reproject,
-            )
-        except Exception as exc:
-            stack[:, :, idx] = np.nan
-            print(
-                f"[model-tile] WARNING: layer {layer_id} read failed for tile "
-                f"z={z} x={x} y={y} — filling NaN. Error: {exc}"
-            )
-        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
-            print(
-                f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} "
-                f"taxon={taxon_id} current_layer={layer_id}"
-            )
+            phenology_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+        except ValueError:
+            phenology_layers = []
 
-    probs = models.predict(
-        model_id,
-        stack,
-        feature_ids=layer_list,
-        taxon_id=taxon_id,
+    # ── Union feature stack (render each layer once) ─────────────────────────
+    all_layers = list(dict.fromkeys(sdm_layers + phenology_layers))
+    print(
+        f"[model-tile] taxon={taxon_id} sdm_features={len(sdm_layers)} "
+        f"phenology_features={len(phenology_layers)} forecast_hours={forecast_hours}"
     )
+    stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours)
+
+    probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
+
+    if phenology_layers:
+        pheno_probs = models.predict(
+            models.AUTO_PHENOLOGY_MODEL_ID, stack, feature_ids=all_layers, taxon_id=taxon_id,
+        )
+        probs = probs * pheno_probs
+
     rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")
     buffer = io.BytesIO()
