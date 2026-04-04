@@ -31,6 +31,7 @@ _INVALID_LOCATION_GID_TOKENS = frozenset({"nan", "none", "null", "na", "n/a", "u
 _MAX_CACHED_RASTERS = 128
 _raster_cache: OrderedDict[str, tuple] = OrderedDict()  # uri -> (ds, gdal_env)
 _raster_cache_lock = threading.Lock()
+_raster_active: set[str] = set()  # URIs whose cached ds is currently being yielded
 _RASTER_STORAGE_ENV = "WHEREWILD_RASTER_STORAGE"
 
 
@@ -124,19 +125,27 @@ def _temporary_env(overrides: dict[str, str]) -> Iterator[None]:
 
 @contextmanager
 def open_raster(source: RasterSource) -> Iterator[Any]:
-    """Open a raster source, reusing a cached handle when available."""
+    """Open a raster source, reusing a cached handle when available.
+
+    Each call gets exclusive use of the cached handle; concurrent callers open a
+    private handle instead of sharing, preventing GDAL seek-state corruption.
+    """
     import rasterio
 
     uri = source.uri
+    close_when_done = False
 
+    # Claim the cached handle only if it is not currently in use
     with _raster_cache_lock:
-        if uri in _raster_cache:
+        if uri in _raster_cache and uri not in _raster_active:
             _raster_cache.move_to_end(uri)
+            _raster_active.add(uri)
             ds = _raster_cache[uri][0]
         else:
             ds = None
 
     if ds is None:
+        # Open a private handle for this caller
         if source.gdal_env:
             with _temporary_env(source.gdal_env):
                 with rasterio.Env():
@@ -146,28 +155,37 @@ def open_raster(source: RasterSource) -> Iterator[Any]:
 
         with _raster_cache_lock:
             if uri not in _raster_cache:
+                # Install into cache and claim it
                 _raster_cache[uri] = (ds, source.gdal_env or {})
                 _raster_cache.move_to_end(uri)
+                _raster_active.add(uri)
                 while len(_raster_cache) > _MAX_CACHED_RASTERS:
-                    _, (evicted_ds, _) = _raster_cache.popitem(last=False)
+                    evicted_uri, (evicted_ds, _) = _raster_cache.popitem(last=False)
+                    _raster_active.discard(evicted_uri)
                     try:
                         evicted_ds.close()
                     except Exception:
                         pass
             else:
-                try:
-                    ds.close()
-                except Exception:
-                    pass
-                _raster_cache.move_to_end(uri)
-                ds = _raster_cache[uri][0]
+                # Cache already populated by another thread; use this as private handle
+                close_when_done = True
 
-    if source.gdal_env:
-        with _temporary_env(source.gdal_env):
-            with rasterio.Env():
-                yield ds
-    else:
-        yield ds
+    try:
+        if source.gdal_env:
+            with _temporary_env(source.gdal_env):
+                with rasterio.Env():
+                    yield ds
+        else:
+            yield ds
+    finally:
+        if close_when_done:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        else:
+            with _raster_cache_lock:
+                _raster_active.discard(uri)
 
 
 @contextmanager

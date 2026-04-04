@@ -120,8 +120,8 @@ class GlobalConfig:
 
     # ML training
     ml_train_taxon_id: str = "3084072"
-    ml_model_kind: str = "maxent"
-    ml_negative_ratio: int = 10
+    ml_model_kind: str = "gbt"
+    ml_negative_ratio: int = 15
     ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
     ml_negative_global_growth_factor: float = 5.0
     ml_negative_global_max_extra_rounds: int = 12
@@ -133,6 +133,10 @@ class GlobalConfig:
     ml_test_size: float = 0.2
     ml_random_seed: int = 42
     ml_enable_background_eval: bool = False
+    ml_push_model_to_b2: bool = True
+    ml_negative_mode: str = "taxa"  # "raster" | "taxa"
+    ml_negative_taxa_max_per_taxon: int = 30
+    ml_negative_taxa_candidate_pool: int = 10000
     ml_parquet_storage_mode: str = "local"
     ml_raster_storage_mode: str = "auto"
 

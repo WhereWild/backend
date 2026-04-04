@@ -6,6 +6,8 @@ import json
 import os
 import pickle
 from pathlib import Path
+import shutil
+import subprocess
 import time
 from typing import Any
 
@@ -604,7 +606,7 @@ def _prefilter_candidate_coordinates(
     return lats[keep_mask], lons[keep_mask], keep_mask
 
 
-def _sample_negative_features(
+def _sample_negative_features_raster(
     target_rows: int,
     feature_spec: FeatureSpec,
     positive_bbox: BoundingBox,
@@ -849,6 +851,121 @@ def _sample_negative_features(
         "windows": windows,
     }
     return negative_frame, summary
+
+
+def _sample_negative_features_from_taxa(
+    target_taxon_id: str,
+    target_rows: int,
+    feature_spec: FeatureSpec,
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if target_rows <= 0:
+        return pd.DataFrame(columns=feature_spec.all_columns), {"rows_collected": 0}
+
+    catalog = taxa_navigation.load_catalog()
+    leaf_ranks = frozenset(CONFIG.leaf_ranks)
+    storage = _parquet_storage()
+    target_id_str = str(target_taxon_id)
+
+    # Collect all leaf taxa with occurrence parquets, excluding the target taxon
+    candidates: list[tuple[str, Path]] = []
+    for tid, taxon in catalog.items():
+        if str(tid) == target_id_str:
+            continue
+        if str(taxon.get("rank") or "").upper() not in leaf_ranks:
+            continue
+        path = taxa_navigation.normalize_taxon_path(taxon["path"]) / CONFIG.occurrence_parquet_filename
+        candidates.append((str(tid), path))
+
+    if not candidates:
+        raise RuntimeError(
+            "No candidate taxa found for taxa-based negative sampling. "
+            "Ensure leaf taxa with occurrence parquets exist in the catalog."
+        )
+
+    # Shuffle then cap pool size
+    perm = rng.permutation(len(candidates))
+    pool_size = min(int(CONFIG.ml_negative_taxa_candidate_pool), len(candidates))
+    selected = [candidates[i] for i in perm[:pool_size]]
+
+    max_per_taxon = int(CONFIG.ml_negative_taxa_max_per_taxon)
+    print(
+        f"[negatives-taxa] pool={pool_size}/{len(candidates)} "
+        f"target_rows={target_rows} max_per_taxon={max_per_taxon}"
+    )
+
+    collected_frames: list[pd.DataFrame] = []
+    rows_collected = 0
+    taxa_used = 0
+
+    for _tid, path in selected:
+        if rows_collected >= target_rows:
+            break
+        try:
+            pf = storage.parquet_file(path)
+            if pf.metadata.num_rows == 0:
+                continue
+            available = [c for c in feature_spec.all_columns if c in pf.schema.names]
+            if not available:
+                continue
+
+            frame = pf.read(columns=available).to_pandas()
+            for col in feature_spec.all_columns:
+                if col not in frame.columns:
+                    frame[col] = np.nan
+            frame = frame[feature_spec.all_columns].dropna(how="all").reset_index(drop=True)
+            if frame.empty:
+                continue
+
+            to_take = min(max_per_taxon, len(frame), target_rows - rows_collected)
+            if len(frame) > to_take:
+                frame = frame.iloc[rng.choice(len(frame), size=to_take, replace=False)].reset_index(drop=True)
+
+            collected_frames.append(frame)
+            rows_collected += len(frame)
+            taxa_used += 1
+        except Exception:
+            continue
+
+    if not collected_frames:
+        raise RuntimeError(
+            "No negative rows could be collected from taxa parquets. "
+            "Ensure occurrence parquets have GIS feature columns populated."
+        )
+
+    negative_frame = pd.concat(collected_frames, ignore_index=True)
+    shuffle_idx = rng.permutation(len(negative_frame))
+    negative_frame = negative_frame.iloc[shuffle_idx].iloc[:target_rows].reset_index(drop=True)
+
+    print(f"[negatives-taxa] collected={len(negative_frame)} taxa_used={taxa_used}")
+    return negative_frame, {
+        "strategy": "taxa_occurrence_sampling",
+        "target_rows": int(target_rows),
+        "rows_collected": int(len(negative_frame)),
+        "taxa_used": int(taxa_used),
+        "candidate_pool_size": int(pool_size),
+        "max_per_taxon": int(max_per_taxon),
+    }
+
+
+def _sample_negative_features(
+    target_rows: int,
+    feature_spec: FeatureSpec,
+    positive_bbox: BoundingBox,
+    rng: np.random.Generator,
+    *,
+    taxon_id: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    mode = str(CONFIG.ml_negative_mode).strip().lower()
+    if mode == "taxa":
+        if taxon_id is None:
+            raise ValueError("taxon_id is required when ml_negative_mode='taxa'")
+        return _sample_negative_features_from_taxa(taxon_id, target_rows, feature_spec, rng)
+    if mode == "raster":
+        return _sample_negative_features_raster(target_rows, feature_spec, positive_bbox, rng)
+    raise ValueError(
+        f"Unknown ml_negative_mode={CONFIG.ml_negative_mode!r}; expected 'raster' or 'taxa'."
+    )
 
 
 def _build_negative_window_plan(positive_bbox: BoundingBox) -> list[dict[str, Any]]:
@@ -1131,6 +1248,7 @@ def main() -> None:
         feature_spec,
         positive_bbox,
         rng,
+        taxon_id=taxon_id,
     )
     print(f"[train] negatives collected={len(negatives)}")
 
@@ -1179,6 +1297,7 @@ def main() -> None:
             pruned_spec,
             positive_bbox,
             eval_rng,
+            taxon_id=taxon_id,
         )
         eval_background_prob = _score_frame(
             eval_background_frame[pruned_spec.all_columns],
@@ -1228,8 +1347,10 @@ def main() -> None:
             f"known_positive_p90={positive_quantiles.get('0.90')}"
         )
 
-    run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output_dir = CONFIG.models_root / f"taxon_{taxon_id}_{CONFIG.ml_model_kind}_{run_ts}"
+    output_dir = CONFIG.models_root / f"taxon_{taxon_id}_{CONFIG.ml_model_kind}"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"[train] removed old model directory: {output_dir}")
     if model_kind == "gbt":
         model_type = "sklearn_gradient_boosting"
     elif model_kind == "maxent":
@@ -1275,6 +1396,19 @@ def main() -> None:
     print(f"[train] saved model artifact: {output_dir / 'model.pkl'}")
     print(f"[train] saved metrics: {output_dir / 'metrics.json'}")
     print(f"[train] saved summary: {output_dir / 'summary.json'}")
+
+    if bool(CONFIG.ml_push_model_to_b2):
+        remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
+        bucket = os.environ.get("WW_B2_BUCKET", "wherewild-data")
+        prefix = os.environ.get("WW_B2_PREFIX", "data")
+        rel_path = output_dir.relative_to(CONFIG.data_root)
+        remote_dest = f"{remote}:{bucket}/{prefix}/{rel_path}"
+        print(f"[train] pushing model to B2: {remote_dest}")
+        subprocess.run(
+            ["rclone", "copy", str(output_dir), remote_dest, "--transfers=4"],
+            check=True,
+        )
+        print("[train] B2 push complete")
 
 
 if __name__ == "__main__":

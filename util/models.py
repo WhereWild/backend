@@ -46,8 +46,13 @@ def _iter_model_artifact_dirs() -> list[Path]:
 
 
 def _latest_artifact_for_prefix(prefix: str) -> Path | None:
-    for model_dir in _iter_model_artifact_dirs():
-        if model_dir.name.startswith(prefix):
+    dirs = _iter_model_artifact_dirs()
+    # Exact match wins over prefix match
+    for model_dir in dirs:
+        if model_dir.name == prefix:
+            return model_dir
+    for model_dir in dirs:
+        if model_dir.name.startswith(prefix + "_"):
             return model_dir
     return None
 
@@ -60,18 +65,18 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
         if not taxon_key:
             return None
         model_kind = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}")
 
     if normalized.startswith("auto_"):
         model_kind = normalized.removeprefix("auto_").strip().lower()
         if not model_kind or not taxon_key:
             return None
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}_")
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{model_kind}")
 
     if normalized.startswith("taxon_") and (
         normalized.endswith("_gbt") or normalized.endswith("_maxent")
     ):
-        return _latest_artifact_for_prefix(f"{normalized}_")
+        return _latest_artifact_for_prefix(normalized)
 
     candidate = _models_root() / normalized
     if candidate.is_dir() and (candidate / "model.pkl").exists():

@@ -937,11 +937,18 @@ def render_model_tile_bytes(
     stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
 
     for idx, layer_id in enumerate(layer_list):
-        stack[:, :, idx] = _render_layer_values(
-            layer_id,
-            spec,
-            reproject_to_mercator=reproject,
-        )
+        try:
+            stack[:, :, idx] = _render_layer_values(
+                layer_id,
+                spec,
+                reproject_to_mercator=reproject,
+            )
+        except Exception as exc:
+            stack[:, :, idx] = np.nan
+            print(
+                f"[model-tile] WARNING: layer {layer_id} read failed for tile "
+                f"z={z} x={x} y={y} — filling NaN. Error: {exc}"
+            )
         if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
             print(
                 f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} "
