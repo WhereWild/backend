@@ -984,6 +984,7 @@ def render_model_tile_bytes(
     reproject: bool = True,
     forecast_hours: int = 0,
     apply_phenology: bool = True,
+    phenology_only: bool = False,
 ) -> bytes:
     """Render a species habitat-suitability tile.
 
@@ -991,35 +992,50 @@ def render_model_tile_bytes(
     pixel-wise, giving "habitat suitability × current-weather flowering likelihood".
     Temporal feature channels are sampled from the live/forecast weather cache at
     *forecast_hours* (0 = current snapshot, 8/24/72/168 = GFS forecast offsets).
+    If phenology_only=True, renders the raw phenology model output without SDM.
     """
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
 
-    # ── SDM model ────────────────────────────────────────────────────────────
-    sdm_layers = _load_model_layers(taxon_id, model_id, layers)
+    has_phenology = models.has_phenology_model(taxon_id)
 
-    # ── Phenology model (optional) ───────────────────────────────────────────
-    phenology_layers: list[str] = []
-    if apply_phenology and models.has_phenology_model(taxon_id):
-        try:
-            phenology_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
-        except ValueError:
-            phenology_layers = []
-
-    # ── Union feature stack (render each layer once) ─────────────────────────
-    all_layers = list(dict.fromkeys(sdm_layers + phenology_layers))
-    print(
-        f"[model-tile] taxon={taxon_id} sdm_features={len(sdm_layers)} "
-        f"phenology_features={len(phenology_layers)} forecast_hours={forecast_hours}"
-    )
-    stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours)
-
-    probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
-
-    if phenology_layers:
-        pheno_probs = models.predict(
-            models.AUTO_PHENOLOGY_MODEL_ID, stack, feature_ids=all_layers, taxon_id=taxon_id,
+    if phenology_only and has_phenology:
+        # Render phenology model output directly, no SDM
+        phenology_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+        print(
+            f"[model-tile] taxon={taxon_id} mode=phenology_only "
+            f"phenology_features={len(phenology_layers)} forecast_hours={forecast_hours}"
         )
-        probs = probs * pheno_probs
+        stack = _render_feature_stack(phenology_layers, spec, reproject, forecast_hours)
+        probs = models.predict(
+            models.AUTO_PHENOLOGY_MODEL_ID, stack, feature_ids=phenology_layers, taxon_id=taxon_id,
+        )
+    else:
+        # ── SDM model ────────────────────────────────────────────────────────
+        sdm_layers = _load_model_layers(taxon_id, model_id, layers)
+
+        # ── Phenology model (optional) ────────────────────────────────────────
+        phenology_layers: list[str] = []
+        if apply_phenology and has_phenology:
+            try:
+                phenology_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+            except ValueError:
+                phenology_layers = []
+
+        # ── Union feature stack (render each layer once) ─────────────────────
+        all_layers = list(dict.fromkeys(sdm_layers + phenology_layers))
+        print(
+            f"[model-tile] taxon={taxon_id} sdm_features={len(sdm_layers)} "
+            f"phenology_features={len(phenology_layers)} forecast_hours={forecast_hours}"
+        )
+        stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours)
+
+        probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
+
+        if phenology_layers:
+            pheno_probs = models.predict(
+                models.AUTO_PHENOLOGY_MODEL_ID, stack, feature_ids=all_layers, taxon_id=taxon_id,
+            )
+            probs = probs * pheno_probs
 
     rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")

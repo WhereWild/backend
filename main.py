@@ -283,6 +283,7 @@ async def species_heatmap_tile(
     ),
     forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
     apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
+    phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
 ) -> Response:
     if await request.is_disconnected():
         return Response(status_code=204)
@@ -316,6 +317,7 @@ async def species_heatmap_tile(
                 reproject=reproject,
                 forecast_hours=forecast_hours,
                 apply_phenology=apply_phenology,
+                phenology_only=phenology_only,
             )
             if await request.is_disconnected():
                 return Response(status_code=204)
@@ -349,6 +351,7 @@ async def species_heatmap_tile(
                 reproject=reproject,
                 forecast_hours=forecast_hours,
                 apply_phenology=apply_phenology,
+                phenology_only=phenology_only,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

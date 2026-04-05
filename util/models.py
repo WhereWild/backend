@@ -75,13 +75,12 @@ def _resolve_model_dir(model_id: str | None, taxon_id: str | int | None) -> Path
         if not kind_and_mode or not taxon_key:
             return None
         # New-style: taxon_{key}_gbt_sdm_TIMESTAMP
-        result = _latest_artifact_for_prefix(f"taxon_{taxon_key}_{kind_and_mode}_")
+        result = _latest_artifact_for_prefix(f"taxon_{taxon_key}_{kind_and_mode}")
         if result is not None:
             return result
-        # Old-style fallback (no mode suffix): taxon_{key}_gbt_TIMESTAMP
-        # Strip the mode part (e.g. "_sdm", "_phenology") — only applies to SDM, not phenology
+        # Old-style fallback (no mode suffix): taxon_{key}_gbt or taxon_{key}_gbt_TIMESTAMP
         base_kind = kind_and_mode.rsplit("_", 1)[0] if "_" in kind_and_mode else kind_and_mode
-        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{base_kind}_")
+        return _latest_artifact_for_prefix(f"taxon_{taxon_key}_{base_kind}")
 
     if normalized.startswith("taxon_"):
         # Exact match first (full artifact id passed), then prefix search

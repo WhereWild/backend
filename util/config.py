@@ -119,7 +119,7 @@ class GlobalConfig:
     sdm_tile_size: int = 256
 
     # ML training
-    ml_train_taxon_id: str = "3084072"
+    ml_train_taxon_id: str = "3953823"
     ml_model_kind: str = "gbt"
     ml_negative_ratio: int = 15
     ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
@@ -139,15 +139,12 @@ class GlobalConfig:
     ml_negative_taxa_candidate_pool: int = 10000
     ml_parquet_storage_mode: str = "local"
     ml_raster_storage_mode: str = "auto"
-    ml_phenology_mode: bool = True
+    ml_phenology_mode: bool = False
+    ml_phenology_temporal_only: bool = True
     # Phenology mode: column containing reproductive condition summary and positive values
     ml_phenology_rcs_column: str = "rcs"
     ml_phenology_rcs_positive_values: tuple[str, ...] = (
         "flowers",
-        "flower buds",
-        "fruits or seeds",
-        "flowers|flower buds",
-        "fruits or seeds|flower buds",
     )
 
     # Enrichment
@@ -181,9 +178,7 @@ class GlobalConfig:
             "snow_depth": ("copernicus_era5_land",),
             "snowfall_water_equivalent": ("copernicus_era5", "copernicus_era5_ensemble"),
             "soil_moisture_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
-            "soil_moisture_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
-            "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "vapor_pressure_deficit": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
@@ -202,9 +197,7 @@ class GlobalConfig:
             "precipitation": (1, 8, 24, 72, 168, 720, 2160),
             "snowfall_water_equivalent": (1, 8, 24, 72, 168, 720, 2160),
             "soil_moisture_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
-            "soil_moisture_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
             "soil_temperature_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
-            "soil_temperature_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
             "temperature_2m": (1, 8, 24, 72, 168, 720, 2160),
             # Snapshots
             "snow_depth": (1,),
@@ -225,7 +218,6 @@ class GlobalConfig:
         "temperature_2m",
         "dew_point_2m",
         "soil_temperature_0_to_7cm",
-        "soil_temperature_7_to_28cm",
     )
     temporal_agg_by_variable: dict[str, str] = field(
         default_factory=lambda: {
@@ -236,9 +228,7 @@ class GlobalConfig:
             "dew_point_2m": "avg",
             "snow_depth": "avg",
             "soil_moisture_0_to_7cm": "avg",
-            "soil_moisture_7_to_28cm": "avg",
             "soil_temperature_0_to_7cm": "avg",
-            "soil_temperature_7_to_28cm": "avg",
             "temperature_2m": "avg",
         }
     )
