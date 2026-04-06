@@ -334,6 +334,8 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
     entries: list[dict[str, Any]] = []
     mapping: dict[str, dict[str, Any]] = {}
     for category in catalog.get("categories", []):
+        if category.get("name") == "live_weather":
+            continue
         category_name = category.get("display_name") or category.get("name")
         if category.get("name") == "temporal":
             for layer in _expand_temporal_layers(category):

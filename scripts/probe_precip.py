@@ -1,6 +1,7 @@
 """Check global models for any precipitation-like variables (broad name match)."""
 from __future__ import annotations
-import json, fsspec
+import json
+import fsspec
 from datetime import datetime
 from omfiles import OmFileReader
 

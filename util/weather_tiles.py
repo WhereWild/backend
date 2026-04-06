@@ -13,7 +13,6 @@ import numpy as np
 from omfiles import OmFileReader
 from PIL import Image
 
-import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds as rasterio_from_bounds
 from rasterio.warp import reproject, Resampling as RasterioResampling
@@ -182,11 +181,17 @@ def _populate_cache_from_hits(model: str, ref_time: str, disk_hits: dict[str, np
         snow_rate = swe / 10.0
         rain_rate = prec
         code = np.full(cc.shape, 3, dtype=np.float32)
-        code[cc < 80] = 2;  code[cc < 50] = 1;  code[cc < 20] = 0
-        code[rain_rate >= 0.01] = 51; code[rain_rate >= 0.5] = 53
-        code[rain_rate >= 1.0]  = 55; code[rain_rate >= 1.3] = 61
-        code[rain_rate >= 2.5]  = 63; code[rain_rate >= 7.6] = 65
-        code[snow_rate >= 0.01] = 71; code[snow_rate >= 0.2] = 73
+        code[cc < 80] = 2
+        code[cc < 50] = 1
+        code[cc < 20] = 0
+        code[rain_rate >= 0.01] = 51
+        code[rain_rate >= 0.5] = 53
+        code[rain_rate >= 1.0] = 55
+        code[rain_rate >= 1.3] = 61
+        code[rain_rate >= 2.5] = 63
+        code[rain_rate >= 7.6] = 65
+        code[snow_rate >= 0.01] = 71
+        code[snow_rate >= 0.2] = 73
         code[snow_rate >= 0.8]  = 75
         disk_hits["weather_code_simple"] = code
 
@@ -301,7 +306,8 @@ def load_cache() -> None:
             _load_model(model, forecast_hours=0)
         except Exception as exc:
             print(f"[weather_tiles] ERROR loading {model}: {exc}", flush=True)
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
     print(f"[weather_tiles] cache ready. vars={list(_cache.keys())}", flush=True)
 
 

@@ -9,7 +9,6 @@ import fsspec
 import numpy as np
 from omfiles import OmFileReader
 from PIL import Image
-import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds as rasterio_from_bounds
 from rasterio.warp import reproject as rasterio_reproject, Resampling
