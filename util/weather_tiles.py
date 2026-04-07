@@ -241,7 +241,6 @@ def _load_model(model: str, forecast_hours: int = 0) -> None:
             vars_for_model = {vid for vid, cfg in LIVE_WEATHER_VARIABLES.items() if cfg["model"] == model}
             already_done = current_ref == ref_time and all(v in fc for v in vars_for_model)
     if already_done:
-        print(f"[weather_tiles] {model}+{forecast_hours}h already current ({ref_time})", flush=True)
         return
 
     raw_needs = (
@@ -257,16 +256,12 @@ def _load_model(model: str, forecast_hours: int = 0) -> None:
     valid = valid_times[1] if target_dt is None else min(
         valid_times, key=lambda t: abs((t - target_dt).total_seconds()))
 
-    tag = f"+{forecast_hours}h" if forecast_hours else "current"
-    print(f"[weather_tiles] {model} {tag}: valid={valid.strftime('%Y-%m-%dT%HZ')}", flush=True)
-
     # Try disk cache first
     disk_hits: dict[str, np.ndarray] = {}
     for var_id in raw_needs:
         arr = _load_from_disk(model, ref_time, var_id, forecast_hours)
         if arr is not None:
             disk_hits[var_id] = arr
-            print(f"[weather_tiles] {model}/{var_id}+{forecast_hours}h from disk", flush=True)
 
     # Fetch missing vars from S3
     need = [v for v in raw_needs if v not in disk_hits]
@@ -276,24 +271,18 @@ def _load_model(model: str, forecast_hours: int = 0) -> None:
         local_om = _DISK_CACHE_DIR / f"{model}__{safe_valid}.om"
         _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         if not local_om.exists():
-            print(f"[weather_tiles] S3 fetch {tag}: {need} from {model}", flush=True)
             fs_anon = fsspec.filesystem("s3", anon=True)
             fs_anon.get(s3_path, str(local_om))
-        else:
-            print(f"[weather_tiles] S3 om file from disk {tag} from {model}", flush=True)
         root = OmFileReader(str(local_om))
         available = {root.get_child_by_index(i).name for i in range(root.num_children)}
         for var_id in need:
             if var_id not in available:
-                print(f"[weather_tiles] {var_id} not in {model}, skipping", flush=True)
                 continue
             node = root.get_child_by_name(var_id)
             ny, nx = node.shape
             arr = node.read_array((slice(0, ny), slice(0, nx)))
             _save_to_disk(model, ref_time, var_id, arr, forecast_hours)
             disk_hits[var_id] = arr
-            print(f"[weather_tiles] {model}/{var_id}+{forecast_hours}h  "
-                  f"range=[{float(arr.min()):.1f}, {float(arr.max()):.1f}]", flush=True)
 
     _populate_cache_from_hits(model, ref_time, disk_hits, forecast_hours)
 
@@ -304,21 +293,15 @@ def load_cache() -> None:
     for model in sorted(models):
         try:
             _load_model(model, forecast_hours=0)
-        except Exception as exc:
-            print(f"[weather_tiles] ERROR loading {model}: {exc}", flush=True)
-            import traceback
-            traceback.print_exc()
-    print(f"[weather_tiles] cache ready. vars={list(_cache.keys())}", flush=True)
+        except Exception:
+            pass
 
 
 def preload_all_forecasts() -> None:
     """Pre-fetch and disk-cache all forecast offsets. Safe to call from build scripts."""
-    print("[weather_tiles] preloading current snapshot ...", flush=True)
     load_cache()
     for hours in FORECAST_HOURS_OPTIONS:
-        print(f"[weather_tiles] preloading +{hours}h forecast ...", flush=True)
         ensure_forecast_loaded(hours)
-    print("[weather_tiles] all forecast offsets cached to disk.", flush=True)
 
 
 def load_from_disk() -> None:
@@ -329,7 +312,6 @@ def load_from_disk() -> None:
     Called on API startup so the API never needs to touch S3.
     """
     if not _DISK_CACHE_DIR.exists():
-        print("[weather_tiles] disk cache dir not found — run build script first", flush=True)
         return
 
     raw_needs_by_model: dict[str, set[str]] = {}
@@ -345,7 +327,6 @@ def load_from_disk() -> None:
         # Find the newest ref_time by scanning filenames (format: model__safe_ref__var.npy)
         files = list(_DISK_CACHE_DIR.glob(f"{model}__*__*.npy"))
         if not files:
-            print(f"[weather_tiles] no disk cache for {model} — run build script first", flush=True)
             continue
         ref_times: set[str] = set()
         for f in files:
@@ -363,8 +344,7 @@ def load_from_disk() -> None:
             if disk_hits:
                 _populate_cache_from_hits(model, newest_ref, disk_hits, forecast_hours)
             else:
-                tag = f"+{forecast_hours}h" if forecast_hours else "current"
-                print(f"[weather_tiles] {model} {tag} not on disk — run build script", flush=True)
+                pass
 
 
 def cleanup_weather_disk_cache(now_ts: float, keep_hours: int = 24) -> None:
@@ -380,8 +360,7 @@ def cleanup_weather_disk_cache(now_ts: float, keep_hours: int = 24) -> None:
                 removed += 1
         except OSError:
             pass
-    if removed:
-        print(f"[weather_tiles] cleaned {removed} stale weather cache file(s)", flush=True)
+    pass
 
 
 def ensure_forecast_loaded(forecast_hours: int) -> None:
@@ -398,8 +377,8 @@ def ensure_forecast_loaded(forecast_hours: int) -> None:
         for model in sorted(models):
             try:
                 _load_model(model, forecast_hours=forecast_hours)
-            except Exception as exc:
-                print(f"[weather_tiles] ERROR loading {model}+{forecast_hours}h: {exc}", flush=True)
+            except Exception:
+                pass
 
 
 def _colorize(arr: np.ndarray, stops: np.ndarray, lo: float, hi: float) -> np.ndarray:

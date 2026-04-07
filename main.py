@@ -682,7 +682,6 @@ def homepage_viewport_scores(
         if taxon_reasons:
             reasons[taxon_id_str] = taxon_reasons
 
-    print(f"[scores] returning {len(scores)} scores")
     return {"scores": scores, "reasons": reasons}
 
 
@@ -768,9 +767,8 @@ def get_species_detail(
         if isinstance(text, str) and text.strip():
             payload["description"] = text
         payload["description_profile"] = description_profile
-    except Exception as exc:
-        print(f"[description] failed for taxon_id={taxon_id}: {exc}")
-        traceback.print_exc()
+    except Exception:
+        pass
     payload["heatmap"] = models.describe_model(models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
     return payload
 
@@ -1223,10 +1221,6 @@ def species_environment_stats(
         }
         if location_gid:
             ranks = []
-            print(
-                f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
-                f"location={location_gid} step=relative_ranks skipped=1 reason=location_filter"
-            )
         else:
             ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
         response = {
@@ -1333,10 +1327,6 @@ def species_environment_stats(
     summary = summary_stats.summarize_values(values)
     density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(variable_id == "aspect_deg"))
     ranks = []
-    print(
-        f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
-        f"location={location_gid} step=relative_ranks skipped=1 reason=location_filter"
-    )
     response = {
         "speciesId": taxon_id,
         "species_id": taxon_id,
@@ -1787,8 +1777,6 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
             detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
         )
     
-    print("Received file, converting to parquet...")
-
     contents = await file.read()
     buf = io.BytesIO(contents)
 
@@ -1802,20 +1790,14 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
 
-    print("Finished converting file to parquet, normalizing fields...")
-
     df = custom_upload_processing._normalize_coordinate_columns(df)
     df = custom_upload_processing._ensure_catalog_numbers(df)
-    print("Finished normalizing fields. adding tileID...")
     df = custom_upload_processing._add_tile_ids(df)
-    print("Finished adding tileID, adding columns for GIS data, building parquet files")
     df = custom_upload_processing._add_gis_columns(df)
 
     archive_path, out_name, work_dir = custom_upload_processing._build_index_archive(df, filename)
 
     background_tasks.add_task(shutil.rmtree, work_dir, True)
-
-    print("Finished generating, returning zip")
     return FileResponse(
         path=archive_path,
         media_type="application/zip",

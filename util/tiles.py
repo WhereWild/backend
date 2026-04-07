@@ -8,6 +8,7 @@ import io
 import math
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+import warnings
 
 import numpy as np
 from PIL import Image
@@ -21,6 +22,9 @@ from rasterio.windows import Window, from_bounds as window_from_bounds, transfor
 
 from util.config import load_config
 from util import gis_lookup, models, units
+
+from rasterio.errors import NotGeoreferencedWarning
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 
 CONFIG = load_config("global")
@@ -419,6 +423,7 @@ def _render_layer_values(
     spec: TileSpec,
     *,
     reproject_to_mercator: bool,
+    overview_bias: int = 0,
 ) -> np.ndarray:
     layer_meta = _layer_metadata(layer_id)
 
@@ -461,6 +466,9 @@ def _render_layer_values(
 
             overviews, desired = _estimate_overview_factor(ds, bounds_wgs84, spec.tile_size)
             chosen_level, chosen_factor = _choose_overview_level(overviews, desired)
+            if overview_bias > 0 and chosen_level is not None and overviews:
+                chosen_level = min(len(overviews) - 1, chosen_level + overview_bias)
+                chosen_factor = overviews[chosen_level]
             overview_factor = max(1, int(chosen_factor or 1))
 
             if not reproject_to_mercator and _is_wgs84(ds):
@@ -935,21 +943,31 @@ def _render_feature_stack(
     forecast_hours: int,
     *,
     layer_cache: "dict[str, np.ndarray] | None" = None,
+    overview_bias: int = 0,
 ) -> np.ndarray:
     """Render a (tile_size, tile_size, C) feature tensor for the given layer list.
 
     If *layer_cache* is provided, already-rendered layers are read from it and
     newly rendered layers are stored back into it so subsequent calls sharing the
     same cache dict skip redundant I/O.
+    Layers not already cached are rendered in parallel using a thread pool.
     """
+    from concurrent.futures import ThreadPoolExecutor
     from util import weather_tiles as _wt
 
     tile_size = spec.tile_size
     stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
+
+    # Populate from cache first; collect indices that still need rendering.
+    to_render: list[tuple[int, str]] = []
     for idx, layer_id in enumerate(layer_list):
         if layer_cache is not None and layer_id in layer_cache:
             stack[:, :, idx] = layer_cache[layer_id]
-            continue
+        else:
+            to_render.append((idx, layer_id))
+
+    def _render_one(idx_layer: tuple[int, str]) -> tuple[int, str, np.ndarray]:
+        idx, layer_id = idx_layer
         parsed_temporal = gis_lookup.parse_temporal_layer_id(layer_id)
         if parsed_temporal is not None:
             variable_id, _agg, window_hours = parsed_temporal
@@ -957,25 +975,25 @@ def _render_feature_stack(
                 arr = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
             except Exception as exc:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-                print(f"[model-tile] WARNING: temporal layer {layer_id} failed: {exc}")
         else:
             try:
                 arr = _render_layer_values(
                     layer_id,
                     spec,
                     reproject_to_mercator=reproject,
+                    overview_bias=overview_bias,
                 )
             except Exception as exc:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-                print(
-                    f"[model-tile] WARNING: layer {layer_id} read failed for tile "
-                    f"z={spec.z} x={spec.x} y={spec.y} — filling NaN. Error: {exc}"
-                )
-        stack[:, :, idx] = arr
-        if layer_cache is not None:
-            layer_cache[layer_id] = arr
-        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
-            print(f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} current_layer={layer_id}")
+        return idx, layer_id, arr
+
+    n_workers = min(len(to_render), 16) if to_render else 1
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for idx, layer_id, arr in pool.map(_render_one, to_render):
+            stack[:, :, idx] = arr
+            if layer_cache is not None:
+                layer_cache[layer_id] = arr
+
     return stack
 
 
@@ -990,6 +1008,7 @@ def _compute_model_probs(
     apply_phenology: bool = True,
     phenology_only: bool = False,
     layer_cache: "dict[str, np.ndarray] | None" = None,
+    overview_bias: int = 0,
 ) -> np.ndarray:
     """Compute per-pixel probabilities for a single taxon. Returns (H, W) float array."""
     has_phenology = models.has_phenology_model(taxon_id)
@@ -1005,11 +1024,7 @@ def _compute_model_probs(
         active_model_id = model_id
 
     active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
-    print(
-        f"[model-tile] taxon={taxon_id} model={active_model_id} "
-        f"features={len(active_layers)} forecast_hours={forecast_hours}"
-    )
-    stack = _render_feature_stack(active_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
+    stack = _render_feature_stack(active_layers, spec, reproject, forecast_hours, layer_cache=layer_cache, overview_bias=overview_bias)
     probs = models.predict(active_model_id, stack, feature_ids=active_layers, taxon_id=taxon_id)
 
     # Plants with both SDM + phenology: multiply for combined view
@@ -1018,7 +1033,7 @@ def _compute_model_probs(
             pheno_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
             all_layers = list(dict.fromkeys(active_layers + pheno_layers))
             if all_layers != active_layers:
-                stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
+                stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours, layer_cache=layer_cache, overview_bias=overview_bias)
                 probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
             pheno_probs = models.predict(
                 models.AUTO_PHENOLOGY_MODEL_ID,
@@ -1046,6 +1061,7 @@ def render_model_tile_bytes(
     forecast_hours: int = 0,
     apply_phenology: bool = True,
     phenology_only: bool = False,
+    overview_bias: int = 1,
 ) -> bytes:
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
     probs = _compute_model_probs(
@@ -1057,6 +1073,7 @@ def render_model_tile_bytes(
         forecast_hours=forecast_hours,
         apply_phenology=apply_phenology,
         phenology_only=phenology_only,
+        overview_bias=overview_bias,
     )
     rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")
@@ -1073,6 +1090,7 @@ def render_aggregate_tile_bytes(
     tile_size: int = 256,
     reproject: bool = True,
     forecast_hours: int = 0,
+    overview_bias: int = 1,
 ) -> bytes:
     """Render an aggregate heatmap averaged across all species with available models.
 
@@ -1097,11 +1115,12 @@ def render_aggregate_tile_bytes(
                 forecast_hours=forecast_hours,
                 apply_phenology=True,
                 layer_cache=layer_cache,
+                overview_bias=overview_bias,
             )
             acc = probs if acc is None else acc + probs
             count += 1
-        except Exception as exc:
-            print(f"[aggregate-tile] skipping taxon={taxon_id}: {exc}")
+        except Exception:
+            pass
 
     if acc is None or count == 0:
         # No models — return transparent tile
@@ -1112,7 +1131,6 @@ def render_aggregate_tile_bytes(
         return buffer.getvalue()
 
     avg = acc / count
-    print(f"[aggregate-tile] z={z} x={x} y={y} species={count} avg_max={float(avg.max()):.3f}")
     rgba = _colorize_heatmap(avg)
     image = Image.fromarray(rgba, mode="RGBA")
     buffer = io.BytesIO()
