@@ -3,7 +3,6 @@ import io
 import math
 import re
 import shutil
-import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass as _dataclass
 from datetime import datetime, timezone

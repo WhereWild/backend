@@ -4,6 +4,7 @@ import colorsys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import io
 import math
 from pathlib import Path
@@ -29,6 +30,65 @@ warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 CONFIG = load_config("global")
 WEB_MERCATOR = "EPSG:3857"
+
+# ---------------------------------------------------------------------------
+# Shared on-disk tile cache — all workers read/write the same directory.
+# Size-based eviction: when total exceeds _TILE_CACHE_MAX_BYTES, oldest files
+# (by mtime) are removed until usage drops to 80% of the limit.
+# ---------------------------------------------------------------------------
+_TILE_CACHE_DIR = Path("/workspace/cache/tiles")
+_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB
+
+
+def _tile_cache_path(key: str) -> Path:
+    return _TILE_CACHE_DIR / f"{key}.png"
+
+
+def _read_tile_cache(key: str) -> bytes | None:
+    path = _tile_cache_path(key)
+    try:
+        data = path.read_bytes()
+        path.touch()  # bump mtime so LRU eviction keeps hot tiles
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _write_tile_cache(key: str, data: bytes) -> None:
+    try:
+        _TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _tile_cache_path(key).write_bytes(data)
+        _evict_tile_cache_if_needed()
+    except Exception:
+        pass
+
+
+def _evict_tile_cache_if_needed() -> None:
+    try:
+        entries = []
+        total = 0
+        for p in _TILE_CACHE_DIR.glob("*.png"):
+            st = p.stat()
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= _TILE_CACHE_MAX_BYTES:
+            return
+        target = int(_TILE_CACHE_MAX_BYTES * 0.8)
+        entries.sort()  # oldest mtime first
+        for _, size, path in entries:
+            if total <= target:
+                break
+            path.unlink(missing_ok=True)
+            total -= size
+    except Exception:
+        pass
+
+
+def _make_tile_cache_key(**kwargs: object) -> str:
+    raw = "&".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def _is_temporal_column(col: str) -> bool:
@@ -973,7 +1033,7 @@ def _render_feature_stack(
             variable_id, _agg, window_hours = parsed_temporal
             try:
                 arr = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
-            except Exception as exc:
+            except Exception:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
         else:
             try:
@@ -983,7 +1043,7 @@ def _render_feature_stack(
                     reproject_to_mercator=reproject,
                     overview_bias=overview_bias,
                 )
-            except Exception as exc:
+            except Exception:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
         return idx, layer_id, arr
 
@@ -993,7 +1053,6 @@ def _render_feature_stack(
             stack[:, :, idx] = arr
             if layer_cache is not None:
                 layer_cache[layer_id] = arr
-
     return stack
 
 
@@ -1024,6 +1083,7 @@ def _compute_model_probs(
         active_model_id = model_id
 
     active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
+
     stack = _render_feature_stack(active_layers, spec, reproject, forecast_hours, layer_cache=layer_cache, overview_bias=overview_bias)
     probs = models.predict(active_model_id, stack, feature_ids=active_layers, taxon_id=taxon_id)
 
@@ -1034,7 +1094,6 @@ def _compute_model_probs(
             all_layers = list(dict.fromkeys(active_layers + pheno_layers))
             if all_layers != active_layers:
                 stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours, layer_cache=layer_cache, overview_bias=overview_bias)
-                probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
             pheno_probs = models.predict(
                 models.AUTO_PHENOLOGY_MODEL_ID,
                 stack,
@@ -1063,7 +1122,18 @@ def render_model_tile_bytes(
     phenology_only: bool = False,
     overview_bias: int = 1,
 ) -> bytes:
-    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    cache_key = _make_tile_cache_key(
+        taxon_id=taxon_id, z=z, x=x, y=y,
+        model_id=model_id, forecast_hours=forecast_hours,
+        apply_phenology=apply_phenology, phenology_only=phenology_only,
+        tile_size=tile_size, overview_bias=overview_bias,
+    )
+    cached = _read_tile_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    render_size = max(tile_size // 2, 64)
+    spec = TileSpec(z=z, x=x, y=y, tile_size=render_size)
     probs = _compute_model_probs(
         taxon_id,
         spec,
@@ -1077,9 +1147,13 @@ def render_model_tile_bytes(
     )
     rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")
+    if render_size != tile_size:
+        image = image.resize((tile_size, tile_size), Image.BILINEAR)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    result = buffer.getvalue()
+    _write_tile_cache(cache_key, result)
+    return result
 
 
 def render_aggregate_tile_bytes(
