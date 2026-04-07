@@ -1132,7 +1132,7 @@ def render_model_tile_bytes(
     if cached is not None:
         return cached
 
-    render_size = max(tile_size // 2, 64)
+    render_size = tile_size
     spec = TileSpec(z=z, x=x, y=y, tile_size=render_size)
     probs = _compute_model_probs(
         taxon_id,
