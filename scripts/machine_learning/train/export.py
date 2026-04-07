@@ -11,6 +11,9 @@ Usage:
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
     --heads-checkpoint ./checkpoints/canary_plants/heads/species_heads.pt \
     --output ./checkpoints/canary_plants/inference_bundle.pt
+
+You can also pass a directory to --output and the bundle will be written as
+inference_bundle.pt inside that directory.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ classify_feature_name = import_module("scripts.machine_learning.preprocess_train
 
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
+_DEFAULT_BUNDLE_FILENAME = "inference_bundle.pt"
 
 
 def build_cell_table(
@@ -195,6 +199,13 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         return None
 
 
+def _resolve_output_path(output_path: Path) -> Path:
+    """Accept either an explicit bundle file path or an output directory."""
+    if output_path.exists() and output_path.is_dir():
+        return output_path / _DEFAULT_BUNDLE_FILENAME
+    return output_path
+
+
 def export_bundle(
     data_root: Path,
     encoder_path: Path,
@@ -203,6 +214,8 @@ def export_bundle(
     cell_size_deg: float = 0.25,
 ) -> Path:
     """Create a single inference bundle file."""
+    output_path = _resolve_output_path(output_path)
+
     encoder_ckpt = torch.load(encoder_path, map_location="cpu", weights_only=True)
     heads_ckpt = torch.load(heads_path, map_location="cpu", weights_only=True)
 
@@ -244,7 +257,12 @@ def main() -> int:
     parser.add_argument("--data-root", type=Path, required=True, help="Preprocessed parquet dataset root.")
     parser.add_argument("--encoder-checkpoint", type=Path, required=True, help="Path to encoder_best.pt.")
     parser.add_argument("--heads-checkpoint", type=Path, required=True, help="Path to species_heads.pt.")
-    parser.add_argument("--output", type=Path, required=True, help="Output path for inference bundle.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Output bundle file path, or an existing directory to receive inference_bundle.pt.",
+    )
     parser.add_argument("--cell-size-deg", type=float, default=0.25, help="Geocell bin size in degrees.")
     args = parser.parse_args()
 

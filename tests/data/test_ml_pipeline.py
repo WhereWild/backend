@@ -606,3 +606,54 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
     assert cells[0]["lat"] == 0.125
     assert cells[0]["lon"] == 0.125
     assert isinstance(cells[0]["score"], float)
+
+
+def test_export_bundle_accepts_output_directory(tmp_path: Path) -> None:
+    data_root = tmp_path / "dataset"
+    output_dir = tmp_path / "bundle_dir"
+    encoder_path = tmp_path / "encoder.pt"
+    heads_path = tmp_path / "heads.pt"
+
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": ["landcover"],
+        "terrain": ["landform"],
+        "temporal": ["temperature_2m_24h"],
+        "other": ["custom_measure"],
+    }
+    (data_root / "_meta").mkdir(parents=True, exist_ok=True)
+    (data_root / "_meta" / "feature_template.json").write_text(json.dumps(feature_names), encoding="utf-8")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_split_part(
+        data_root,
+        split="train",
+        part_name="part-0.parquet",
+        cell_id="cell_0_0",
+        feature_values=[1.0, 2.0, 3.0, 4.0, 5.0],
+        mask_values=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+    encoder = SharedEncoder(input_dim=10, embed_dim=4, hidden_dim=8)
+    head = SpeciesHead(embed_dim=4)
+    torch.save(
+        {
+            "input_dim": 10,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_path,
+    )
+    torch.save(
+        {
+            "head_states": {101: head.state_dict()},
+            "species_meta": {101: {"name": "Test species"}},
+        },
+        heads_path,
+    )
+
+    bundle_path = export.export_bundle(data_root, encoder_path, heads_path, output_dir)
+
+    assert bundle_path == output_dir / "inference_bundle.pt"
+    assert bundle_path.exists()
