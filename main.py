@@ -3,6 +3,7 @@ import io
 import math
 import re
 import shutil
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass as _dataclass
 from datetime import datetime, timezone
@@ -63,7 +64,6 @@ async def lifespan(app: FastAPI):
         pass
     import threading
     threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
-    threading.Thread(target=_get_homepage_cache, daemon=True, name="homepage-cache").start()
     yield
 
 
@@ -404,6 +404,7 @@ async def aggregate_heatmap_tile(
 
 _HOMEPAGE_RASTER = Path(__file__).parent / "data" / "gis" / "temporal" / "homepage" / "aggregate_sdm.tif"
 _TAXON_PROBS_PATH = _HOMEPAGE_RASTER.parent / "taxon_probs.npz"
+_SCORES_CACHE_DIR = Path("/workspace/cache/scores")
 
 @_dataclass
 class _HomepageCache:
@@ -548,30 +549,23 @@ _LANDCOVER_GROUP_LABELS: dict[str, str] = {
 }
 
 
-@app.get("/api/heatmap/homepage/scores")
-def homepage_viewport_scores(
-    min_lon: float = Query(...),
-    min_lat: float = Query(...),
-    max_lon: float = Query(...),
-    max_lat: float = Query(...),
-) -> dict[str, Any]:
-    """Return per-taxon average probability for the given viewport bbox.
-
-    Slices pre-built per-taxon rasters to the bbox and returns
-    {taxon_id: avg_prob} — no model inference at request time.
-    """
+def _compute_single_tile_scores(z: int, x: int, y: int) -> dict:
+    """Compute per-taxon scores for a single tile. Loads data locally so nothing is retained in worker memory."""
+    import json as _json
     import numpy as _np
+    from collections import defaultdict as _dd
+    from util.tiles import TileSpec, tile_bounds_wgs84
 
-    cache = _get_homepage_cache()
-    if not cache:
+    meta_path = _HOMEPAGE_RASTER.parent / "base_features_meta.json"
+    if not meta_path.exists() or not _TAXON_PROBS_PATH.exists():
         return {"scores": {}, "reasons": {}}
 
-    meta = cache.meta
+    meta = _json.loads(meta_path.read_text())
     out_h, out_w = meta["shape"]
     res = meta["resolution_degrees"]
     bounds = meta["bounds"]
 
-    # Clamp viewport to raster extent
+    min_lon, min_lat, max_lon, max_lat = tile_bounds_wgs84(TileSpec(z=z, x=x, y=y, tile_size=256))
     c_min_lon = max(min_lon, bounds["min_lon"])
     c_max_lon = min(max_lon, bounds["max_lon"])
     c_min_lat = max(min_lat, bounds["min_lat"])
@@ -586,101 +580,151 @@ def homepage_viewport_scores(
     if col1 <= col0 or row1 <= row0:
         return {"scores": {}, "reasons": {}}
 
-    # Load temporal slices for reason computation
-    _TEMPORAL_WINDOW_LABELS = {1:"1h",8:"8h",24:"24h",72:"3d",168:"7d",720:"30d",2160:"90d"}
-    temporal_dir = _HOMEPAGE_RASTER.parent.parent / "rasters"
-    temporal_arrays: dict[str, "_np.ndarray | None"] = {}
-    for p in temporal_dir.glob("*.npy"):
-        # Match files like temperature_2m_24h.npy
-        stem = p.stem
-        temporal_arrays[stem] = _np.load(p).astype(_np.float32)
+    # Load taxon probs locally — not stored in module state, GC'd on return
+    taxon_npz = _np.load(_TAXON_PROBS_PATH)
+    scores: dict[str, float] = {}
+    probs_patches: dict[str, "_np.ndarray"] = {}
+    for taxon_id_str in taxon_npz.files:
+        patch = taxon_npz[taxon_id_str][row0:row1, col0:col1]
+        finite = patch[_np.isfinite(patch)]
+        if finite.size > 0:
+            scores[taxon_id_str] = float(finite.mean())
+            probs_patches[taxon_id_str] = patch
+    del taxon_npz
 
-    # Slice temporal arrays to viewport
+    # Temporal reasons
     era5_res = 0.25
     er0 = max(0, round((90.0 - c_max_lat) / era5_res))
     er1_bound = round((90.0 - c_min_lat) / era5_res)
     ec0 = max(0, round((c_min_lon + 180.0) / era5_res))
     ec1_bound = round((c_max_lon + 180.0) / era5_res)
     need_h, need_w = row1 - row0, col1 - col0
+
+    temporal_dir = _HOMEPAGE_RASTER.parent.parent / "rasters"
     temporal_patches: dict[str, "_np.ndarray"] = {}
-    for feat_id, full in temporal_arrays.items():
-        if full is None:
-            continue
+    for p in temporal_dir.glob("*.npy"):
+        full = _np.load(p).astype(_np.float32)
         er1 = min(full.shape[0], er1_bound)
         ec1 = min(full.shape[1], ec1_bound)
         sliced = full[er0:er1, ec0:ec1]
         if sliced.shape != (need_h, need_w):
             out = _np.full((need_h, need_w), _np.nan, dtype=_np.float32)
-            h = min(sliced.shape[0], need_h)
-            w = min(sliced.shape[1], need_w)
+            h, w = min(sliced.shape[0], need_h), min(sliced.shape[1], need_w)
             out[:h, :w] = sliced[:h, :w]
             sliced = out
-        temporal_patches[feat_id] = sliced
+        temporal_patches[p.stem] = sliced
 
-    scores: dict[str, float] = {}
+    lc_path = _HOMEPAGE_RASTER.parent / "base_features.npz"
+    lc_arr: "_np.ndarray | None" = None
+    if lc_path.exists():
+        lc_npz = _np.load(lc_path)
+        if "landcover" in lc_npz:
+            lc_arr = lc_npz["landcover"][row0:row1, col0:col1]
+        del lc_npz
+
     reasons: dict[str, list[str]] = {}
-    for taxon_id_str, probs_full in cache.taxon_probs.items():
-        probs_patch = probs_full[row0:row1, col0:col1]
-        finite = probs_patch[_np.isfinite(probs_patch)]
-        if finite.size == 0:
-            continue
-        scores[taxon_id_str] = float(finite.mean())
+    for taxon_id_str, prob_patch in probs_patches.items():
+        prob_flat = prob_patch.flatten()
+        taxon_reasons: list[str] = []
 
-        prob_flat = probs_patch.flatten()
-
-        def _top_temporal_reason() -> "str | None":
-            best: tuple[float, str] | None = None
-            for feat_id, arr in temporal_patches.items():
-                feat_flat = arr.flatten()
-                valid = _np.isfinite(feat_flat) & _np.isfinite(prob_flat)
-                if valid.sum() < 10:
-                    continue
-                fv, pv = feat_flat[valid], prob_flat[valid]
-                if fv.std() == 0 or pv.std() == 0:
-                    continue
+        best_temporal: tuple[float, str] | None = None
+        for feat_id, arr in temporal_patches.items():
+            feat_flat = arr.flatten()
+            valid = _np.isfinite(feat_flat) & _np.isfinite(prob_flat)
+            if valid.sum() < 10:
+                continue
+            fv, pv = feat_flat[valid], prob_flat[valid]
+            if fv.std() == 0 or pv.std() == 0:
+                continue
+            with _np.errstate(invalid='ignore'):
                 corr = float(_np.corrcoef(fv, pv)[0, 1])
-                if not _np.isfinite(corr):
-                    continue
-                parsed_temporal = gis_lookup.parse_temporal_layer_id(feat_id)
-                var_name = parsed_temporal[0] if parsed_temporal else re.sub(r'_\d+[hd]$', '', feat_id)
-                label_pair = _TEMPORAL_REASON_LABELS.get(var_name)
-                if not label_pair:
-                    continue
-                label = label_pair[0] if corr >= 0 else label_pair[1]
-                if best is None or abs(corr) > best[0]:
-                    best = (abs(corr), label)
-            return best[1] if best else None
+            if not _np.isfinite(corr):
+                continue
+            parsed = gis_lookup.parse_temporal_layer_id(feat_id)
+            var_name = parsed[0] if parsed else re.sub(r'_\d+[hd]$', '', feat_id)
+            label_pair = _TEMPORAL_REASON_LABELS.get(var_name)
+            if not label_pair:
+                continue
+            label = label_pair[0] if corr >= 0 else label_pair[1]
+            if best_temporal is None or abs(corr) > best_temporal[0]:
+                best_temporal = (abs(corr), label)
+        if best_temporal:
+            taxon_reasons.append(best_temporal[1])
 
-        def _landcover_reason() -> "str | None":
-            lc_full = cache.gis_arrays.get("landcover")
-            if lc_full is None:
-                return None
-            lc_patch = lc_full[row0:row1, col0:col1].flatten()
-            valid = _np.isfinite(lc_patch) & _np.isfinite(prob_flat)
-            if not valid.any():
-                return None
-            lc_vals = _np.rint(lc_patch[valid]).astype(int)
-            prob_vals = prob_flat[valid]
-            from collections import defaultdict as _dd
-            group_probs: dict = _dd(list)
-            for cls, p in zip(lc_vals, prob_vals):
-                group = _LANDCOVER_CLASS_TO_GROUP.get(int(cls))
-                if group:
-                    group_probs[group].append(p)
-            best_group = max(
-                (g for g, ps in group_probs.items() if len(ps) >= 3),
-                key=lambda g: float(_np.mean(group_probs[g])),
-                default=None,
-            )
-            return _LANDCOVER_GROUP_LABELS.get(best_group) if best_group else None
+        if lc_arr is not None:
+            lc_flat = lc_arr.flatten()
+            valid = _np.isfinite(lc_flat) & _np.isfinite(prob_flat)
+            if valid.any():
+                lc_vals = _np.rint(lc_flat[valid]).astype(int)
+                prob_vals = prob_flat[valid]
+                group_probs: dict = _dd(list)
+                for cls, p in zip(lc_vals, prob_vals):
+                    group = _LANDCOVER_CLASS_TO_GROUP.get(int(cls))
+                    if group:
+                        group_probs[group].append(p)
+                best_group = max(
+                    (g for g, ps in group_probs.items() if len(ps) >= 3),
+                    key=lambda g: float(_np.mean(group_probs[g])),
+                    default=None,
+                )
+                lc_label = _LANDCOVER_GROUP_LABELS.get(best_group) if best_group else None
+                if lc_label:
+                    taxon_reasons.append(lc_label)
 
-        temporal_reason = _top_temporal_reason()
-        gis_reason = _landcover_reason()
-
-        taxon_reasons = [r for r in [temporal_reason, gis_reason] if r]
         if taxon_reasons:
             reasons[taxon_id_str] = taxon_reasons
 
+    return {"scores": scores, "reasons": reasons}
+
+
+@app.get("/api/heatmap/homepage/scores")
+def homepage_tile_scores(
+    z: int = Query(...),
+    x0: int = Query(...),
+    y0: int = Query(...),
+    x1: int = Query(...),
+    y1: int = Query(...),
+) -> dict[str, Any]:
+    """Return per-taxon average probability for the given tile range.
+
+    Results are cached per tile on disk and shared across all workers.
+    """
+    import json as _json
+
+    _SCORES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    all_scores: dict[str, list[float]] = {}
+    all_reasons: dict[str, dict[str, int]] = {}  # tid -> {reason: tile_count}
+
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            cache_path = _SCORES_CACHE_DIR / f"z{z}_x{tx}_y{ty}.json"
+            if cache_path.exists():
+                try:
+                    tile_result = _json.loads(cache_path.read_text())
+                except Exception:
+                    tile_result = _compute_single_tile_scores(z, tx, ty)
+            else:
+                tile_result = _compute_single_tile_scores(z, tx, ty)
+                try:
+                    cache_path.write_text(_json.dumps(tile_result))
+                except Exception:
+                    pass
+
+            for tid, score in tile_result.get("scores", {}).items():
+                all_scores.setdefault(tid, []).append(score)
+            for tid, tile_reasons in tile_result.get("reasons", {}).items():
+                counts = all_reasons.setdefault(tid, {})
+                for r in tile_reasons:
+                    counts[r] = counts.get(r, 0) + 1
+
+    scores = {tid: float(sum(vals) / len(vals)) for tid, vals in all_scores.items()}
+    # Pick the top 2 most-agreed-upon reasons across tiles
+    reasons = {
+        tid: sorted(counts, key=lambda r: -counts[r])[:2]
+        for tid, counts in all_reasons.items()
+        if counts
+    }
     return {"scores": scores, "reasons": reasons}
 
 
@@ -767,7 +811,7 @@ def get_species_detail(
             payload["description"] = text
         payload["description_profile"] = description_profile
     except Exception:
-        pass
+        traceback.print_exc()
     payload["heatmap"] = models.describe_model(models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
     return payload
 
