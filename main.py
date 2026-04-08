@@ -1731,6 +1731,8 @@ def gis_point_value(
     raw_units = variable_entry.get("units")
     if variable in gis_lookup._DERIVED_DEM_VARIABLES:
         raw_value = gis_lookup.sample_dem_derived_value(variable, lat, lon)
+    elif gis_lookup.is_temporal_layer_id(variable):
+        raw_value = gis_lookup.sample_temporal_npy_value(variable, lat, lon)
     else:
         cog_source = gis_lookup.get_cog_source(variable, lat, lon)
         if cog_source is None:

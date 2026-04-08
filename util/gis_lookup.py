@@ -1186,3 +1186,47 @@ def get_cog_source(layer_id: str, latitude: float, longitude: float) -> Optional
     if cog_path is None:
         return None
     return resolve_raster_source(cog_path)
+
+
+# ERA5 grid constants (0.25° global grid, top-left origin)
+_ERA5_RES = 0.25
+_ERA5_TOP_LAT = 90.0
+_ERA5_LEFT_LON = -180.0
+_ERA5_ROWS = 721
+_ERA5_COLS = 1440
+
+# Maps window hours → file label suffix used by build_temporal_rasters
+_TEMPORAL_HOURS_TO_LABEL: dict[int, str] = {
+    1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d",
+}
+
+
+def sample_temporal_npy_value(variable_id: str, lat: float, lon: float) -> Optional[float]:
+    """Sample a temporal raster .npy file at a given lat/lon.
+
+    Accepts variable IDs in the form produced by _expand_temporal_layers,
+    e.g. ``cloud_cover_avg_168h``.  Returns None if the file is missing or
+    the coordinate is out of range.
+    """
+    import numpy as np
+
+    parsed = parse_temporal_layer_id(variable_id)
+    if parsed is None:
+        return None
+    base_id, _agg, hours = parsed
+    label = _TEMPORAL_HOURS_TO_LABEL.get(hours)
+    if label is None:
+        return None
+
+    npy_path = CONFIG.data_root / "gis" / "temporal" / "rasters" / f"{base_id}_{label}.npy"
+    if not npy_path.exists():
+        return None
+
+    row = int(round((_ERA5_TOP_LAT - lat) / _ERA5_RES))
+    col = int(round((lon - _ERA5_LEFT_LON) / _ERA5_RES))
+    if not (0 <= row < _ERA5_ROWS and 0 <= col < _ERA5_COLS):
+        return None
+
+    arr = np.load(npy_path)
+    val = float(arr[row, col])
+    return None if (val != val) else val  # NaN → None
