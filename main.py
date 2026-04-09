@@ -402,7 +402,7 @@ async def aggregate_heatmap_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
-_HOMEPAGE_RASTER = Path(__file__).parent / "data" / "gis" / "temporal" / "homepage" / "aggregate_sdm.tif"
+_HOMEPAGE_RASTER = CONFIG.data_root / "gis" / "temporal" / "homepage" / "aggregate_sdm.tif"
 _TAXON_PROBS_PATH = _HOMEPAGE_RASTER.parent / "taxon_probs.npz"
 _SCORES_CACHE_DIR = Path("/workspace/cache/scores")
 
@@ -484,6 +484,8 @@ async def homepage_heatmap_tile(
     if not raster_path.exists():
         # Group raster not generated yet, fall back to overall
         raster_path, vmin, vmax = _raster_for_group(None)
+    if not raster_path.exists():
+        raise HTTPException(status_code=404, detail="Heatmap data not yet available.")
     cache = _get_homepage_cache()
     if cache and group is None:
         vmin, vmax = cache.vmin, cache.vmax
