@@ -40,19 +40,44 @@ _UNSAMPLED_FEATURE_GROUPS = _feature_contract.UNSAMPLED_FEATURE_GROUPS
 # ---------------------------------------------------------------------------
 SharedEncoder = None  # type: ignore[assignment]
 SpeciesHead = None  # type: ignore[assignment]
+CombinedSpeciesHead = None  # type: ignore[assignment]
 
 # Module-level singleton state.
 _bundle: dict[str, Any] | None = None
 _encoder: torch.nn.Module | None = None
 _heads: dict[int, torch.nn.Module] = {}
+_combined_head: torch.nn.Module | None = None
 _cell_table: dict[str, dict[str, torch.Tensor]] = {}
 _cell_table_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
 _cell_size_deg: float = 0.25
 _species_meta: dict[int, dict] = {}
+_combined_species_keys: list[int] = []
+_combined_head_meta: dict[str, Any] | None = None
+_combined_species_head_class_indices: list[int] = []
 _feature_names: dict[str, list[str]] | None = None
 _input_dim: int = 0
 _model_uses_mask: bool = False
 _device: torch.device = torch.device("cpu")
+
+_TEMPORAL_RASTER_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
+_TEMPORAL_WINDOW_LABELS: dict[int, str] = {
+    1: "1h",
+    8: "8h",
+    24: "24h",
+    72: "3d",
+    168: "7d",
+    720: "30d",
+    2160: "90d",
+}
+_TEMPORAL_WINDOW_TO_FORECAST_HOURS: dict[int, int] = {
+    1: 1,
+    8: 8,
+    24: 24,
+    72: 72,
+    168: 168,
+    720: 168,
+    2160: 168,
+}
 
 HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
@@ -74,6 +99,18 @@ def _sampled_static_feature_names() -> list[str]:
     for group_name in _SAMPLED_FEATURE_GROUPS:
         names.extend(_feature_group_names(group_name))
     return names
+
+
+def _temporal_feature_names() -> list[str]:
+    """Return ordered temporal feature names in model order."""
+    return _feature_group_names("temporal")
+
+
+def _temporal_feature_span() -> tuple[int, int]:
+    """Return [start, end) of temporal features within the raw feature vector."""
+    static_width = len(_sampled_static_feature_names())
+    temporal_width = len(_temporal_feature_names())
+    return static_width, static_width + temporal_width
 
 
 def _resolve_inference_device() -> torch.device:
@@ -215,6 +252,31 @@ def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None
     raise ValueError(
         f"cannot align features ({feat.shape[0]}) + mask ({mask.shape[0] if isinstance(mask, torch.Tensor) else 'None'}) "
         f"to input_dim={_input_dim}"
+    )
+
+
+def _coerce_model_input_batch(features: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Coerce batched raw features and masks to encoder input width."""
+    if _input_dim <= 0:
+        raise ValueError("_input_dim not set; call load_bundle() first")
+    if not isinstance(features, torch.Tensor) or features.ndim != 2:
+        raise ValueError(
+            f"batched model features must be a 2-d torch.Tensor; got {type(features).__name__} "
+            f"with ndim={getattr(features, 'ndim', '?')}"
+        )
+
+    feat = features.to(dtype=torch.float32)
+    if int(feat.shape[1]) == _input_dim:
+        return feat
+
+    if isinstance(mask, torch.Tensor) and mask.ndim == 2:
+        mask_t = mask.to(dtype=torch.float32)
+        if int(feat.shape[1] + mask_t.shape[1]) == _input_dim:
+            return torch.cat([feat, mask_t], dim=1)
+
+    raise ValueError(
+        f"cannot align batched features ({feat.shape[1]}) + mask "
+        f"({mask.shape[1] if isinstance(mask, torch.Tensor) else 'None'}) to input_dim={_input_dim}"
     )
 
 
@@ -515,9 +577,322 @@ def score_species_coords(
     return scores_per_coord, feature_source_per_coord
 
 
+def _score_combined_logits_tensor(
+    feature_tensor: torch.Tensor,
+    *,
+    score_batch_size: int,
+) -> list[torch.Tensor]:
+    """Score the shared combined head and return logits for a prebuilt batch."""
+    if _encoder is None or _combined_head is None:
+        raise RuntimeError("Combined inference head not loaded. Call load_bundle() with a compatible bundle first.")
+
+    encoder = _encoder
+    combined_head = _combined_head
+    logits_batches: list[torch.Tensor] = []
+    with torch.no_grad():
+        for start in range(0, int(feature_tensor.shape[0]), score_batch_size):
+            batch_features = feature_tensor[start : start + score_batch_size]
+            if batch_features.device != _device:
+                batch_features = batch_features.to(_device)
+            embeddings = encoder(batch_features)
+            logits = combined_head(embeddings)
+            logits_batches.append(logits.cpu())
+    return logits_batches
+
+
+def has_combined_head() -> bool:
+    """Return whether the loaded bundle includes a shared combined species head."""
+    return _combined_head is not None and bool(_combined_species_keys)
+
+
+def combined_species_keys() -> list[int]:
+    """Return species-key order for the shared combined species head."""
+    return list(_combined_species_keys)
+
+
+def combined_head_meta() -> dict[str, Any] | None:
+    """Return metadata for the shared combined head, if available."""
+    if _combined_head_meta is None:
+        return None
+    return dict(_combined_head_meta)
+
+
+def combined_species_with_heads() -> list[int]:
+    """Return combined-head species that also have per-species heads loaded."""
+    return [_combined_species_keys[class_index] for class_index in _combined_species_head_class_indices]
+
+
+def _rank_combined_coords(
+    coords: list[tuple[float, float]],
+    *,
+    resolution_hint: float,
+    top_k: int,
+    min_score: float,
+    feature_mode: str,
+    score_batch_size: int,
+    include_source: bool,
+    class_indices: list[int],
+    include_has_species_head: bool,
+) -> tuple[list[list[dict[str, Any]] | None], list[str | None] | None]:
+    """Shared ranking implementation for combined-head inference helpers."""
+    if not has_combined_head():
+        raise RuntimeError("Combined inference head not loaded. Call load_bundle() with a compatible bundle first.")
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
+    if not 0.0 <= min_score <= 1.0:
+        raise ValueError("min_score must be between 0 and 1")
+    if not class_indices:
+        empty = cast(list[list[dict[str, Any]] | None], [[] for _ in coords])
+        feature_source_per_coord = cast(list[str | None], [None] * len(coords)) if include_source else None
+        return empty, feature_source_per_coord
+
+    score_class_indices = torch.tensor(class_indices, dtype=torch.int64)
+    sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
+    ranks_per_coord: list[list[dict[str, Any]] | None] = [None] * len(coords)
+    feature_source_per_coord: list[str | None] | None = (
+        cast(list[str | None], [None] * len(coords)) if include_source else None
+    )
+    raster_dataset_cache: dict[tuple[str, str], Any] = {}
+    dem_dataset_cache: dict[tuple[str, str], Any] = {}
+
+    try:
+        for chunk_start in range(0, len(coords), sample_chunk_size):
+            chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
+            valid_indices, feature_tensor, chunk_sources = _prepare_feature_batch_for_coords(
+                chunk_coords,
+                resolution_hint=resolution_hint,
+                include_source=include_source,
+                feature_mode=feature_mode,
+                raster_dataset_cache=raster_dataset_cache,
+                dem_dataset_cache=dem_dataset_cache,
+            )
+            if chunk_sources is not None and feature_source_per_coord is not None:
+                for local_index, source in enumerate(chunk_sources):
+                    feature_source_per_coord[chunk_start + local_index] = source
+            if feature_tensor is None or feature_tensor.numel() == 0:
+                continue
+
+            logits_batches = _score_combined_logits_tensor(
+                feature_tensor,
+                score_batch_size=score_batch_size,
+            )
+
+            local_valid_offset = 0
+            for logits_batch in logits_batches:
+                score_batch = torch.softmax(logits_batch, dim=1)
+                restricted_scores = score_batch.index_select(1, score_class_indices)
+                candidate_count = int(restricted_scores.shape[1])
+                batch_top_k = min(top_k, candidate_count)
+                top_scores, top_positions = torch.topk(restricted_scores, k=batch_top_k, dim=1)
+
+                for row_offset in range(int(logits_batch.shape[0])):
+                    ranked: list[dict[str, Any]] = []
+                    for score_value, position in zip(
+                        top_scores[row_offset].tolist(), top_positions[row_offset].tolist()
+                    ):
+                        score = float(score_value)
+                        if score < min_score:
+                            continue
+                        class_index = class_indices[int(position)]
+                        species_key = _combined_species_keys[class_index]
+                        entry: dict[str, Any] = {"species_key": species_key, "score": score}
+                        meta = _species_meta.get(species_key)
+                        if isinstance(meta, dict) and meta.get("name") is not None:
+                            entry["name"] = meta["name"]
+                        if include_has_species_head:
+                            entry["has_species_head"] = species_key in _heads
+                        ranked.append(entry)
+
+                    coord_index = valid_indices[local_valid_offset + row_offset]
+                    ranks_per_coord[chunk_start + coord_index] = ranked
+                local_valid_offset += int(logits_batch.shape[0])
+    finally:
+        _close_dataset_cache(raster_dataset_cache)
+        _close_dataset_cache(dem_dataset_cache)
+
+    return ranks_per_coord, feature_source_per_coord
+
+
+def rank_species_weather_delta_coords(
+    coords: list[tuple[float, float]],
+    *,
+    top_k: int = 20,
+    min_delta: float = 0.0,
+    forecast_hours: int | None = None,
+    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
+    include_source: bool = False,
+    backed_species_only: bool = True,
+) -> tuple[list[list[dict[str, Any]] | None], list[str | None] | None]:
+    """Rank species by uplift from current temporal weather versus masked temporal features.
+
+    By default only species with non-negative ``delta_logit`` are returned.
+    Pass a lower ``min_delta`` to include weather-suppressed species as well.
+    """
+    if not has_combined_head():
+        raise RuntimeError("Combined inference head not loaded. Call load_bundle() with a compatible bundle first.")
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
+    if forecast_hours is not None and forecast_hours < 0:
+        raise ValueError("forecast_hours must be >= 0")
+
+    class_indices = (
+        list(_combined_species_head_class_indices) if backed_species_only else list(range(len(_combined_species_keys)))
+    )
+    if not class_indices:
+        empty = cast(list[list[dict[str, Any]] | None], [[] for _ in coords])
+        feature_source_per_coord = cast(list[str | None], [None] * len(coords)) if include_source else None
+        return empty, feature_source_per_coord
+
+    class_index_tensor = torch.tensor(class_indices, dtype=torch.int64)
+    sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
+    ranks_per_coord: list[list[dict[str, Any]] | None] = [None] * len(coords)
+    feature_source_per_coord: list[str | None] | None = (
+        cast(list[str | None], [None] * len(coords)) if include_source else None
+    )
+    raster_dataset_cache: dict[tuple[str, str], Any] = {}
+    dem_dataset_cache: dict[tuple[str, str], Any] = {}
+    temporal_raster_cache: dict[tuple[str, int, int], Any] = {}
+
+    try:
+        for chunk_start in range(0, len(coords), sample_chunk_size):
+            chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
+            sampled_payloads = _batch_sample_features(
+                chunk_coords,
+                raster_dataset_cache=raster_dataset_cache,
+                dem_dataset_cache=dem_dataset_cache,
+                temporal_mode="current",
+                temporal_forecast_hours=forecast_hours,
+                temporal_raster_cache=temporal_raster_cache,
+            )
+
+            valid_indices: list[int] = []
+            current_inputs: list[torch.Tensor] = []
+            baseline_inputs: list[torch.Tensor] = []
+            for local_index, payload in enumerate(sampled_payloads):
+                if payload is None:
+                    continue
+                model_input = payload["features"]
+                valid_indices.append(local_index)
+                current_inputs.append(model_input)
+                baseline_inputs.append(_mask_temporal_model_input(model_input))
+                if feature_source_per_coord is not None:
+                    feature_source_per_coord[chunk_start + local_index] = "sampled_weather"
+
+            if not current_inputs:
+                continue
+
+            current_tensor = _stack_feature_batch(current_inputs, target_device=_device)
+            baseline_tensor = _stack_feature_batch(baseline_inputs, target_device=_device)
+            current_logits_batches = _score_combined_logits_tensor(current_tensor, score_batch_size=score_batch_size)
+            baseline_logits_batches = _score_combined_logits_tensor(baseline_tensor, score_batch_size=score_batch_size)
+
+            local_valid_offset = 0
+            for baseline_logits_batch, current_logits_batch in zip(
+                baseline_logits_batches,
+                current_logits_batches,
+                strict=True,
+            ):
+                delta_logits_batch = current_logits_batch - baseline_logits_batch
+                restricted_delta_logits = delta_logits_batch.index_select(1, class_index_tensor)
+                batch_top_k = min(top_k, int(restricted_delta_logits.shape[1]))
+                top_deltas, top_positions = torch.topk(restricted_delta_logits, k=batch_top_k, dim=1)
+                baseline_probs_batch = torch.softmax(baseline_logits_batch, dim=1)
+                current_probs_batch = torch.softmax(current_logits_batch, dim=1)
+
+                for row_offset in range(int(delta_logits_batch.shape[0])):
+                    ranked: list[dict[str, Any]] = []
+                    for delta_value, position in zip(
+                        top_deltas[row_offset].tolist(), top_positions[row_offset].tolist()
+                    ):
+                        delta_logit = float(delta_value)
+                        if delta_logit < min_delta:
+                            continue
+                        class_index = class_indices[int(position)]
+                        species_key = _combined_species_keys[class_index]
+                        entry: dict[str, Any] = {
+                            "species_key": species_key,
+                            "baseline_logit": float(baseline_logits_batch[row_offset, class_index].item()),
+                            "weather_logit": float(current_logits_batch[row_offset, class_index].item()),
+                            "delta_logit": delta_logit,
+                            "baseline_score": float(baseline_probs_batch[row_offset, class_index].item()),
+                            "weather_score": float(current_probs_batch[row_offset, class_index].item()),
+                            "delta_score": float(
+                                current_probs_batch[row_offset, class_index].item()
+                                - baseline_probs_batch[row_offset, class_index].item()
+                            ),
+                        }
+                        meta = _species_meta.get(species_key)
+                        if isinstance(meta, dict) and meta.get("name") is not None:
+                            entry["name"] = meta["name"]
+                        if not backed_species_only:
+                            entry["has_species_head"] = species_key in _heads
+                        ranked.append(entry)
+
+                    coord_index = valid_indices[local_valid_offset + row_offset]
+                    ranks_per_coord[chunk_start + coord_index] = ranked
+                local_valid_offset += int(delta_logits_batch.shape[0])
+    finally:
+        _close_dataset_cache(raster_dataset_cache)
+        _close_dataset_cache(dem_dataset_cache)
+
+    return ranks_per_coord, feature_source_per_coord
+
+
+def rank_species_coords(
+    coords: list[tuple[float, float]],
+    *,
+    resolution_hint: float,
+    top_k: int = 20,
+    min_score: float = 0.0,
+    feature_mode: str = "prefer_cell_table",
+    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
+    include_source: bool = False,
+) -> tuple[list[list[dict[str, Any]] | None], list[str | None] | None]:
+    """Rank combined-head species that also have per-species heads.
+
+    Returns one list of ranked species dicts per input coordinate. Coordinates
+    that cannot be resolved to model-ready features are returned as ``None``.
+    """
+    return _rank_combined_coords(
+        coords,
+        resolution_hint=resolution_hint,
+        top_k=top_k,
+        min_score=min_score,
+        feature_mode=feature_mode,
+        score_batch_size=score_batch_size,
+        include_source=include_source,
+        class_indices=_combined_species_head_class_indices,
+        include_has_species_head=False,
+    )
+
+
+def rank_all_species_coords(
+    coords: list[tuple[float, float]],
+    *,
+    resolution_hint: float,
+    top_k: int = 20,
+    min_score: float = 0.0,
+    feature_mode: str = "prefer_cell_table",
+    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
+    include_source: bool = False,
+) -> tuple[list[list[dict[str, Any]] | None], list[str | None] | None]:
+    """Rank all species represented by the combined shared head."""
+    return _rank_combined_coords(
+        coords,
+        resolution_hint=resolution_hint,
+        top_k=top_k,
+        min_score=min_score,
+        feature_mode=feature_mode,
+        score_batch_size=score_batch_size,
+        include_source=include_source,
+        class_indices=list(range(len(_combined_species_keys))),
+        include_has_species_head=True,
+    )
+
+
 def _lazy_import_models() -> None:
     """Import model classes from the training package on first use."""
-    global SharedEncoder, SpeciesHead  # noqa: PLW0603
+    global SharedEncoder, SpeciesHead, CombinedSpeciesHead  # noqa: PLW0603
     if SharedEncoder is not None:
         return
     module = None
@@ -533,6 +908,7 @@ def _lazy_import_models() -> None:
 
     SharedEncoder = getattr(module, "SharedEncoder")
     SpeciesHead = getattr(module, "SpeciesHead")
+    CombinedSpeciesHead = getattr(module, "CombinedSpeciesHead")
 
 
 def _bin_index(lat: float, lon: float, size_deg: float) -> tuple[int, int]:
@@ -738,11 +1114,119 @@ def _batch_compute_dem_derived(
     return results
 
 
+def _resolve_temporal_forecast_hours(window_hours: int, forecast_hours: int | None) -> int:
+    """Resolve which temporal raster snapshot to use for one feature window."""
+    if forecast_hours is not None:
+        return int(forecast_hours)
+    return int(_TEMPORAL_WINDOW_TO_FORECAST_HOURS.get(int(window_hours), 0))
+
+
+def _temporal_raster_path(variable_id: str, window_hours: int, forecast_hours: int) -> Path | None:
+    """Resolve the on-disk temporal raster path for one temporal layer."""
+    window_label = _TEMPORAL_WINDOW_LABELS.get(int(window_hours))
+    if window_label is None:
+        return None
+    if int(forecast_hours) == 0:
+        return _TEMPORAL_RASTER_DIR / f"{variable_id}_{window_label}.npy"
+    return _TEMPORAL_RASTER_DIR / f"{variable_id}_{window_label}__f{int(forecast_hours):03d}h.npy"
+
+
+def _load_temporal_raster_array(
+    variable_id: str,
+    window_hours: int,
+    forecast_hours: int,
+    temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
+) -> Any | None:
+    """Load one temporal raster array, optionally caching by variable/window/forecast."""
+    cache_key = (variable_id, int(window_hours), int(forecast_hours))
+    if temporal_raster_cache is not None and cache_key in temporal_raster_cache:
+        cached = temporal_raster_cache[cache_key]
+        return None if cached is _MISSING_DATASET else cached
+
+    raster_path = _temporal_raster_path(variable_id, window_hours, forecast_hours)
+    if raster_path is None or not raster_path.exists():
+        if temporal_raster_cache is not None:
+            temporal_raster_cache[cache_key] = _MISSING_DATASET
+        return None
+
+    import numpy as np
+
+    arr = np.load(raster_path).astype(np.float32, copy=False)
+    if temporal_raster_cache is not None:
+        temporal_raster_cache[cache_key] = arr
+    return arr
+
+
+def _sample_temporal_layer_points(
+    layer_id: str,
+    coords: list[tuple[float, float]],
+    *,
+    forecast_hours: int | None = None,
+    temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
+) -> list[float | None]:
+    """Sample one temporal raster layer at point coordinates using nearest cells."""
+    import numpy as np
+    from util import gis_lookup
+
+    parsed = gis_lookup.parse_temporal_layer_id(layer_id)
+    if parsed is None:
+        return [None] * len(coords)
+    variable_id, _agg, window_hours = parsed
+    resolved_forecast_hours = _resolve_temporal_forecast_hours(window_hours, forecast_hours)
+    arr = _load_temporal_raster_array(
+        variable_id,
+        window_hours,
+        resolved_forecast_hours,
+        temporal_raster_cache=temporal_raster_cache,
+    )
+    if arr is None:
+        return [None] * len(coords)
+
+    ny, nx = arr.shape
+    results: list[float | None] = [None] * len(coords)
+    for idx, (lat, lon) in enumerate(coords):
+        if lat < -90.0 or lat > 90.0:
+            continue
+        wrapped_lon = ((lon + 180.0) % 360.0) - 180.0
+        row = int(math.floor(((90.0 - lat) / 180.0) * ny))
+        col = int(math.floor(((wrapped_lon + 180.0) / 360.0) * nx))
+        row = min(max(row, 0), ny - 1)
+        col = min(max(col, 0), nx - 1)
+        value = float(arr[row, col])
+        if np.isnan(value):
+            continue
+        results[idx] = value
+    return results
+
+
+def _mask_temporal_model_input(model_input: torch.Tensor) -> torch.Tensor:
+    """Return a copy of one model input with temporal features masked out."""
+    if model_input.ndim != 1:
+        raise ValueError("model_input must be a 1-d tensor")
+    temporal_start, temporal_end = _temporal_feature_span()
+    if temporal_start >= temporal_end:
+        return model_input.clone()
+
+    masked = model_input.clone()
+    raw_dim = _raw_feature_dim_from_names()
+    if raw_dim is None or raw_dim <= 0:
+        return masked
+
+    masked[temporal_start:temporal_end] = 0.0
+    if _model_uses_mask:
+        mask_offset = raw_dim
+        masked[mask_offset + temporal_start : mask_offset + temporal_end] = 1.0
+    return masked
+
+
 def _batch_sample_features(
     coords: list[tuple[float, float]],
     *,
     raster_dataset_cache: dict[tuple[str, str], Any] | None = None,
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
+    temporal_mode: str = "missing",
+    temporal_forecast_hours: int | None = None,
+    temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
 ) -> list[dict[str, torch.Tensor] | None]:
     """Batch-sample static features for many coordinates.
 
@@ -752,36 +1236,56 @@ def _batch_sample_features(
     if _feature_names is None:
         return [None] * len(coords)
     try:
+        import numpy as np
         import rasterio  # noqa: F401
     except ImportError:
         return [None] * len(coords)
 
     sampled_group_names = {group_name: _feature_group_names(group_name) for group_name in _SAMPLED_FEATURE_GROUPS}
-    temporal_dim: int = len(_feature_names.get("temporal", []))
+    temporal_names = _temporal_feature_names()
+    temporal_dim: int = len(temporal_names)
     other_dim: int = len(_feature_names.get("other", []))
     n_coords = len(coords)
 
-    layer_vals: dict[str, list[float | None]] = {}
+    layer_vals: dict[str, np.ndarray] = {}
     sampled_static_names = _sampled_static_feature_names()
     layer_names = [name for name in sampled_static_names if name not in _DEM_DERIVED]
     sampling_workers = _resolve_sampling_workers()
+    static_width = len(sampled_static_names)
+    raw_width = static_width + temporal_dim + other_dim
 
-    def _sample_layers(target_coords: list[tuple[float, float]], names: list[str]) -> dict[str, list[float | None]]:
+    feature_matrix = np.zeros((n_coords, raw_width), dtype=np.float32)
+    mask_matrix = np.ones((n_coords, raw_width), dtype=np.float32)
+    static_feature_index = {name: idx for idx, name in enumerate(sampled_static_names)}
+    temporal_start = static_width
+
+    def _sample_layers(target_coords: list[tuple[float, float]], names: list[str]) -> dict[str, np.ndarray]:
         """Sample raster layers for a coordinate subset."""
-        sampled: dict[str, list[float | None]] = {}
+        sampled: dict[str, np.ndarray] = {}
         if not names:
             return sampled
+
+        def _values_to_array(values: list[float | None]) -> np.ndarray:
+            arr = np.full(len(values), np.nan, dtype=np.float32)
+            for idx, value in enumerate(values):
+                if value is not None:
+                    arr[idx] = float(value)
+            return arr
+
         # For a single layer, thread-pool setup/teardown overhead tends to
         # exceed any benefit, so keep that path serial.
         if sampling_workers == 1 or len(names) <= 1:
             for name in names:
-                sampled[name] = _batch_sample_raster(name, target_coords, dataset_cache=raster_dataset_cache)
+                sampled[name] = _values_to_array(
+                    _batch_sample_raster(name, target_coords, dataset_cache=raster_dataset_cache)
+                )
             return sampled
 
         from concurrent.futures import ThreadPoolExecutor
 
-        def _sample_layer(layer_name: str) -> tuple[str, list[float | None]]:
-            return layer_name, _batch_sample_raster(layer_name, target_coords, dataset_cache=raster_dataset_cache)
+        def _sample_layer(layer_name: str) -> tuple[str, np.ndarray]:
+            values = _batch_sample_raster(layer_name, target_coords, dataset_cache=raster_dataset_cache)
+            return layer_name, _values_to_array(values)
 
         max_workers = min(sampling_workers, len(names))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -803,7 +1307,7 @@ def _batch_sample_features(
         for name in prefilter_names:
             values = prefilter_vals[name]
             for i, val in enumerate(values):
-                if val is not None:
+                if not np.isnan(val):
                     keep_mask[i] = True
         active_indices = [i for i, keep in enumerate(keep_mask) if keep]
         if not active_indices:
@@ -814,48 +1318,77 @@ def _batch_sample_features(
     if active_indices and remaining_layers:
         sampled_remaining = _sample_layers(active_coords, remaining_layers)
         for name, vals in sampled_remaining.items():
-            full_vals: list[float | None] = [None] * n_coords
-            for pos, global_idx in enumerate(active_indices):
-                full_vals[global_idx] = vals[pos]
+            full_vals = np.full(n_coords, np.nan, dtype=np.float32)
+            full_vals[np.asarray(active_indices, dtype=np.int64)] = vals
             layer_vals[name] = full_vals
 
     needs_dem = _DEM_DERIVED & set(sampled_static_names)
-    dem_results: list[dict[str, float]] = [{} for _ in range(n_coords)]
+    dem_layer_vals: dict[str, np.ndarray] = {name: np.full(n_coords, np.nan, dtype=np.float32) for name in needs_dem}
     if needs_dem and active_indices:
         dem_active = _batch_compute_dem_derived(active_coords, dem_dataset_cache=dem_dataset_cache)
         for pos, global_idx in enumerate(active_indices):
-            dem_results[global_idx] = dem_active[pos]
+            for name, value in dem_active[pos].items():
+                if name in dem_layer_vals:
+                    dem_layer_vals[name][global_idx] = float(value)
 
+    temporal_vals: dict[str, np.ndarray] = {}
+    normalized_temporal_mode = temporal_mode.strip().lower()
+    if normalized_temporal_mode not in {"missing", "current"}:
+        raise ValueError("temporal_mode must be one of ['current', 'missing']")
+    if normalized_temporal_mode == "current" and temporal_names:
+        for layer_name in temporal_names:
+            values = _sample_temporal_layer_points(
+                layer_name,
+                coords,
+                forecast_hours=temporal_forecast_hours,
+                temporal_raster_cache=temporal_raster_cache,
+            )
+            arr = np.full(n_coords, np.nan, dtype=np.float32)
+            for idx, value in enumerate(values):
+                if value is not None:
+                    arr[idx] = float(value)
+            temporal_vals[layer_name] = arr
+
+    for name, values in layer_vals.items():
+        col_idx = static_feature_index[name]
+        observed = ~np.isnan(values)
+        if not np.any(observed):
+            continue
+        feature_matrix[observed, col_idx] = values[observed]
+        mask_matrix[observed, col_idx] = 0.0
+
+    for name, values in dem_layer_vals.items():
+        col_idx = static_feature_index[name]
+        observed = ~np.isnan(values)
+        if not np.any(observed):
+            continue
+        feature_matrix[observed, col_idx] = values[observed]
+        mask_matrix[observed, col_idx] = 0.0
+
+    if normalized_temporal_mode == "current":
+        for offset, layer_name in enumerate(temporal_names):
+            values = temporal_vals[layer_name]
+            col_idx = temporal_start + offset
+            observed = ~np.isnan(values)
+            if not np.any(observed):
+                continue
+            feature_matrix[observed, col_idx] = values[observed]
+            mask_matrix[observed, col_idx] = 0.0
+
+    feature_tensor = torch.from_numpy(feature_matrix)
+    mask_tensor = torch.from_numpy(mask_matrix)
+    feature_tensor[mask_tensor > 0.5] = 0.0
+    model_input_tensor = _coerce_model_input_batch(feature_tensor, mask_tensor)
+
+    static_observed = (
+        (mask_matrix[:, :static_width] < 0.5).any(axis=1) if static_width > 0 else np.ones(n_coords, dtype=bool)
+    )
     out: list[dict[str, torch.Tensor] | None] = []
     for i in range(n_coords):
-        features: list[float] = []
-        mask: list[float] = []
-        for group_name in _SAMPLED_FEATURE_GROUPS:
-            for name in sampled_group_names[group_name]:
-                val = dem_results[i].get(name) if name in _DEM_DERIVED else layer_vals[name][i]
-                if val is None:
-                    features.append(0.0)
-                    mask.append(1.0)
-                else:
-                    features.append(val)
-                    mask.append(0.0)
-
-        features.extend([0.0] * temporal_dim)
-        mask.extend([1.0] * temporal_dim)
-        features.extend([0.0] * other_dim)
-        mask.extend([1.0] * other_dim)
-        ft = torch.tensor(features, dtype=torch.float32)
-        mt = torch.tensor(mask, dtype=torch.float32)
-        ft[mt > 0.5] = 0.0
-
-        # Skip if every static feature is missing (e.g. ocean).
-        static_width = len(sampled_static_names)
-        static_missing = sum(mask[:static_width])
-        if static_missing == static_width:
+        if not bool(static_observed[i]):
             out.append(None)
-        else:
-            model_input = _coerce_model_input(ft, mt)
-            out.append({"features": model_input, "mask": mt})
+            continue
+        out.append({"features": model_input_tensor[i], "mask": mask_tensor[i]})
     return out
 
 
@@ -865,8 +1398,9 @@ def load_bundle(path: str | Path) -> None:
     Safe to call multiple times (reloads the bundle).  Should be called
     once during application startup.
     """
-    global _bundle, _encoder, _heads, _cell_table, _cell_table_by_bin, _cell_size_deg, _species_meta  # noqa: PLW0603
-    global _feature_names, _input_dim, _model_uses_mask, _device  # noqa: PLW0603
+    global _bundle, _encoder, _heads, _combined_head, _cell_table, _cell_table_by_bin  # noqa: PLW0603
+    global _cell_size_deg, _species_meta, _combined_species_keys, _combined_head_meta  # noqa: PLW0603
+    global _combined_species_head_class_indices, _feature_names, _input_dim, _model_uses_mask, _device  # noqa: PLW0603
 
     _lazy_import_models()
     _device = _resolve_inference_device()
@@ -885,7 +1419,7 @@ def load_bundle(path: str | Path) -> None:
     hidden_dim: int = loaded["hidden_dim"]
     _input_dim = input_dim
 
-    if SharedEncoder is None or SpeciesHead is None:
+    if SharedEncoder is None or SpeciesHead is None or CombinedSpeciesHead is None:
         raise RuntimeError("Training model classes are unavailable.")
 
     encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(_device)
@@ -904,10 +1438,29 @@ def load_bundle(path: str | Path) -> None:
             p.requires_grad = False
         _heads[int(sp_key)] = head
 
+    loaded_combined_species_keys = [int(species_key) for species_key in loaded.get("combined_species_keys", [])]
+    loaded_combined_state = loaded.get("combined_head_state")
+    _combined_head = None
+    if loaded_combined_state is not None and loaded_combined_species_keys:
+        combined_head = CombinedSpeciesHead(
+            embed_dim=embed_dim,
+            species_count=len(loaded_combined_species_keys),
+        ).to(_device)
+        combined_head.load_state_dict(loaded_combined_state)
+        combined_head.eval()
+        for p in combined_head.parameters():
+            p.requires_grad = False
+        _combined_head = combined_head
+
     _cell_table = loaded.get("cell_table", {})
     _cell_table = _move_cell_table_to_device(_cell_table, cell_table_device)
     _cell_size_deg = loaded.get("cell_size_deg", 0.25)
     _species_meta = loaded.get("species_meta", {})
+    _combined_species_keys = loaded_combined_species_keys
+    _combined_head_meta = loaded.get("combined_head_meta")
+    _combined_species_head_class_indices = [
+        class_index for class_index, species_key in enumerate(_combined_species_keys) if int(species_key) in _heads
+    ]
     _feature_names = loaded.get("feature_names")
 
     raw_dim = _raw_feature_dim_from_names()

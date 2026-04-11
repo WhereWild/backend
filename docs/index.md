@@ -19,5 +19,6 @@ data processing scripts, machine-learning pipeline, and the prediction API.
 - [ML Scripts Guide](ml_scripts.md) -- end-to-end preprocessing, training, export, and serving
 - [Training Observation Schema](training_observation_schema.md)
 - [Darwin Model Card](darwin_model_card.md)
+- [Inference Optimization Opportunities](inference_optimization_opportunities.md)
 
 For more information, see the README on the left.
