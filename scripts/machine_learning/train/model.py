@@ -67,6 +67,24 @@ class SpeciesHead(nn.Module):
         return self.linear(z).squeeze(-1)
 
 
+class CombinedSpeciesHead(nn.Module):
+    """Shared multiclass head for comparable all-species ranking.
+
+    Produces one logit per supported species from the encoder embedding.
+    Softmax probabilities from this head are directly comparable across the
+    trained species set, which makes it suitable for shortlist/ranking use.
+    """
+
+    def __init__(self, embed_dim: int = 128, species_count: int = 0) -> None:
+        super().__init__()
+        if species_count < 1:
+            raise ValueError("species_count must be >= 1")
+        self.linear = nn.Linear(embed_dim, species_count)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.linear(z)
+
+
 class AuxDecoder(nn.Module):
     """Auxiliary reconstruction head for self-supervised encoder pretraining.
 

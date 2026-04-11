@@ -13,9 +13,10 @@ import torch
 
 from scripts.machine_learning.preprocess_training import pipeline
 from scripts.machine_learning.preprocess_training import resume_from_staging, transform
+from scripts.machine_learning.train import cli as train_cli
 from scripts.machine_learning.train import data as training_data
 from scripts.machine_learning.train import export
-from scripts.machine_learning.train.model import SharedEncoder, SpeciesHead
+from scripts.machine_learning.train.model import CombinedSpeciesHead, SharedEncoder, SpeciesHead
 from util import inference
 
 
@@ -32,6 +33,9 @@ def _write_split_part(
     cell_id: str,
     feature_values: list[float],
     mask_values: list[float],
+    species_key: int = 101,
+    presence_label: int = 1,
+    sample_weight: float = 1.0,
 ) -> None:
     split_dir = root / f"split={split}"
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -45,9 +49,9 @@ def _write_split_part(
                 mask_col: pa.array([[mask_values[idx]]], type=pa.list_(pa.float32()))
                 for idx, mask_col in enumerate(training_data.MASK_COLUMNS)
             },
-            "species_key": pa.array([101], type=pa.int64()),
-            "presence_label": pa.array([1], type=pa.int8()),
-            "sample_weight": pa.array([1.0], type=pa.float32()),
+            "species_key": pa.array([species_key], type=pa.int64()),
+            "presence_label": pa.array([presence_label], type=pa.int8()),
+            "sample_weight": pa.array([sample_weight], type=pa.float32()),
             "cell_id": pa.array([cell_id], type=pa.string()),
         }
     )
@@ -64,9 +68,14 @@ def _write_inference_bundle(
     species_name: str = "Test species",
     embed_dim: int = 4,
     hidden_dim: int = 8,
+    combined_species_keys: list[int] | None = None,
+    combined_head_state: dict[str, torch.Tensor] | None = None,
+    species_meta: dict[int, dict] | None = None,
 ) -> Path:
     encoder = SharedEncoder(input_dim=input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim)
     head = SpeciesHead(embed_dim=embed_dim)
+    if species_meta is None:
+        species_meta = {species_key: {"name": species_name}}
     torch.save(
         {
             "input_dim": input_dim,
@@ -74,7 +83,9 @@ def _write_inference_bundle(
             "hidden_dim": hidden_dim,
             "encoder_state_dict": encoder.state_dict(),
             "head_states": {species_key: head.state_dict()},
-            "species_meta": {species_key: {"name": species_name}},
+            "species_meta": species_meta,
+            "combined_head_state": combined_head_state,
+            "combined_species_keys": combined_species_keys or [],
             "cell_table": cell_table,
             "cell_size_deg": 0.25,
             "feature_names": feature_names,
@@ -133,6 +144,158 @@ def test_export_load_feature_names_rebuilds_legacy_template(tmp_path: Path) -> N
         "temporal": ["temperature_2m_24h"],
         "other": ["custom_measure"],
     }
+
+
+def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train-cli",
+            "heads",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--encoder-checkpoint",
+            str(tmp_path / "encoder_best.pt"),
+            "--train-combined-head",
+            "--batch-size",
+            "16384",
+            "--combined-head-batch-size",
+            "512",
+        ],
+    )
+
+    args = train_cli.parse_args()
+
+    assert args.stage == "heads"
+    assert args.batch_size == 16384
+    assert args.combined_head_batch_size == 512
+    assert args.train_combined_head is True
+
+
+def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    forwarded: dict[str, object] = {}
+
+    def _fake_train_species_heads(**kwargs: object) -> Path:
+        forwarded.update(kwargs)
+        return tmp_path / "species_heads.pt"
+
+    def _fake_import_local_symbol(module_name: str, symbol_name: str) -> object:
+        if (module_name, symbol_name) == ("train_heads", "train_species_heads"):
+            return _fake_train_species_heads
+        raise AssertionError(f"unexpected import request: {(module_name, symbol_name)}")
+
+    monkeypatch.setattr(train_cli, "import_local_symbol", _fake_import_local_symbol)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train-cli",
+            "heads",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--encoder-checkpoint",
+            str(tmp_path / "encoder_best.pt"),
+            "--train-combined-head",
+            "--batch-size",
+            "8192",
+            "--combined-head-batch-size",
+            "256",
+        ],
+    )
+
+    assert train_cli.main() == 0
+    assert forwarded["batch_size"] == 8192
+    assert forwarded["combined_head_batch_size"] == 256
+    assert forwarded["train_combined_head"] is True
+
+
+def test_train_species_heads_end_to_end_writes_combined_head_payload(tmp_path: Path) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+
+    def _group_values(first: float, second: float) -> list[float]:
+        values = [0.0] * n_groups
+        if n_groups > 0:
+            values[0] = first
+        if n_groups > 1:
+            values[1] = second
+        return values
+
+    row_specs = [
+        ("train", "train_sp101_pos_a.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("train", "train_sp101_pos_b.parquet", 101, 1, _group_values(0.9, 0.0)),
+        ("train", "train_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("train", "train_sp202_pos_a.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("train", "train_sp202_pos_b.parquet", 202, 1, _group_values(0.0, 0.9)),
+        ("train", "train_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+        ("val", "val_sp101_pos.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("val", "val_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("val", "val_sp202_pos.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("val", "val_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+    ]
+
+    for split, part_name, species_key, presence_label, feature_values in row_specs:
+        _write_split_part(
+            data_root,
+            split=split,
+            part_name=part_name,
+            cell_id=f"{split}_{species_key}_{presence_label}_{part_name}",
+            feature_values=feature_values,
+            mask_values=zero_mask,
+            species_key=species_key,
+            presence_label=presence_label,
+        )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    heads_path = train_heads.train_species_heads(
+        data_root=data_root,
+        encoder_checkpoint=encoder_checkpoint,
+        output_dir=output_dir,
+        min_positives=2,
+        head_epochs=1,
+        head_lr=1e-2,
+        head_weight_decay=1e-3,
+        batch_size=4,
+        device="cpu",
+        train_combined_head=True,
+        combined_head_min_positives=2,
+        combined_head_epochs=1,
+        combined_head_lr=1e-2,
+        combined_head_batch_size=2,
+        combined_head_weight_decay=1e-4,
+    )
+
+    checkpoint = torch.load(heads_path, map_location="cpu", weights_only=True)
+
+    assert heads_path == output_dir / "species_heads.pt"
+    assert checkpoint["combined_head_state"] is not None
+    assert checkpoint["combined_species_keys"] == [101, 202]
+    assert checkpoint["combined_head_meta"]["n_species"] == 2
+    assert checkpoint["combined_head_meta"]["n_positive_rows_train"] == 4
+    assert checkpoint["combined_head_meta"]["min_positives"] == 2
+    assert checkpoint["combined_head_meta"]["val_loss"] is not None
+    assert set(checkpoint["head_states"]) == {101, 202}
+    assert set(checkpoint["species_meta"]) == {101, 202}
 
 
 def test_build_feature_template_uses_catalog_groups_and_occurrence_other(tmp_path: Path) -> None:
@@ -566,6 +729,7 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
 
     encoder = SharedEncoder(input_dim=10, embed_dim=4, hidden_dim=8)
     head = SpeciesHead(embed_dim=4)
+    combined_head = CombinedSpeciesHead(embed_dim=4, species_count=1)
     torch.save(
         {
             "input_dim": 10,
@@ -579,6 +743,9 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
         {
             "head_states": {101: head.state_dict()},
             "species_meta": {101: {"name": "Test species"}},
+            "combined_head_state": combined_head.state_dict(),
+            "combined_species_keys": [101],
+            "combined_head_meta": {"n_species": 1, "val_loss": 0.0},
         },
         heads_path,
     )
@@ -599,6 +766,8 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
     assert bundle_path.exists()
     assert inference.is_loaded() is True
     assert inference.has_species(101) is True
+    assert inference.has_combined_head() is True
+    assert inference.combined_species_keys() == [101]
     assert inference.cell_count() == 2
     assert inference.species_meta()[101]["name"] == "Test species"
     assert len(cells) == 1
@@ -657,3 +826,183 @@ def test_export_bundle_accepts_output_directory(tmp_path: Path) -> None:
 
     assert bundle_path == output_dir / "inference_bundle.pt"
     assert bundle_path.exists()
+
+
+def test_rank_species_coords_uses_combined_head(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.pt"
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": [],
+        "other": [],
+    }
+    combined_head = CombinedSpeciesHead(embed_dim=4, species_count=2)
+    with torch.no_grad():
+        combined_head.linear.weight.zero_()
+        combined_head.linear.bias.copy_(torch.tensor([2.0, -1.0], dtype=torch.float32))
+
+    _write_inference_bundle(
+        bundle_path,
+        input_dim=2,
+        cell_table={
+            "cell_0_0": {
+                "features": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "mask": torch.tensor([0.0], dtype=torch.float32),
+            }
+        },
+        feature_names=feature_names,
+        species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
+        combined_head_state=combined_head.state_dict(),
+        combined_species_keys=[101, 202],
+    )
+
+    inference.load_bundle(bundle_path)
+    ranked, sources = inference.rank_all_species_coords(
+        [(0.125, 0.125)],
+        resolution_hint=0.25,
+        top_k=2,
+        feature_mode="cell_table_only",
+        include_source=True,
+        score_batch_size=1,
+    )
+
+    assert inference.has_combined_head() is True
+    assert ranked[0] is not None
+    assert [entry["species_key"] for entry in ranked[0]] == [101, 202]
+    assert ranked[0][0]["name"] == "Alpha"
+    assert ranked[0][0]["has_species_head"] is True
+    assert ranked[0][0]["score"] > ranked[0][1]["score"]
+    assert sources == ["cell_table"]
+
+
+def test_rank_species_coords_filters_to_species_with_heads(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.pt"
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": [],
+        "other": [],
+    }
+    combined_head = CombinedSpeciesHead(embed_dim=4, species_count=2)
+    with torch.no_grad():
+        combined_head.linear.weight.zero_()
+        combined_head.linear.bias.copy_(torch.tensor([1.0, 3.0], dtype=torch.float32))
+
+    _write_inference_bundle(
+        bundle_path,
+        input_dim=2,
+        cell_table={
+            "cell_0_0": {
+                "features": torch.tensor([1.0, 0.0], dtype=torch.float32),
+                "mask": torch.tensor([0.0], dtype=torch.float32),
+            }
+        },
+        feature_names=feature_names,
+        species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
+        combined_head_state=combined_head.state_dict(),
+        combined_species_keys=[101, 202],
+    )
+
+    inference.load_bundle(bundle_path)
+    assert inference.combined_species_with_heads() == [101]
+
+    ranked_backed, _ = inference.rank_species_coords(
+        [(0.125, 0.125)],
+        resolution_hint=0.25,
+        top_k=2,
+        feature_mode="cell_table_only",
+        score_batch_size=1,
+    )
+    ranked_all, _ = inference.rank_all_species_coords(
+        [(0.125, 0.125)],
+        resolution_hint=0.25,
+        top_k=2,
+        feature_mode="cell_table_only",
+        score_batch_size=1,
+    )
+
+    assert [entry["species_key"] for entry in ranked_backed[0]] == [101]
+    assert [entry["species_key"] for entry in ranked_all[0]] == [202, 101]
+    assert ranked_all[0][0]["has_species_head"] is False
+    assert ranked_all[0][1]["has_species_head"] is True
+
+
+def test_rank_species_weather_delta_coords_uses_current_temporal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle_path = tmp_path / "bundle.pt"
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": ["temperature_2m_avg_24h"],
+        "other": [],
+    }
+
+    combined_head = CombinedSpeciesHead(embed_dim=4, species_count=2)
+
+    _write_inference_bundle(
+        bundle_path,
+        input_dim=4,
+        cell_table={
+            "cell_0_0": {
+                "features": torch.tensor([0.5, 0.0, 0.0, 1.0], dtype=torch.float32),
+                "mask": torch.tensor([0.0, 1.0], dtype=torch.float32),
+            }
+        },
+        feature_names=feature_names,
+        species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
+        combined_head_state=combined_head.state_dict(),
+        combined_species_keys=[101, 202],
+    )
+
+    def _fake_batch_sample_raster(
+        layer_id: str,
+        coords: list[tuple[float, float]],
+        dataset_cache: dict[tuple[str, str], object] | None = None,
+    ) -> list[float | None]:
+        assert layer_id == "bio_1"
+        return [0.5 for _ in coords]
+
+    def _fake_load_temporal_raster_array(
+        variable_id: str,
+        window_hours: int,
+        forecast_hours: int,
+        temporal_raster_cache: dict[tuple[str, int, int], object] | None = None,
+    ) -> object:
+        assert variable_id == "temperature_2m"
+        assert window_hours == 24
+        assert forecast_hours == 24
+        return torch.tensor([[3.0]], dtype=torch.float32).numpy()
+
+    def _fake_score_combined_logits_tensor(
+        feature_tensor: torch.Tensor,
+        *,
+        score_batch_size: int,
+    ) -> list[torch.Tensor]:
+        temporal_values = feature_tensor[:, 1].cpu()
+        return [torch.stack([temporal_values, -temporal_values], dim=1)]
+
+    monkeypatch.setattr(inference, "_batch_sample_raster", _fake_batch_sample_raster)
+    monkeypatch.setattr(inference, "_load_temporal_raster_array", _fake_load_temporal_raster_array)
+    monkeypatch.setattr(inference, "_score_combined_logits_tensor", _fake_score_combined_logits_tensor)
+
+    inference.load_bundle(bundle_path)
+    ranked, sources = inference.rank_species_weather_delta_coords(
+        [(0.125, 0.125)],
+        top_k=2,
+        min_delta=-10.0,
+        score_batch_size=1,
+        include_source=True,
+        backed_species_only=False,
+    )
+
+    assert ranked[0] is not None
+    assert [entry["species_key"] for entry in ranked[0]] == [101, 202]
+    assert ranked[0][0]["delta_logit"] > 0.0
+    assert ranked[0][0]["weather_logit"] > ranked[0][0]["baseline_logit"]
+    assert ranked[0][1]["delta_logit"] < 0.0
+    assert ranked[0][0]["has_species_head"] is True
+    assert sources == ["sampled_weather"]

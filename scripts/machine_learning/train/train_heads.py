@@ -20,6 +20,7 @@ StreamingTrainingDataset = import_local_symbol("data", "StreamingTrainingDataset
 nnpu_loss = import_local_symbol("losses", "nnpu_loss")
 SharedEncoder = import_local_symbol("model", "SharedEncoder")
 SpeciesHead = import_local_symbol("model", "SpeciesHead")
+CombinedSpeciesHead = import_local_symbol("model", "CombinedSpeciesHead")
 
 
 class _FeatureDataset(Protocol):
@@ -35,6 +36,8 @@ class _StreamingSplitDataset(Protocol):
 
 
 HEARTBEAT_INTERVAL_SPECIES = 50
+COMBINED_HEAD_EVAL_INTERVAL_EPOCHS = 5
+COMBINED_HEAD_SCAN_MULTIPLIER = 8
 
 
 def compute_embeddings(
@@ -202,6 +205,92 @@ def estimate_prior(
     return float(np.clip(numerator / max(denominator, 1e-12), min_prior, max_prior))
 
 
+def _iter_combined_positive_batches(
+    embeddings: np.ndarray,
+    species: np.ndarray,
+    labels: np.ndarray,
+    *,
+    eligible_species: np.ndarray,
+    batch_size: int,
+    shuffle: bool,
+    rng: np.random.Generator | None = None,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield positive-only multiclass batches without materializing giant index arrays."""
+    scan_rows = int(batch_size) * COMBINED_HEAD_SCAN_MULTIPLIER
+
+    for start in range(0, int(labels.shape[0]), scan_rows):
+        end = min(start + scan_rows, int(labels.shape[0]))
+
+        chunk_labels = np.asarray(labels[start:end], dtype=np.int8)
+        pos_mask = chunk_labels == 1
+        if not pos_mask.any():
+            continue
+
+        chunk_species = np.asarray(species[start:end], dtype=np.int64)
+        positive_species = chunk_species[pos_mask]
+        class_indices = np.searchsorted(eligible_species, positive_species)
+        valid_mask = (class_indices < eligible_species.shape[0]) & (eligible_species[class_indices] == positive_species)
+        if not valid_mask.any():
+            continue
+
+        chunk_embeddings = np.asarray(embeddings[start:end], dtype=np.float32)
+        positive_embeddings = chunk_embeddings[pos_mask][valid_mask]
+        positive_targets = class_indices[valid_mask].astype(np.int64, copy=False)
+
+        if shuffle and positive_targets.shape[0] > 1:
+            if rng is None:
+                rng = np.random.default_rng(0)
+            order = rng.permutation(positive_targets.shape[0])
+            positive_embeddings = positive_embeddings[order]
+            positive_targets = positive_targets[order]
+
+        for batch_start in range(0, positive_targets.shape[0], batch_size):
+            batch_end = min(batch_start + batch_size, positive_targets.shape[0])
+            yield (
+                torch.from_numpy(positive_embeddings[batch_start:batch_end]),
+                torch.from_numpy(positive_targets[batch_start:batch_end]),
+            )
+
+
+def _evaluate_combined_head(
+    head: torch.nn.Module,
+    embeddings: np.ndarray,
+    species: np.ndarray,
+    labels: np.ndarray,
+    *,
+    eligible_species: np.ndarray,
+    loss_fn: torch.nn.Module,
+    combined_head_batch_size: int,
+    device: torch.device,
+) -> float | None:
+    """Evaluate combined-head cross-entropy on positive validation rows."""
+    total_loss = 0.0
+    total_rows = 0
+
+    head.eval()
+    with torch.no_grad():
+        for batch_embeddings, batch_targets in _iter_combined_positive_batches(
+            embeddings,
+            species,
+            labels,
+            eligible_species=eligible_species,
+            batch_size=combined_head_batch_size,
+            shuffle=False,
+        ):
+            if batch_targets.numel() == 0:
+                continue
+            logits = head(batch_embeddings.to(device))
+            targets = batch_targets.to(device)
+            loss = loss_fn(logits, targets)
+            batch_rows = int(targets.shape[0])
+            total_loss += float(loss.item()) * batch_rows
+            total_rows += batch_rows
+
+    if total_rows <= 0:
+        return None
+    return total_loss / total_rows
+
+
 def train_species_heads(
     data_root: str | Path,
     encoder_checkpoint: str | Path,
@@ -213,6 +302,12 @@ def train_species_heads(
     head_weight_decay: float = 1e-3,
     batch_size: int = 4096,
     device: str = "auto",
+    train_combined_head: bool = False,
+    combined_head_min_positives: int = 50,
+    combined_head_epochs: int = 10,
+    combined_head_lr: float = 5e-3,
+    combined_head_batch_size: int = 4096,
+    combined_head_weight_decay: float = 1e-4,
 ) -> Path:
     """Train per-species PU logistic heads on frozen encoder embeddings.
 
@@ -227,6 +322,8 @@ def train_species_heads(
         batch_size: batch size for embedding computation only (heads
             train full-batch per species, which is preferable for
             logistic regression convergence).
+        combined_head_batch_size: optimization mini-batch size for the
+            shared multiclass combined head.
         device: "auto", "cuda", "mps", or "cpu".
 
     Returns:
@@ -234,6 +331,10 @@ def train_species_heads(
     """
     if min_positives < 1:
         raise ValueError("min_positives must be >= 1")
+    if combined_head_min_positives < 1:
+        raise ValueError("combined_head_min_positives must be >= 1")
+    if combined_head_batch_size < 1:
+        raise ValueError("combined_head_batch_size must be >= 1")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -303,7 +404,15 @@ def train_species_heads(
         for sp, total_count in zip(unique_species.tolist(), species_total_counts.tolist(), strict=True)
         if species_pos_map.get(int(sp), 0) >= min_positives and int(total_count) > 0
     ]
+    combined_eligible = [
+        int(sp)
+        for sp, total_count in zip(unique_species.tolist(), species_total_counts.tolist(), strict=True)
+        if species_pos_map.get(int(sp), 0) >= combined_head_min_positives
+        and int(total_count) - species_pos_map.get(int(sp), 0) > 0
+    ]
     print(f"Species total: {len(unique_species):,} | Eligible (>={min_positives} positives): {len(eligible):,}")
+
+    combined_species = np.asarray(sorted(combined_eligible), dtype=np.int64)
 
     print("Indexing species rows for fast per-species slicing...")
     train_order = np.argsort(train_species, kind="stable")
@@ -428,6 +537,91 @@ def train_species_heads(
             elapsed = time.perf_counter() - total_start
             print(f"  Heads trained: {idx + 1:,}/{len(eligible):,} | elapsed: {elapsed:.1f}s")
 
+    combined_head_state: dict[str, torch.Tensor] | None = None
+    combined_head_meta: dict[str, int | float | None] | None = None
+
+    if train_combined_head and combined_species.shape[0] > 0:
+        print(f"Training combined species head for {combined_species.shape[0]:,} species...")
+        combined_head = CombinedSpeciesHead(embed_dim=embed_dim, species_count=int(combined_species.shape[0])).to(dev)
+        combined_optimizer = torch.optim.AdamW(
+            combined_head.parameters(),
+            lr=combined_head_lr,
+            weight_decay=combined_head_weight_decay,
+        )
+
+        class_counts = np.asarray([species_pos_map[int(sp)] for sp in combined_species.tolist()], dtype=np.float32)
+        class_weights = 1.0 / np.maximum(class_counts, 1.0)
+        class_weights /= float(class_weights.mean())
+        combined_loss_fn = torch.nn.CrossEntropyLoss(weight=torch.from_numpy(class_weights).to(dev))
+        combined_rng = np.random.default_rng(0)
+
+        best_combined_val_loss = float("inf")
+        best_combined_state: dict[str, torch.Tensor] | None = None
+        combined_positive_train_rows = int(class_counts.sum())
+
+        for epoch in range(combined_head_epochs):
+            combined_head.train()
+            epoch_loss = 0.0
+            epoch_rows = 0
+
+            for batch_embeddings, batch_targets in _iter_combined_positive_batches(
+                train_z,
+                train_species,
+                train_labels,
+                eligible_species=combined_species,
+                batch_size=combined_head_batch_size,
+                shuffle=True,
+                rng=combined_rng,
+            ):
+                if batch_targets.numel() == 0:
+                    continue
+                logits = combined_head(batch_embeddings.to(dev))
+                targets = batch_targets.to(dev)
+                loss = combined_loss_fn(logits, targets)
+
+                combined_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                combined_optimizer.step()
+
+                batch_rows = int(targets.shape[0])
+                epoch_loss += float(loss.item()) * batch_rows
+                epoch_rows += batch_rows
+
+            if epoch_rows <= 0:
+                break
+
+            if (epoch + 1) % COMBINED_HEAD_EVAL_INTERVAL_EPOCHS == 0 or epoch == combined_head_epochs - 1:
+                val_loss = _evaluate_combined_head(
+                    combined_head,
+                    val_z,
+                    val_species,
+                    val_labels,
+                    eligible_species=combined_species,
+                    loss_fn=combined_loss_fn,
+                    combined_head_batch_size=combined_head_batch_size,
+                    device=dev,
+                )
+                if val_loss is not None and val_loss < best_combined_val_loss:
+                    best_combined_val_loss = val_loss
+                    best_combined_state = {k: v.clone() for k, v in combined_head.state_dict().items()}
+
+            mean_train_loss = epoch_loss / epoch_rows
+            print(
+                f"  Combined head epoch {epoch + 1:,}/{combined_head_epochs:,} | "
+                f"rows={epoch_rows:,} | train_loss={mean_train_loss:.4f}"
+            )
+
+        if best_combined_state is None:
+            best_combined_state = {k: v.clone() for k, v in combined_head.state_dict().items()}
+
+        combined_head_state = best_combined_state
+        combined_head_meta = {
+            "n_species": int(combined_species.shape[0]),
+            "n_positive_rows_train": combined_positive_train_rows,
+            "val_loss": best_combined_val_loss if best_combined_val_loss < float("inf") else None,
+            "min_positives": int(combined_head_min_positives),
+        }
+
     total_seconds = time.perf_counter() - total_start
     heads_path = output_dir / "species_heads.pt"
     torch.save(
@@ -435,6 +629,9 @@ def train_species_heads(
             "embed_dim": embed_dim,
             "head_states": head_states,
             "species_meta": species_meta,
+            "combined_head_state": combined_head_state,
+            "combined_species_keys": combined_species.tolist() if combined_head_state is not None else [],
+            "combined_head_meta": combined_head_meta,
         },
         heads_path,
     )

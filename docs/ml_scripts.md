@@ -248,6 +248,16 @@ uv run python -m scripts.machine_learning.train.cli heads \
     --output-dir ./checkpoints/canary_plants/heads
 ```
 
+Train Stage C with the shared combined species-ranking head enabled:
+
+```bash
+uv run python -m scripts.machine_learning.train.cli heads \
+    --data-root ./data_ml/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --output-dir ./checkpoints/canary_plants/heads \
+    --train-combined-head
+```
+
 ### Both stages sequentially
 
 ```bash
@@ -262,20 +272,26 @@ uv run python -m scripts.machine_learning.train.cli all \
 - `--hidden-dim`: encoder hidden layer dimension (default 256).
 - `--epochs`: encoder training epochs (default 50).
 - `--head-epochs`: epochs per species head (default 50).
+- `--combined-head-epochs`: epochs for the shared multiclass combined head (default 10).
 - `--batch-size`: shared batch-size flag.
     - Stage B (`encoder`): encoder training mini-batch size (default 32768).
     - Stage C (`heads`): embedding pass chunk size only; per-species head optimization is full-batch.
 - `--lr`: encoder peak learning rate (default 1e-3).
 - `--head-lr`: species head learning rate (default 1e-2).
+- `--combined-head-batch-size`: optimization mini-batch size for the shared multiclass combined head over frozen embeddings (default 4096).
+- `--combined-head-lr`: combined-head learning rate (default 5e-3).
 - `--recon-weight`: reconstruction loss weight for encoder pretraining.
 - `--min-positives`: skip species with fewer positives (default 50).
+- `--train-combined-head`: enable the shared multiclass combined species head (default disabled).
+- `--combined-head-min-positives`: minimum positives for a species to participate in the combined head (default 50).
+- `--combined-head-weight-decay`: combined-head weight decay (default 1e-4).
 - `--device`: auto (default), cuda, mps, cpu.
 - `--no-amp`: disable automatic mixed precision.
 
 ### Output files
 
 - `encoder_best.pt`: shared encoder checkpoint (Stage B).
-- `species_heads.pt`: all per-species head weights + metadata (Stage C).
+- `species_heads.pt`: per-species head weights + metadata, and when enabled also the shared combined-head weights plus the ordered species key list used by that head (Stage C).
 
 ## 5. Export inference bundle
 
@@ -293,8 +309,9 @@ The bundle contains:
 
 - Encoder architecture config and weights.
 - Per-species head weights and metadata (prior, val_loss, counts).
+- Optional shared combined-head weights, species ordering, and metadata when trained with `--train-combined-head`.
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
-- Feature names per group (`bioclimate`, `landclass`, `terrain`, `edaphic`, `temporal`, `other`). GIS sampling only reconstructs catalog-backed static groups; `temporal` and `other` are emitted as missing in sampled-only paths.
+- Feature names per group (`bioclimate`, `landclass`, `terrain`, `temporal`, `other`). GIS sampling reconstructs catalog-backed static groups, while runtime paths can also fill temporal features from current rasters under `data/gis/temporal` when using the combined-head weather-delta helpers.
 
 The preprocessing step also writes `feature_template.json` under
 `<output-root>/_meta/`. Export reads this file automatically. If it is missing (e.g. older
@@ -314,6 +331,31 @@ stream_result = predict_heatmap_stream(
     (24.0, -106.0, 32.0, -94.0),
 )
 ```
+
+### Load the bundle and rank species with the combined head
+
+```python
+from util.inference import load_bundle, rank_species_coords, rank_species_weather_delta_coords
+
+load_bundle("checkpoints/canary_plants/inference_bundle.pt")
+
+ranked_species, _ = rank_species_coords(
+    [(31.5, -100.2)],
+    resolution_hint=0.25,
+    top_k=25,
+)
+
+weather_uplift, _ = rank_species_weather_delta_coords(
+    [(31.5, -100.2)],
+    top_k=25,
+)
+```
+
+Notes:
+
+- `rank_species_coords(...)` returns combined-head rankings only for species that also have per-species heads in the loaded bundle.
+- `rank_all_species_coords(...)` returns the full combined-head ranking space, including species that may not have per-species heads.
+- `rank_species_weather_delta_coords(...)` compares a masked-temporal baseline pass against a current-weather temporal pass and ranks species by `delta_logit` uplift.
 
 ### Start the FastAPI server
 

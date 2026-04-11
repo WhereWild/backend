@@ -43,7 +43,12 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument("--data-root", type=Path, required=True, help="Preprocessed parquet dataset root.")
     shared.add_argument("--output-dir", type=Path, required=True, help="Output directory for checkpoints.")
     shared.add_argument("--device", type=str, default="auto", help="Device: auto, cuda, mps, cpu.")
-    shared.add_argument("--batch-size", type=int, default=32768, help="Mini-batch size.")
+    shared.add_argument(
+        "--batch-size",
+        type=int,
+        default=32768,
+        help="Mini-batch size for encoder training and Stage C embedding materialization; not used for combined-head optimization.",
+    )
 
     # Encoder-specific arguments
     encoder_args = argparse.ArgumentParser(add_help=False)
@@ -104,6 +109,42 @@ def parse_args() -> argparse.Namespace:
     heads_args.add_argument("--head-epochs", type=int, default=50, help="Epochs per species head.")
     heads_args.add_argument("--head-lr", type=float, default=1e-2, help="Species head learning rate.")
     heads_args.add_argument("--head-weight-decay", type=float, default=1e-3, help="Species head weight decay.")
+    heads_args.add_argument(
+        "--train-combined-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train a shared multiclass species-ranking head alongside per-species PU heads.",
+    )
+    heads_args.add_argument(
+        "--combined-head-epochs",
+        type=int,
+        default=10,
+        help="Epochs for the shared multiclass combined species head.",
+    )
+    heads_args.add_argument(
+        "--combined-head-min-positives",
+        type=int,
+        default=50,
+        help="Minimum positive rows for a species to participate in the shared combined head.",
+    )
+    heads_args.add_argument(
+        "--combined-head-lr",
+        type=float,
+        default=5e-3,
+        help="Learning rate for the shared multiclass combined species head.",
+    )
+    heads_args.add_argument(
+        "--combined-head-batch-size",
+        type=int,
+        default=4096,
+        help="Optimization mini-batch size for the shared multiclass combined species head.",
+    )
+    heads_args.add_argument(
+        "--combined-head-weight-decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for the shared multiclass combined species head.",
+    )
 
     # Stage B: encoder
     subparsers.add_parser("encoder", parents=[shared, encoder_args], help="Stage B: train shared encoder.")
@@ -171,6 +212,12 @@ def main() -> int:
             head_weight_decay=args.head_weight_decay,
             batch_size=args.batch_size,
             device=args.device,
+            train_combined_head=args.train_combined_head,
+            combined_head_min_positives=args.combined_head_min_positives,
+            combined_head_epochs=args.combined_head_epochs,
+            combined_head_lr=args.combined_head_lr,
+            combined_head_batch_size=args.combined_head_batch_size,
+            combined_head_weight_decay=args.combined_head_weight_decay,
         )
 
     return 0

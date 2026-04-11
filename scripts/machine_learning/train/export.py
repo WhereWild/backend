@@ -238,6 +238,9 @@ def export_bundle(
         # Species heads
         "head_states": heads_ckpt["head_states"],
         "species_meta": heads_ckpt["species_meta"],
+        "combined_head_state": heads_ckpt.get("combined_head_state"),
+        "combined_species_keys": heads_ckpt.get("combined_species_keys", []),
+        "combined_head_meta": heads_ckpt.get("combined_head_meta"),
         # Geocell feature lookup
         "cell_table": cell_table,
         "cell_size_deg": cell_size_deg,
