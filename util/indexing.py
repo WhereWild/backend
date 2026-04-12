@@ -2065,6 +2065,8 @@ def child_relative_rankings(
             resolved_sample_count = int(sample_count) if sample_count is not None else None
         if resolved_sample_count is None or (min_samples and resolved_sample_count < min_samples):
             continue
+        if value is None:
+            continue
         taxon_rank = taxa_navigation.canonical_rank(taxon["rank"])
         if (
             canonical_rank == "SPECIES"
@@ -2129,7 +2131,7 @@ def child_relative_rankings(
             "value": numeric_value,
             "sampleCount": sample_count,
             "count": filtered_total,
-            "position": output_idx + 1,
+            "position": rank_index + 1,
             "percentile": percentile,
             "metric": metric,
             "variable": layer,
