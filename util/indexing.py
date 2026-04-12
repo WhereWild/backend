@@ -2032,9 +2032,9 @@ def child_relative_rankings(
                 taxon_id: count
                 for taxon_id, count in location_counts.items()
                 if taxon_id in allowed_taxa
-            }
-            if not location_counts:
-                location_counts = None
+            } or None
+        else:
+            location_counts = None
 
     taxon_values = column.field("taxonKey").to_pylist()
     metric_values = column.field("value").to_pylist()
