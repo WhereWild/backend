@@ -121,6 +121,81 @@ def test_normalize_template_payload_reclassifies_legacy_groups() -> None:
     }
 
 
+def test_resume_output_files_reuses_staging_transform_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    staging_dir = tmp_path / "staging"
+    output_root = tmp_path / "output"
+    staging_meta = staging_dir / "_meta"
+    staging_meta.mkdir(parents=True, exist_ok=True)
+
+    feature_template = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": [],
+        "other": [],
+    }
+    feature_transforms = {
+        "version": "v1",
+        "raw_feature_template": feature_template,
+        "transformed_feature_template": feature_template,
+        "feature_specs": {
+            "bio_1": {
+                "group": "bioclimate",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["bio_1"],
+            }
+        },
+    }
+    uncatalogued = {"kept_occurrence": [], "skipped_context": []}
+
+    (staging_meta / "feature_template.json").write_text(json.dumps(feature_template), encoding="utf-8")
+    (staging_meta / "feature_transforms.json").write_text(json.dumps(feature_transforms), encoding="utf-8")
+    (staging_meta / "uncatalogued_columns.json").write_text(json.dumps(uncatalogued), encoding="utf-8")
+    (staging_dir / "base_00000.parquet").write_text("placeholder", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def _fake_write_partitioned_dataset(
+        shard_paths: list[Path],
+        output_root: Path,
+        max_rows_per_file: int,
+        metadata_payloads: dict[str, object] | None = None,
+    ) -> None:
+        captured["shard_paths"] = list(shard_paths)
+        captured["output_root"] = output_root
+        captured["max_rows_per_file"] = max_rows_per_file
+        captured["metadata_payloads"] = metadata_payloads
+
+    monkeypatch.setattr(resume_from_staging, "write_partitioned_dataset", _fake_write_partitioned_dataset)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "resume-from-staging",
+            "--staging-dir",
+            str(staging_dir),
+            "--output-root",
+            str(output_root),
+            "--resume-base-files",
+            "--resume-output-files",
+        ],
+    )
+
+    exit_code = resume_from_staging.main()
+
+    assert exit_code == 0
+    assert captured["shard_paths"] == [staging_dir / "base_00000.parquet"]
+    assert captured["metadata_payloads"] == {
+        "_meta/feature_template.json": feature_template,
+        "_meta/feature_transforms.json": feature_transforms,
+        "_meta/uncatalogued_columns.json": uncatalogued,
+    }
+
+
 def test_export_load_feature_names_rebuilds_legacy_template(tmp_path: Path) -> None:
     meta_dir = tmp_path / "_meta"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +428,115 @@ def test_build_feature_template_uses_catalog_groups_and_occurrence_other(tmp_pat
     assert template.other == ["custom_measure"]
 
 
+def test_load_occurrence_frame_projects_case_insensitive_columns(tmp_path: Path) -> None:
+    source_path = tmp_path / "occurrence.parquet"
+    _write_parquet(
+        source_path,
+        {
+            "Latitude": pa.array([10.0], type=pa.float64()),
+            "Longitude": pa.array([20.0], type=pa.float64()),
+            "Species_Key": pa.array([101], type=pa.int64()),
+            "EventDate": pa.array(["2024-01-15T00:00:00Z"], type=pa.string()),
+            "BIO_1": pa.array([1.0], type=pa.float32()),
+            "LANDCOVER": pa.array([2], type=pa.int32()),
+        },
+    )
+
+    frame = transform.load_occurrence_frame(
+        source_path,
+        feature_template=transform.FeatureGroups(
+            bioclimate=["bio_1"],
+            landclass=["landcover"],
+            terrain=[],
+            temporal=[],
+            other=[],
+        ),
+    )
+
+    assert {"Latitude", "Longitude", "Species_Key", "EventDate", "BIO_1", "LANDCOVER"}.issubset(frame.columns)
+    assert transform.choose_column(frame, ("lat", "latitude")) == "Latitude"
+    assert transform.choose_column(frame, ("lon", "longitude")) == "Longitude"
+    assert transform.choose_column(frame, ("species_key",)) == "Species_Key"
+    assert frame["BIO_1"].iloc[0] == pytest.approx(1.0)
+
+
+def test_load_occurrence_frame_caches_explicit_schema_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_path = tmp_path / "occurrence.parquet"
+    _write_parquet(
+        source_path,
+        {
+            "lat": pa.array([10.0], type=pa.float64()),
+            "lon": pa.array([20.0], type=pa.float64()),
+            "species_key": pa.array([101], type=pa.int64()),
+            "eventDate": pa.array(["2024-01-15T00:00:00Z"], type=pa.string()),
+            "bio_1": pa.array([1.0], type=pa.float32()),
+        },
+    )
+
+    transform._occurrence_schema_columns_cached.cache_clear()
+    original_read_schema = transform.pq.read_schema
+    call_counter = {"count": 0}
+
+    def _counting_read_schema(*args: object, **kwargs: object):
+        call_counter["count"] += 1
+        return original_read_schema(*args, **kwargs)
+
+    monkeypatch.setattr(transform.pq, "read_schema", _counting_read_schema)
+
+    template = transform.FeatureGroups(
+        bioclimate=["bio_1"],
+        landclass=[],
+        terrain=[],
+        temporal=[],
+        other=[],
+    )
+    transform.load_occurrence_frame(source_path, feature_template=template)
+    transform.load_occurrence_frame(source_path, feature_template=template)
+
+    assert call_counter["count"] == 1
+
+
+def test_build_feature_transforms_from_frames_fits_numeric_and_categorical() -> None:
+    feature_template = transform.FeatureGroups(
+        bioclimate=["bio_1"],
+        landclass=["landcover"],
+        terrain=["aspect_deg"],
+        temporal=[],
+        other=["custom_measure"],
+    )
+    train_frame = pd.DataFrame(
+        {
+            "bio_1": [10.0, 14.0],
+            "landcover": [52.0, 71.0],
+            "aspect_deg": [0.0, 90.0],
+            "custom_measure": [1.0, 3.0],
+            "split": ["train", "train"],
+        }
+    )
+
+    fitted = transform.build_feature_transforms_from_frames([train_frame], feature_template=feature_template)
+
+    assert fitted.raw_feature_template == {
+        "bioclimate": ["bio_1"],
+        "landclass": ["landcover"],
+        "terrain": ["aspect_deg"],
+        "temporal": [],
+        "other": ["custom_measure"],
+    }
+    assert fitted.transformed_feature_template == {
+        "bioclimate": ["bio_1"],
+        "landclass": ["landcover__cat_52", "landcover__cat_71", "landcover__cat_unknown"],
+        "terrain": ["aspect_deg__sin", "aspect_deg__cos"],
+        "temporal": [],
+        "other": ["custom_measure"],
+    }
+    assert fitted.feature_specs["bio_1"]["value_type"] == "numeric"
+    assert fitted.feature_specs["bio_1"]["mean"] == pytest.approx(12.0)
+    assert fitted.feature_specs["landcover"]["value_type"] == "categorical"
+    assert fitted.feature_specs["landcover"]["categories"] == [52, 71]
+    assert fitted.feature_specs["aspect_deg"]["value_type"] == "circular"
+
+
 def test_transform_frame_merges_context_and_builds_group_vectors() -> None:
     feature_template = transform.FeatureGroups(
         bioclimate=["bio_1"],
@@ -397,7 +581,6 @@ def test_transform_frame_merges_context_and_builds_group_vectors() -> None:
         fallback_species_key=None,
         feature_template=feature_template,
         fallback_time_policy="keep",
-        missing_feature_sentinel=-9999.0,
         warn_min_cells_per_species=2,
         static_context=static_context,
         temporal_context=temporal_context,
@@ -411,7 +594,7 @@ def test_transform_frame_merges_context_and_builds_group_vectors() -> None:
     assert row.column("bioclimate_missing_mask")[0].as_py() == [0]
     assert row.column("landclass_features")[0].as_py() == [2.0, 7.0]
     assert row.column("landclass_missing_mask")[0].as_py() == [0, 0]
-    assert row.column("terrain_features")[0].as_py() == [-9999.0, 3.0]
+    assert row.column("terrain_features")[0].as_py() == [0.0, 3.0]
     assert row.column("terrain_missing_mask")[0].as_py() == [1, 0]
     assert row.column("temporal_features")[0].as_py() == [4.5]
     assert row.column("other_features")[0].as_py() == [9.0]
@@ -461,11 +644,98 @@ def test_transform_frame_raises_when_missing_times_are_dropped() -> None:
             fallback_species_key=None,
             feature_template=feature_template,
             fallback_time_policy="drop",
-            missing_feature_sentinel=-9999.0,
             warn_min_cells_per_species=0,
             static_context=None,
             temporal_context=None,
         )
+
+
+def test_fit_feature_transforms_skips_files_with_no_rows_after_drop_missing_time(tmp_path: Path) -> None:
+    source_path = tmp_path / "species_101" / "occurrence.parquet"
+    _write_parquet(
+        source_path,
+        {
+            "lat": pa.array([10.1], type=pa.float64()),
+            "lon": pa.array([20.1], type=pa.float64()),
+            "species_key": pa.array([101], type=pa.int64()),
+            "eventDate": pa.array(["not-a-date"], type=pa.string()),
+            "bio_1": pa.array([1.5], type=pa.float32()),
+        },
+    )
+
+    fitted = transform.fit_feature_transforms(
+        [source_path],
+        cell_size_deg=0.25,
+        region_size_deg=10.0,
+        feature_template=transform.FeatureGroups(
+            bioclimate=["bio_1"],
+            landclass=[],
+            terrain=[],
+            temporal=[],
+            other=[],
+        ),
+        fallback_time_policy="drop",
+        warn_min_cells_per_species=0,
+        static_context_template="",
+        static_context_path=None,
+        static_context_required=False,
+        temporal_context_template="",
+        temporal_context_path=None,
+        temporal_context_required=False,
+    )
+
+    assert fitted.transformed_feature_template == {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": [],
+        "other": [],
+    }
+    assert fitted.feature_specs["bio_1"]["value_type"] == "numeric"
+    assert fitted.feature_specs["bio_1"]["mean"] == 0.0
+    assert fitted.feature_specs["bio_1"]["std"] == 1.0
+
+
+def test_transform_file_skips_files_with_no_rows_after_drop_missing_time(tmp_path: Path) -> None:
+    source_path = tmp_path / "species_101" / "occurrence.parquet"
+    _write_parquet(
+        source_path,
+        {
+            "lat": pa.array([10.1], type=pa.float64()),
+            "lon": pa.array([20.1], type=pa.float64()),
+            "species_key": pa.array([101], type=pa.int64()),
+            "eventDate": pa.array(["not-a-date"], type=pa.string()),
+            "bio_1": pa.array([1.5], type=pa.float32()),
+        },
+    )
+
+    result = transform.transform_file(
+        source_path,
+        tmp_path / "staging",
+        feature_version="test-v1",
+        cell_size_deg=0.25,
+        region_size_deg=10.0,
+        feature_template=transform.FeatureGroups(
+            bioclimate=["bio_1"],
+            landclass=[],
+            terrain=[],
+            temporal=[],
+            other=[],
+        ),
+        feature_transforms=None,
+        fallback_time_policy="drop",
+        warn_min_cells_per_species=0,
+        static_context_template="",
+        static_context_path=None,
+        static_context_required=False,
+        temporal_context_template="",
+        temporal_context_path=None,
+        temporal_context_required=False,
+    )
+
+    assert result.out_path is None
+    assert result.rows == 0
+    assert result.skipped_reason == "No valid rows remain after fallback-time filtering."
 
 
 def test_build_cell_table_averages_rows_and_zeroes_tied_missing_features(tmp_path: Path) -> None:
@@ -489,10 +759,11 @@ def test_build_cell_table_averages_rows_and_zeroes_tied_missing_features(tmp_pat
     cell_table = export.build_cell_table(tmp_path)
 
     payload = cell_table["cell_0_0"]
-    # The two rows are averaged elementwise: e.g. (1 + 11) / 2 = 6. The second
-    # feature is then zeroed because its averaged missing mask is 1.0.
-    assert payload["features"].tolist() == [6.0, 0.0, 8.0, 9.0, 10.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-    assert payload["mask"].tolist() == [0.0, 1.0, 0.0, 0.0, 0.0]
+    # Missing values are excluded from the per-feature mean, so the second
+    # feature keeps the observed value from the train row instead of being
+    # biased by the missing val row.
+    assert payload["features"].tolist() == [6.0, 2.0, 8.0, 9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert payload["mask"].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 def test_load_bundle_and_predict_heatmap_stream_uses_loaded_cell_table(tmp_path: Path) -> None:
@@ -657,10 +928,24 @@ def test_run_preprocess_writes_partitioned_dataset_and_metadata(tmp_path: Path) 
 
     assert exit_code == 0
     feature_template = json.loads((output_root / "_meta" / "feature_template.json").read_text(encoding="utf-8"))
+    feature_transforms = json.loads((output_root / "_meta" / "feature_transforms.json").read_text(encoding="utf-8"))
     assert feature_template == {
         "bioclimate": ["bio_1"],
         "landclass": ["landcover", "lithology"],
         "terrain": ["landform"],
+        "temporal": ["temperature_2m_24h"],
+        "other": ["custom_measure"],
+    }
+    assert feature_transforms["raw_feature_template"] == feature_template
+    assert feature_transforms["transformed_feature_template"] == {
+        "bioclimate": ["bio_1"],
+        "landclass": [
+            "landcover__cat_2",
+            "landcover__cat_unknown",
+            "lithology__cat_7",
+            "lithology__cat_unknown",
+        ],
+        "terrain": ["landform__cat_3", "landform__cat_unknown"],
         "temporal": ["temperature_2m_24h"],
         "other": ["custom_measure"],
     }
@@ -679,11 +964,165 @@ def test_run_preprocess_writes_partitioned_dataset_and_metadata(tmp_path: Path) 
     assert table.num_rows == 1
     assert table.column("species_key")[0].as_py() == 101
     assert table.column("cell_id")[0].as_py() == "cell_40_80"
-    assert table.column("bioclimate_features")[0].as_py() == [1.5]
-    assert table.column("landclass_features")[0].as_py() == [2.0, 7.0]
-    assert table.column("terrain_features")[0].as_py() == [3.0]
-    assert table.column("temporal_features")[0].as_py() == [4.5]
+    assert table.column("bioclimate_features")[0].as_py() == [0.0]
+    assert table.column("bioclimate_missing_mask")[0].as_py() == [0]
+    assert table.column("landclass_features")[0].as_py() == [1.0, 0.0, 1.0, 0.0]
+    assert table.column("landclass_missing_mask")[0].as_py() == [0, 0, 0, 0]
+    assert table.column("terrain_features")[0].as_py() == [1.0, 0.0]
+    assert table.column("terrain_missing_mask")[0].as_py() == [0, 0]
+    assert table.column("temporal_features")[0].as_py() == [0.0]
+    assert table.column("other_features")[0].as_py() == [0.0]
     assert not staging_dir.exists()
+
+
+def test_run_preprocess_uses_all_discovered_files_for_template_scan_but_caps_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    staging_dir = tmp_path / "staging"
+    source_a = input_root / "species_a" / "observations.parquet"
+    source_b = input_root / "species_b" / "observations.parquet"
+
+    _write_parquet(
+        source_a,
+        {
+            "lat": pa.array([10.1], type=pa.float64()),
+            "lon": pa.array([20.1], type=pa.float64()),
+            "species_key": pa.array([101], type=pa.int64()),
+            "eventDate": pa.array(["2024-01-15T00:00:00Z"], type=pa.string()),
+            "bio_1": pa.array([1.5], type=pa.float32()),
+        },
+    )
+    _write_parquet(
+        source_b,
+        {
+            "lat": pa.array([11.1], type=pa.float64()),
+            "lon": pa.array([21.1], type=pa.float64()),
+            "species_key": pa.array([202], type=pa.int64()),
+            "eventDate": pa.array(["2024-02-15T00:00:00Z"], type=pa.string()),
+            "custom_measure": pa.array([9.0], type=pa.float32()),
+        },
+    )
+
+    observed: dict[str, object] = {}
+    feature_template = transform.FeatureGroups(
+        bioclimate=["bio_1"],
+        landclass=[],
+        terrain=[],
+        temporal=[],
+        other=["custom_measure"],
+    )
+    fitted_transforms = transform.FittedFeatureTransforms(
+        raw_feature_template={
+            "bioclimate": ["bio_1"],
+            "landclass": [],
+            "terrain": [],
+            "temporal": [],
+            "other": ["custom_measure"],
+        },
+        transformed_feature_template={
+            "bioclimate": ["bio_1"],
+            "landclass": [],
+            "terrain": [],
+            "temporal": [],
+            "other": ["custom_measure"],
+        },
+        feature_specs={
+            "bio_1": {
+                "group": "bioclimate",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["bio_1"],
+            },
+            "custom_measure": {
+                "group": "other",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["custom_measure"],
+            },
+        },
+    )
+
+    def _fake_build_feature_template(files: list[Path], **_: object) -> transform.FeatureGroups:
+        observed["template_files"] = list(files)
+        return feature_template
+
+    def _fake_fit_feature_transforms(files: list[Path], **_: object) -> transform.FittedFeatureTransforms:
+        observed["fit_files"] = list(files)
+        return fitted_transforms
+
+    def _fake_transform_file(src_path: Path, _staging_dir: Path, **_: object) -> transform.TransformResult:
+        processed = observed.setdefault("processed_files", [])
+        assert isinstance(processed, list)
+        processed.append(src_path)
+        shard_path = _staging_dir / f"{src_path.parent.name}.parquet"
+        _staging_dir.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"split": pa.array(["train"], type=pa.string())}), shard_path)
+        return transform.TransformResult(
+            out_path=shard_path,
+            rows=1,
+            duration_seconds=0.0,
+            read_seconds=0.0,
+            low_cell_warnings=[],
+            static_context_rows=0,
+            temporal_context_rows=0,
+            skipped_reason=None,
+        )
+
+    def _fake_write_partitioned_dataset(
+        shard_paths: list[Path],
+        output_root: Path,
+        max_rows_per_file: int,
+        metadata_payloads: dict[str, object] | None = None,
+    ) -> None:
+        observed["written_shards"] = list(shard_paths)
+        output_root.mkdir(parents=True, exist_ok=True)
+        if metadata_payloads:
+            for relative_path, payload in metadata_payloads.items():
+                target_path = output_root / relative_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(pipeline, "build_feature_template", _fake_build_feature_template)
+    monkeypatch.setattr(pipeline, "fit_feature_transforms", _fake_fit_feature_transforms)
+    monkeypatch.setattr(pipeline, "transform_file", _fake_transform_file)
+    monkeypatch.setattr(pipeline, "write_partitioned_dataset", _fake_write_partitioned_dataset)
+
+    args = SimpleNamespace(
+        input_root=input_root,
+        output_root=output_root,
+        staging_dir=staging_dir,
+        overwrite_output=True,
+        glob="**/observations.parquet",
+        max_files=1,
+        drop_missing_time=False,
+        threads=1,
+        background_ratio=0.0,
+        background_split_chunk_rows=10,
+        warn_min_cells_per_species=0,
+        static_context_template="",
+        static_context_path=None,
+        static_context_required=False,
+        temporal_context_template="",
+        temporal_context_path=None,
+        temporal_context_required=False,
+        template_scan_max_files=0,
+        feature_version="test-v1",
+        max_rows_per_file=10,
+        keep_staging=False,
+    )
+
+    exit_code = pipeline.run_preprocess(args)
+
+    assert exit_code == 0
+    assert observed["template_files"] == [source_a, source_b]
+    assert observed["fit_files"] == [source_a]
+    assert observed["processed_files"] == [source_a]
+    assert len(observed["written_shards"]) == 1
 
 
 def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
@@ -699,8 +1138,51 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
         "temporal": ["temperature_2m_24h"],
         "other": ["custom_measure"],
     }
+    feature_transforms = {
+        "version": "v1",
+        "raw_feature_template": feature_names,
+        "transformed_feature_template": feature_names,
+        "feature_specs": {
+            "bio_1": {
+                "group": "bioclimate",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["bio_1"],
+            },
+            "landcover": {
+                "group": "landclass",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["landcover"],
+            },
+            "landform": {
+                "group": "terrain",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["landform"],
+            },
+            "temperature_2m_24h": {
+                "group": "temporal",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["temperature_2m_24h"],
+            },
+            "custom_measure": {
+                "group": "other",
+                "value_type": "numeric",
+                "mean": 0.0,
+                "std": 1.0,
+                "output_features": ["custom_measure"],
+            },
+        },
+    }
     (data_root / "_meta").mkdir(parents=True, exist_ok=True)
     (data_root / "_meta" / "feature_template.json").write_text(json.dumps(feature_names), encoding="utf-8")
+    (data_root / "_meta" / "feature_transforms.json").write_text(json.dumps(feature_transforms), encoding="utf-8")
 
     _write_split_part(
         data_root,
@@ -751,6 +1233,7 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
     )
 
     bundle_path = export.export_bundle(data_root, encoder_path, heads_path, output_bundle)
+    bundle_payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
     inference.load_bundle(bundle_path)
     stream = inference.predict_heatmap_stream(
         101,
@@ -764,6 +1247,9 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
     cells = list(stream["cells"])
 
     assert bundle_path.exists()
+    assert bundle_payload["raw_feature_names"] == feature_names
+    assert bundle_payload["feature_names"] == feature_names
+    assert bundle_payload["feature_transforms"]["raw_feature_template"] == feature_names
     assert inference.is_loaded() is True
     assert inference.has_species(101) is True
     assert inference.has_combined_head() is True

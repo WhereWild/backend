@@ -40,7 +40,7 @@ except ImportError:
 
 
 DEFAULT_MAX_ROWS_PER_FILE = 150_000
-DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 250_000
+DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 50_000
 
 
 def _template_counts(template: dict[str, list[str]]) -> dict[str, int]:
@@ -211,6 +211,27 @@ def _read_json_payload(path: Path) -> Any | None:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _load_resume_metadata_payloads(output_root: Path, staging_dir: Path) -> dict[str, object]:
+    """Load metadata files to preserve during resume writes.
+
+    Prefer already-published metadata when present, but fall back to staging
+    metadata so resume can publish a complete dataset after a failed first run.
+    """
+    metadata_payloads: dict[str, object] = {}
+    metadata_names = (
+        "feature_template.json",
+        "feature_transforms.json",
+        "uncatalogued_columns.json",
+    )
+    for metadata_name in metadata_names:
+        payload = _read_json_payload(output_root / "_meta" / metadata_name)
+        if payload is None:
+            payload = _read_json_payload(staging_dir / "_meta" / metadata_name)
+        if payload is not None:
+            metadata_payloads[f"_meta/{metadata_name}"] = payload
+    return metadata_payloads
 
 
 def _write_feature_template_from_output(output_root: Path) -> Path:
@@ -469,13 +490,7 @@ def main() -> int:
             )
 
         print(f"Starting final dataset write | shards: {len(final_paths):,}")
-        metadata_payloads: dict[str, object] = {}
-        existing_feature_template = _read_json_payload(output_root / "_meta" / "feature_template.json")
-        if existing_feature_template is not None:
-            metadata_payloads["_meta/feature_template.json"] = existing_feature_template
-        existing_uncatalogued = _read_json_payload(output_root / "_meta" / "uncatalogued_columns.json")
-        if existing_uncatalogued is not None:
-            metadata_payloads["_meta/uncatalogued_columns.json"] = existing_uncatalogued
+        metadata_payloads = _load_resume_metadata_payloads(output_root, staging_dir)
         write_partitioned_dataset(
             final_paths,
             output_root=output_root,

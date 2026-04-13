@@ -23,10 +23,17 @@ feature_template_dict = _feature_contract.feature_template_dict
 format_feature_group_counts = _feature_contract.format_feature_group_counts
 
 try:
-    from .transform import build_feature_template, get_uncatalogued_summary, reset_uncatalogued_summary, transform_file
+    from .transform import (
+        build_feature_template,
+        fit_feature_transforms,
+        get_uncatalogued_summary,
+        reset_uncatalogued_summary,
+        transform_file,
+    )
 except ImportError:
     from transform import (  # type: ignore[no-redef]
         build_feature_template,
+        fit_feature_transforms,
         get_uncatalogued_summary,
         reset_uncatalogued_summary,
         transform_file,
@@ -37,7 +44,6 @@ if TYPE_CHECKING:
 
 FEATURE_CELL_SIZE_DEG = 0.25
 FEATURE_REGION_SIZE_DEG = 10.0
-MISSING_FEATURE_SENTINEL = -9999.0
 PROGRESS_INTERVAL_SECONDS = 30.0
 LOG_SLOW_FILE_SECONDS = 20.0
 LOG_SLOW_READ_SECONDS = 8.0
@@ -296,11 +302,16 @@ def generate_pooled_background_shards(
     return generated_paths, generated_rows
 
 
-def discover_files(input_root: Path, glob_pattern: str, max_files: int) -> list[Path]:
-    """Discover input parquet files under root using glob and optional file cap."""
+def discover_files(input_root: Path, glob_pattern: str) -> list[Path]:
+    """Discover input parquet files under root using glob."""
     files = [path for path in input_root.glob(glob_pattern) if path.is_file()]
     files = [path for path in files if path.suffix.lower() == ".parquet"]
     files.sort()
+    return files
+
+
+def select_processing_files(files: list[Path], max_files: int) -> list[Path]:
+    """Apply the processing-file cap while leaving schema-scan discovery independent."""
     if max_files > 0:
         return files[:max_files]
     return files
@@ -523,18 +534,20 @@ def run_preprocess(args) -> int:
     if not input_root.exists():
         raise SystemExit(f"Input root does not exist: {input_root}")
 
-    files = discover_files(input_root, args.glob, args.max_files)
-    if not files:
+    discovered_files = discover_files(input_root, args.glob)
+    if not discovered_files:
         raise SystemExit(f"No parquet files found in {input_root} with glob '{args.glob}'.")
+    files = select_processing_files(discovered_files, args.max_files)
 
     fallback_time_policy = "drop" if bool(args.drop_missing_time) else "keep"
 
-    print(f"Discovered {len(files):,} parquet files.")
+    print(f"Discovered {len(discovered_files):,} parquet files.")
+    if len(files) != len(discovered_files):
+        print(f"Processing file cap: {len(files):,}/{len(discovered_files):,} files")
     print(f"Using {args.threads} worker threads.")
     print(f"Staging dir: {staging_dir}")
     print(f"Output dir: {output_root}")
     print(f"Fallback time policy: {fallback_time_policy}")
-    print(f"Missing feature sentinel: {MISSING_FEATURE_SENTINEL:.3f}")
     print("Include missing masks: True")
     print(f"Background ratio: {args.background_ratio:.3f}")
     print(f"Background split chunk rows: {args.background_split_chunk_rows:,}")
@@ -559,7 +572,7 @@ def run_preprocess(args) -> int:
         print(f"Template schema scan cap: {args.template_scan_max_files:,} files")
     template_start = time.perf_counter()
     feature_template = build_feature_template(
-        files,
+        discovered_files,
         schema_log_interval_files=SCHEMA_LOG_INTERVAL_FILES,
         log_slow_read_seconds=LOG_SLOW_READ_SECONDS,
         template_scan_max_files=args.template_scan_max_files,
@@ -569,8 +582,32 @@ def run_preprocess(args) -> int:
         temporal_context_path=args.temporal_context_path,
     )
     template_seconds = time.perf_counter() - template_start
-    print(f"Feature template sizes | {format_feature_group_counts(feature_template)}")
+    print(f"Raw feature template sizes | {format_feature_group_counts(feature_template)}")
     print(f"Feature-template schema scan duration: {template_seconds:.1f}s")
+
+    print("Fitting feature transforms from train-split rows...")
+    fit_start = time.perf_counter()
+    feature_transforms = fit_feature_transforms(
+        files,
+        cell_size_deg=FEATURE_CELL_SIZE_DEG,
+        region_size_deg=FEATURE_REGION_SIZE_DEG,
+        feature_template=feature_template,
+        fallback_time_policy=fallback_time_policy,
+        warn_min_cells_per_species=int(args.warn_min_cells_per_species),
+        static_context_template=str(args.static_context_template or ""),
+        static_context_path=args.static_context_path,
+        static_context_required=bool(args.static_context_required),
+        temporal_context_template=str(args.temporal_context_template or ""),
+        temporal_context_path=args.temporal_context_path,
+        temporal_context_required=bool(args.temporal_context_required),
+        fit_threads=max(1, int(args.threads)),
+        progress_interval_seconds=PROGRESS_INTERVAL_SECONDS,
+        progress_log_interval_files=SCHEMA_LOG_INTERVAL_FILES,
+    )
+    fit_seconds = time.perf_counter() - fit_start
+    feature_transforms_payload = feature_transforms.to_payload()
+    print(f"Transformed feature sizes | {format_feature_group_counts(feature_transforms.transformed_feature_template)}")
+    print(f"Feature transform fitting duration: {fit_seconds:.1f}s")
 
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_meta_dir = staging_dir / "_meta"
@@ -579,6 +616,10 @@ def run_preprocess(args) -> int:
     with open(template_json_path, "w") as _ft_fh:
         json.dump(feature_template_dict(feature_template), _ft_fh, indent=2)
     print(f"Saved feature template to {template_json_path}")
+    transform_json_path = staging_meta_dir / "feature_transforms.json"
+    with open(transform_json_path, "w") as _fts_fh:
+        json.dump(feature_transforms_payload, _fts_fh, indent=2)
+    print(f"Saved feature transforms to {transform_json_path}")
 
     written = 0
     staged_paths: list[Path] = []
@@ -586,6 +627,7 @@ def run_preprocess(args) -> int:
     low_cell_warnings: list[str] = []
     static_join_rows_total = 0
     temporal_join_rows_total = 0
+    skipped_files = 0
 
     run_start = time.perf_counter()
 
@@ -599,8 +641,8 @@ def run_preprocess(args) -> int:
                 cell_size_deg=FEATURE_CELL_SIZE_DEG,
                 region_size_deg=FEATURE_REGION_SIZE_DEG,
                 feature_template=feature_template,
+                feature_transforms=feature_transforms_payload,
                 fallback_time_policy=fallback_time_policy,
-                missing_feature_sentinel=MISSING_FEATURE_SENTINEL,
                 warn_min_cells_per_species=int(args.warn_min_cells_per_species),
                 static_context_template=str(args.static_context_template or ""),
                 static_context_path=args.static_context_path,
@@ -647,7 +689,11 @@ def run_preprocess(args) -> int:
                 processed += 1
                 try:
                     result = future.result()
-                    staged_paths.append(result.out_path)
+                    if result.out_path is not None:
+                        staged_paths.append(result.out_path)
+                    else:
+                        skipped_files += 1
+                        print(f"Skipped file | {src} | {result.skipped_reason}")
                     written += result.rows
                     if result.read_seconds >= LOG_SLOW_READ_SECONDS:
                         print(f"Slow read ({result.read_seconds:.1f}s) | rows: {result.rows:,} | {src}")
@@ -664,7 +710,7 @@ def run_preprocess(args) -> int:
                 if processed % 50 == 0 or processed == total:
                     print(
                         f"Processed {processed:,}/{total:,} files | "
-                        f"rows written: {written:,} | failures: {len(failures):,}"
+                        f"rows written: {written:,} | failures: {len(failures):,} | skipped: {skipped_files:,}"
                     )
 
     if not staged_paths:
@@ -698,6 +744,7 @@ def run_preprocess(args) -> int:
     uncatalogued_summary = get_uncatalogued_summary()
     metadata_payloads = {
         "_meta/feature_template.json": feature_template_dict(feature_template),
+        "_meta/feature_transforms.json": feature_transforms_payload,
         "_meta/uncatalogued_columns.json": uncatalogued_summary,
     }
 
@@ -715,10 +762,12 @@ def run_preprocess(args) -> int:
     print(f"Final dataset written to {output_root}")
     print(f"Positive rows: {positive_rows:,}")
     print(f"Total rows: {written:,}")
+    print(f"Skipped source files: {skipped_files:,}")
     print(f"Static context merged rows: {static_join_rows_total:,}")
     print(f"Temporal context merged rows: {temporal_join_rows_total:,}")
     print(f"Final write duration: {write_seconds:.1f}s")
     print(f"Saved feature template to {output_root / '_meta' / 'feature_template.json'}")
+    print(f"Saved feature transforms to {output_root / '_meta' / 'feature_transforms.json'}")
     print(f"Saved uncatalogued column summary to {output_root / '_meta' / 'uncatalogued_columns.json'}")
 
     if failures:

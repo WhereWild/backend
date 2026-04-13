@@ -13,7 +13,7 @@ except ImportError:
 
 DEFAULT_PREPROCESS_THREADS = 8
 DEFAULT_MAX_ROWS_PER_FILE = 150_000
-DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 250_000
+DEFAULT_BACKGROUND_SPLIT_CHUNK_ROWS = 50_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +49,10 @@ def parse_args() -> argparse.Namespace:
         "--max-files",
         type=int,
         default=0,
-        help="Optional cap for number of input files to process (0 = no cap).",
+        help=(
+            "Optional cap for number of input files to transform and write "
+            "(0 = no cap). Does not limit the schema/template scan."
+        ),
     )
     parser.add_argument(
         "--threads",
@@ -106,7 +109,10 @@ def parse_args() -> argparse.Namespace:
         "--template-scan-max-files",
         type=int,
         default=0,
-        help="Optional cap for schema files scanned to build feature template (0 = scan all discovered files).",
+        help=(
+            "Optional cap for files scanned to build the feature template "
+            "(0 = scan all discovered files, independent of --max-files)."
+        ),
     )
     parser.add_argument(
         "--warn-min-cells-per-species",

@@ -31,8 +31,11 @@ from typing import Any, Callable, Iterator, NamedTuple, cast
 import torch
 
 _feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
+_feature_transforms = import_module("scripts.machine_learning.feature_transforms")
 _SAMPLED_FEATURE_GROUPS = _feature_contract.SAMPLED_FEATURE_GROUPS
 _UNSAMPLED_FEATURE_GROUPS = _feature_contract.UNSAMPLED_FEATURE_GROUPS
+normalize_feature_transform_spec = _feature_transforms.normalize_feature_transform_spec
+transform_feature_matrices = _feature_transforms.transform_feature_matrices
 
 # ---------------------------------------------------------------------------
 # Lazy import of model classes — avoids hard-wiring sys.path at module level.
@@ -54,7 +57,9 @@ _species_meta: dict[int, dict] = {}
 _combined_species_keys: list[int] = []
 _combined_head_meta: dict[str, Any] | None = None
 _combined_species_head_class_indices: list[int] = []
+_raw_feature_names: dict[str, list[str]] | None = None
 _feature_names: dict[str, list[str]] | None = None
+_feature_transforms_spec: dict[str, Any] | None = None
 _input_dim: int = 0
 _model_uses_mask: bool = False
 _device: torch.device = torch.device("cpu")
@@ -86,8 +91,15 @@ LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
 
 
-def _feature_group_names(group_name: str) -> list[str]:
-    """Return ordered feature names for one stored feature group."""
+def _raw_feature_group_names(group_name: str) -> list[str]:
+    """Return ordered raw source feature names for one feature group."""
+    if _raw_feature_names is None:
+        return []
+    return list(_raw_feature_names.get(group_name, []))
+
+
+def _model_feature_group_names(group_name: str) -> list[str]:
+    """Return ordered model-layout feature names for one feature group."""
     if _feature_names is None:
         return []
     return list(_feature_names.get(group_name, []))
@@ -97,19 +109,19 @@ def _sampled_static_feature_names() -> list[str]:
     """Return the concatenated GIS-sampleable feature names in model order."""
     names: list[str] = []
     for group_name in _SAMPLED_FEATURE_GROUPS:
-        names.extend(_feature_group_names(group_name))
+        names.extend(_raw_feature_group_names(group_name))
     return names
 
 
-def _temporal_feature_names() -> list[str]:
-    """Return ordered temporal feature names in model order."""
-    return _feature_group_names("temporal")
+def _raw_temporal_feature_names() -> list[str]:
+    """Return ordered raw temporal feature names."""
+    return _raw_feature_group_names("temporal")
 
 
 def _temporal_feature_span() -> tuple[int, int]:
-    """Return [start, end) of temporal features within the raw feature vector."""
-    static_width = len(_sampled_static_feature_names())
-    temporal_width = len(_temporal_feature_names())
+    """Return [start, end) of temporal features within the model feature vector."""
+    static_width = sum(len(_model_feature_group_names(group_name)) for group_name in _SAMPLED_FEATURE_GROUPS)
+    temporal_width = len(_model_feature_group_names("temporal"))
     return static_width, static_width + temporal_width
 
 
@@ -216,7 +228,15 @@ def _move_cell_table_to_device(
 
 
 def _raw_feature_dim_from_names() -> int | None:
-    """Return raw feature dimension from feature names when available."""
+    """Return raw sampled feature dimension from raw feature names when available."""
+    if _raw_feature_names is None:
+        return None
+    groups = (*_SAMPLED_FEATURE_GROUPS, *_UNSAMPLED_FEATURE_GROUPS)
+    return sum(len(_raw_feature_names.get(group_name, [])) for group_name in groups)
+
+
+def _model_feature_dim_from_names() -> int | None:
+    """Return transformed model feature dimension from feature names when available."""
     if _feature_names is None:
         return None
     groups = (*_SAMPLED_FEATURE_GROUPS, *_UNSAMPLED_FEATURE_GROUPS)
@@ -319,18 +339,18 @@ def _payload_model_input(payload: dict[str, torch.Tensor]) -> torch.Tensor:
 
 def _sampled_feature_support_status() -> tuple[bool, str | None]:
     """Return whether sampled GIS features can produce model-aligned inputs."""
-    if _feature_names is None:
-        return False, "bundle does not include feature_names required for sampled features"
+    if _raw_feature_names is None:
+        return False, "bundle does not include raw_feature_names required for sampled features"
 
     raw_dim = _raw_feature_dim_from_names()
     if raw_dim is None:
-        return False, "bundle does not include feature_names required for sampled features"
+        return False, "bundle does not include raw_feature_names required for sampled features"
     if raw_dim <= 0:
-        bioclimate_dim = len(_feature_names.get("bioclimate", []))
-        landclass_dim = len(_feature_names.get("landclass", []))
-        terrain_dim = len(_feature_names.get("terrain", []))
-        temporal_dim = len(_feature_names.get("temporal", []))
-        other_dim = len(_feature_names.get("other", []))
+        bioclimate_dim = len(_raw_feature_names.get("bioclimate", []))
+        landclass_dim = len(_raw_feature_names.get("landclass", []))
+        terrain_dim = len(_raw_feature_names.get("terrain", []))
+        temporal_dim = len(_raw_feature_names.get("temporal", []))
+        other_dim = len(_raw_feature_names.get("other", []))
         return (
             False,
             "bundle sampled feature template is empty "
@@ -340,12 +360,13 @@ def _sampled_feature_support_status() -> tuple[bool, str | None]:
             ")",
         )
 
-    alignable = raw_dim == _input_dim or 2 * raw_dim == _input_dim
+    model_dim = _model_feature_dim_from_names()
+    alignable = model_dim is not None and (model_dim == _input_dim or 2 * model_dim == _input_dim)
     if not alignable:
         return (
             False,
             "sampled feature template does not align with model input width "
-            f"(raw_dim={raw_dim}, input_dim={_input_dim})",
+            f"(raw_dim={raw_dim}, model_dim={model_dim}, input_dim={_input_dim})",
         )
 
     try:
@@ -1208,13 +1229,13 @@ def _mask_temporal_model_input(model_input: torch.Tensor) -> torch.Tensor:
         return model_input.clone()
 
     masked = model_input.clone()
-    raw_dim = _raw_feature_dim_from_names()
-    if raw_dim is None or raw_dim <= 0:
+    model_dim = _model_feature_dim_from_names()
+    if model_dim is None or model_dim <= 0:
         return masked
 
     masked[temporal_start:temporal_end] = 0.0
     if _model_uses_mask:
-        mask_offset = raw_dim
+        mask_offset = model_dim
         masked[mask_offset + temporal_start : mask_offset + temporal_end] = 1.0
     return masked
 
@@ -1233,7 +1254,7 @@ def _batch_sample_features(
     Opens each GIS raster once per 10-degree region rather than once per
     coordinate, so this is efficient enough for heatmap-sized batches.
     """
-    if _feature_names is None:
+    if _raw_feature_names is None:
         return [None] * len(coords)
     try:
         import numpy as np
@@ -1241,10 +1262,9 @@ def _batch_sample_features(
     except ImportError:
         return [None] * len(coords)
 
-    sampled_group_names = {group_name: _feature_group_names(group_name) for group_name in _SAMPLED_FEATURE_GROUPS}
-    temporal_names = _temporal_feature_names()
+    temporal_names = _raw_temporal_feature_names()
     temporal_dim: int = len(temporal_names)
-    other_dim: int = len(_feature_names.get("other", []))
+    other_dim: int = len(_raw_feature_names.get("other", []))
     n_coords = len(coords)
 
     layer_vals: dict[str, np.ndarray] = {}
@@ -1375,8 +1395,15 @@ def _batch_sample_features(
             feature_matrix[observed, col_idx] = values[observed]
             mask_matrix[observed, col_idx] = 0.0
 
-    feature_tensor = torch.from_numpy(feature_matrix)
-    mask_tensor = torch.from_numpy(mask_matrix)
+    transformed_values, transformed_masks, _ = transform_feature_matrices(
+        raw_feature_template=_raw_feature_names,
+        raw_values=feature_matrix,
+        raw_masks=mask_matrix,
+        transform_spec=_feature_transforms_spec,
+    )
+
+    feature_tensor = torch.from_numpy(transformed_values)
+    mask_tensor = torch.from_numpy(transformed_masks)
     feature_tensor[mask_tensor > 0.5] = 0.0
     model_input_tensor = _coerce_model_input_batch(feature_tensor, mask_tensor)
 
@@ -1400,7 +1427,8 @@ def load_bundle(path: str | Path) -> None:
     """
     global _bundle, _encoder, _heads, _combined_head, _cell_table, _cell_table_by_bin  # noqa: PLW0603
     global _cell_size_deg, _species_meta, _combined_species_keys, _combined_head_meta  # noqa: PLW0603
-    global _combined_species_head_class_indices, _feature_names, _input_dim, _model_uses_mask, _device  # noqa: PLW0603
+    global _combined_species_head_class_indices, _raw_feature_names, _feature_names, _feature_transforms_spec  # noqa: PLW0603
+    global _input_dim, _model_uses_mask, _device  # noqa: PLW0603
 
     _lazy_import_models()
     _device = _resolve_inference_device()
@@ -1461,10 +1489,14 @@ def load_bundle(path: str | Path) -> None:
     _combined_species_head_class_indices = [
         class_index for class_index, species_key in enumerate(_combined_species_keys) if int(species_key) in _heads
     ]
-    _feature_names = loaded.get("feature_names")
+    _raw_feature_names = loaded.get("raw_feature_names", loaded.get("feature_names"))
+    _feature_names = loaded.get("feature_names", _raw_feature_names)
+    _feature_transforms_spec = normalize_feature_transform_spec(loaded.get("feature_transforms"))
+    if _feature_transforms_spec is not None and _feature_names is None:
+        _feature_names = _feature_transforms_spec.get("transformed_feature_template")
 
-    raw_dim = _raw_feature_dim_from_names()
-    _model_uses_mask = raw_dim is not None and input_dim == raw_dim * 2
+    model_dim = _model_feature_dim_from_names()
+    _model_uses_mask = model_dim is not None and input_dim == model_dim * 2
     normalized_table: dict[str, dict[str, torch.Tensor]] = {}
     normalized_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
     bad_cells: list[str] = []

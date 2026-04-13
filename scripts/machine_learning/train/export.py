@@ -21,9 +21,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow.compute as pc
@@ -44,6 +44,9 @@ classify_catalog_layer_group = _feature_contract.classify_catalog_layer_group
 format_feature_group_counts = _feature_contract.format_feature_group_counts
 normalize_feature_template = _feature_contract.normalize_feature_template
 classify_feature_name = import_module("scripts.machine_learning.preprocess_training.transform").classify_feature_name
+_feature_transforms = import_module("scripts.machine_learning.feature_transforms")
+normalize_feature_transform_spec = _feature_transforms.normalize_feature_transform_spec
+transformed_feature_template_from_spec = _feature_transforms.transformed_feature_template_from_spec
 
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
@@ -64,7 +67,6 @@ def build_cell_table(
     # Accumulate per-cell sums across all splits.
     cell_feat_sum: dict[str, np.ndarray] = {}
     cell_mask_sum: dict[str, np.ndarray] = {}
-    cell_count: dict[str, int] = defaultdict(int)
     total_processed_rows = 0
 
     columns = [*FEATURE_COLUMNS, *MASK_COLUMNS, "cell_id"]
@@ -96,19 +98,18 @@ def build_cell_table(
                 continue
 
             unique_ids, inverse = np.unique(cell_ids, return_inverse=True)
+            observed = 1.0 - masks
             batch_feat_sum = np.zeros((len(unique_ids), features.shape[1]), dtype=np.float64)
-            batch_mask_sum = np.zeros((len(unique_ids), masks.shape[1]), dtype=np.float64)
-            batch_count = np.bincount(inverse, minlength=len(unique_ids)).astype(np.int64)
-            np.add.at(batch_feat_sum, inverse, features)
-            np.add.at(batch_mask_sum, inverse, masks)
+            batch_observed_sum = np.zeros((len(unique_ids), masks.shape[1]), dtype=np.float64)
+            np.add.at(batch_feat_sum, inverse, features * observed)
+            np.add.at(batch_observed_sum, inverse, observed)
 
             for idx, cid in enumerate(unique_ids.tolist()):
                 if cid not in cell_feat_sum:
                     cell_feat_sum[cid] = np.zeros(features.shape[1], dtype=np.float64)
                     cell_mask_sum[cid] = np.zeros(masks.shape[1], dtype=np.float64)
                 cell_feat_sum[cid] += batch_feat_sum[idx]
-                cell_mask_sum[cid] += batch_mask_sum[idx]
-                cell_count[cid] += int(batch_count[idx])
+                cell_mask_sum[cid] += batch_observed_sum[idx]
 
             split_seen_rows += int(record_batch.num_rows)
             total_processed_rows += int(record_batch.num_rows)
@@ -119,12 +120,14 @@ def build_cell_table(
 
     result: dict[str, dict[str, torch.Tensor]] = {}
     for cid in cell_feat_sum:
-        n = cell_count[cid]
-        avg_feat = (cell_feat_sum[cid] / n).astype(np.float32)
-        # For the mask, if *any* observation had the feature present (mask 0)
-        # treat it as present.  Threshold at 0.5: majority-missing → missing.
-        avg_mask = (cell_mask_sum[cid] / n >= 0.5).astype(np.float32)
-        # Zero out features where the mask says missing.
+        observed_count = cell_mask_sum[cid]
+        avg_feat = np.divide(
+            cell_feat_sum[cid],
+            np.maximum(observed_count, 1.0),
+            out=np.zeros_like(cell_feat_sum[cid], dtype=np.float64),
+            where=observed_count > 0.0,
+        ).astype(np.float32)
+        avg_mask = (observed_count <= 0.0).astype(np.float32)
         avg_feat[avg_mask > 0.5] = 0.0
         model_feat = np.concatenate([avg_feat, avg_mask], axis=0)
         result[cid] = {
@@ -199,6 +202,16 @@ def _load_feature_names(data_root: Path) -> dict[str, list[str]] | None:
         return None
 
 
+def _load_feature_transforms(data_root: Path) -> dict[str, Any] | None:
+    """Load fitted feature transform metadata saved during preprocessing."""
+    candidate_path = data_root / "_meta" / "feature_transforms.json"
+    if not candidate_path.exists():
+        return None
+    with open(candidate_path) as handle:
+        raw = json.load(handle)
+    return normalize_feature_transform_spec(raw)
+
+
 def _resolve_output_path(output_path: Path) -> Path:
     """Accept either an explicit bundle file path or an output directory."""
     if output_path.exists() and output_path.is_dir():
@@ -223,11 +236,18 @@ def export_bundle(
     cell_table = build_cell_table(data_root)
     print(f"Geocell table: {len(cell_table):,} unique cells")
 
-    feature_names = _load_feature_names(data_root)
-    if feature_names is not None:
-        print(f"Feature names: {format_feature_group_counts(feature_names)}")
+    raw_feature_names = _load_feature_names(data_root)
+    feature_transforms = _load_feature_transforms(data_root)
+    transformed_feature_names = transformed_feature_template_from_spec(feature_transforms)
+    model_feature_names = transformed_feature_names or raw_feature_names
+    if raw_feature_names is not None:
+        print(f"Raw feature names: {format_feature_group_counts(raw_feature_names)}")
     else:
-        print("Warning: could not determine feature names; on-the-fly GIS sampling will be unavailable.")
+        print("Warning: could not determine raw feature names; on-the-fly GIS sampling will be unavailable.")
+    if model_feature_names is not None:
+        print(f"Model feature names: {format_feature_group_counts(model_feature_names)}")
+    else:
+        print("Warning: could not determine model feature names.")
 
     bundle = {
         # Encoder config + weights
@@ -244,8 +264,10 @@ def export_bundle(
         # Geocell feature lookup
         "cell_table": cell_table,
         "cell_size_deg": cell_size_deg,
-        # Feature names for on-the-fly GIS sampling
-        "feature_names": feature_names,
+        # Feature metadata for on-the-fly GIS sampling and runtime transforms
+        "feature_names": model_feature_names,
+        "raw_feature_names": raw_feature_names,
+        "feature_transforms": feature_transforms,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

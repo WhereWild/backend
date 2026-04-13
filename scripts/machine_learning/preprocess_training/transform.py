@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from importlib import import_module
 import re
 import threading
@@ -12,12 +13,20 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from scripts.machine_learning.feature_transforms import (
+    categorical_output_name,
+    categorical_unknown_output_name,
+    circular_output_names,
+    transform_feature_matrices,
+)
 
 _NUMERIC_SPECIES_SUFFIX = re.compile(r"(-?\d+)$")
 
@@ -72,13 +81,14 @@ class FeatureGroups:
 
 @dataclass(frozen=True)
 class TransformResult:
-    out_path: Path
+    out_path: Path | None
     rows: int
     duration_seconds: float
     read_seconds: float
     low_cell_warnings: list[str]
     static_context_rows: int
     temporal_context_rows: int
+    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +98,67 @@ class CatalogFeatureRules:
     terrain_exact: frozenset[str]
     temporal_exact: frozenset[str]
     temporal_prefixes: tuple[str, ...]
+    value_type_exact: tuple[tuple[str, str], ...]
+    value_type_prefixes: tuple[tuple[str, str], ...]
+
+
+@dataclass
+class NumericFeatureAccumulator:
+    count: int = 0
+    sum_value: float = 0.0
+    sum_sq_value: float = 0.0
+
+    def update(self, values: np.ndarray) -> None:
+        if values.size == 0:
+            return
+        self.count += int(values.size)
+        self.sum_value += float(values.sum(dtype=np.float64))
+        self.sum_sq_value += float(np.square(values, dtype=np.float64).sum(dtype=np.float64))
+
+    def finalize(self) -> tuple[float, float]:
+        if self.count <= 0:
+            return 0.0, 1.0
+        mean = self.sum_value / float(self.count)
+        variance = (self.sum_sq_value / float(self.count)) - (mean * mean)
+        variance = max(0.0, variance)
+        std = variance**0.5
+        if not np.isfinite(std) or std < 1e-6:
+            std = 1.0
+        return float(mean), float(std)
+
+
+@dataclass(frozen=True)
+class FittedFeatureTransforms:
+    raw_feature_template: dict[str, list[str]]
+    transformed_feature_template: dict[str, list[str]]
+    feature_specs: dict[str, dict[str, Any]]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "version": "v1",
+            "raw_feature_template": self.raw_feature_template,
+            "transformed_feature_template": self.transformed_feature_template,
+            "feature_specs": self.feature_specs,
+        }
+
+
+@dataclass(frozen=True)
+class FitShardStats:
+    numeric_feature_stats: dict[str, NumericFeatureAccumulator]
+    categorical_feature_values: dict[str, set[int]]
+    train_rows: int
+    skipped: bool
+
+
+_SKIPPABLE_EMPTY_FRAME_ERRORS = {
+    "No valid rows with numeric lat/lon after filtering.",
+    "No valid rows remain after fallback-time filtering.",
+}
+
+
+def is_skippable_empty_frame_error(exc: ValueError) -> bool:
+    """Return whether a frame-level ValueError means the file should be skipped."""
+    return str(exc) in _SKIPPABLE_EMPTY_FRAME_ERRORS
 
 
 def warn_once(key: str, message: str) -> None:
@@ -145,6 +216,43 @@ def choose_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
         if selected is not None:
             return selected
     return None
+
+
+@lru_cache(maxsize=8192)
+def _occurrence_schema_columns_cached(path_text: str) -> tuple[str, ...]:
+    """Return occurrence parquet schema column names with per-path caching."""
+    schema = pq.read_schema(Path(path_text), memory_map=True)
+    return tuple(schema.names)
+
+
+def _source_projection_candidates(feature_template: FeatureGroups) -> list[str]:
+    """Return possible occurrence parquet columns needed for fit/transform reads."""
+    candidates: list[str] = [
+        *_LAT_COLUMNS,
+        *_LON_COLUMNS,
+        *_TIME_COLUMNS,
+        *_SPECIES_COLUMNS,
+        *_OBSERVATION_COLUMNS,
+        *_SOURCE_COLUMNS,
+    ]
+    for group_name in FEATURE_GROUPS:
+        candidates.extend(getattr(feature_template, group_name))
+    return candidates
+
+
+def load_occurrence_frame(src_path: Path, *, feature_template: FeatureGroups) -> pd.DataFrame:
+    """Load only required occurrence parquet columns for preprocessing work."""
+    available_columns = list(_occurrence_schema_columns_cached(str(src_path.resolve())))
+    available_by_lower = {column_name.lower(): column_name for column_name in available_columns}
+    requested_columns: list[str] = []
+    for column_name in _source_projection_candidates(feature_template):
+        actual_name = available_by_lower.get(column_name.lower())
+        if actual_name is not None and actual_name not in requested_columns:
+            requested_columns.append(actual_name)
+    if not requested_columns:
+        requested_columns = available_columns
+    table = pq.read_table(src_path, columns=requested_columns, use_threads=True)
+    return table.to_pandas(types_mapper=None)
 
 
 def to_int64_species(value: object) -> int:
@@ -281,6 +389,8 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
     terrain_exact: set[str] = set()
     temporal_exact: set[str] = set()
     temporal_prefixes: set[str] = set()
+    value_type_exact: dict[str, str] = {}
+    value_type_prefixes: dict[str, str] = {}
 
     for category in payload.get("categories", []):
         if not isinstance(category, dict):
@@ -298,6 +408,7 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
                 continue
 
             feature_group = classify_catalog_layer_group(layer_id=layer_id, category_name=category_name)
+            raw_value_type = str(layer.get("value_type", "numeric")).strip().lower() or "numeric"
             if feature_group == "bioclimate":
                 bioclimate_exact.add(layer_id)
             elif feature_group == "landclass":
@@ -307,12 +418,16 @@ def _load_catalog_feature_rules() -> CatalogFeatureRules:
             elif feature_group == "temporal":
                 temporal_exact.add(layer_id)
                 temporal_prefixes.add(f"{layer_id}_")
+                value_type_prefixes[f"{layer_id}_"] = raw_value_type
+            value_type_exact[layer_id] = raw_value_type
     rules = CatalogFeatureRules(
         bioclimate_exact=frozenset(bioclimate_exact),
         landclass_exact=frozenset(landclass_exact),
         terrain_exact=frozenset(terrain_exact),
         temporal_exact=frozenset(temporal_exact),
         temporal_prefixes=tuple(sorted(temporal_prefixes)),
+        value_type_exact=tuple(sorted(value_type_exact.items())),
+        value_type_prefixes=tuple(sorted(value_type_prefixes.items())),
     )
 
     if not (rules.bioclimate_exact or rules.landclass_exact or rules.terrain_exact or rules.temporal_exact):
@@ -499,70 +614,40 @@ def bin_id(lat: float, lon: float, size_deg: float, prefix: str) -> str:
     return f"{prefix}_{lat_bin}_{lon_bin}"
 
 
-def _build_constant_fixed_list_array(rows: int, list_size: int, value: float) -> pa.Array:
-    """Build constant fixed-size list<float32> array."""
-    if list_size <= 0:
-        return pa.array([None] * rows, type=pa.list_(pa.float32()))
-    values = np.full((rows, list_size), value, dtype=np.float32)
-    flat = pa.array(values.reshape(-1), type=pa.float32())
-    return pa.FixedSizeListArray.from_arrays(flat, list_size=list_size)
-
-
-def _build_constant_mask_array(rows: int, list_size: int, value: int) -> pa.Array:
-    """Build constant fixed-size list<int8> array used for feature missingness masks."""
-    if list_size <= 0:
-        return pa.array([None] * rows, type=pa.list_(pa.int8()))
-    values = np.full((rows, list_size), value, dtype=np.int8)
-    flat = pa.array(values.reshape(-1), type=pa.int8())
-    return pa.FixedSizeListArray.from_arrays(flat, list_size=list_size)
-
-
-def vector_from_columns(
-    frame: pd.DataFrame,
-    columns: list[str],
-    *,
-    missing_sentinel: float,
-) -> tuple[pa.Array, pa.Array]:
-    """Create value and missing-mask vectors from provided columns.
-
-    Missing mask convention: 1 = missing/unavailable, 0 = observed.
-    """
-    if not columns:
-        return (
-            pa.array([None] * len(frame), type=pa.list_(pa.float32())),
-            pa.array([None] * len(frame), type=pa.list_(pa.int8())),
-        )
-
-    numeric = frame.reindex(columns=columns)
-    numeric = numeric.apply(pd.to_numeric, errors="coerce")
-    missing_mask = numeric.isna().to_numpy(dtype=np.int8, copy=False)
-    values = numeric.fillna(float(missing_sentinel)).astype(np.float32).to_numpy(copy=False)
-
-    flat = pa.array(values.reshape(-1), type=pa.float32())
-    values_array = pa.FixedSizeListArray.from_arrays(flat, list_size=len(columns))
-
-    mask_flat = pa.array(missing_mask.reshape(-1), type=pa.int8())
-    mask_array = pa.FixedSizeListArray.from_arrays(mask_flat, list_size=len(columns))
-    return values_array, mask_array
-
-
 def build_feature_group_arrays(
     frame: pd.DataFrame,
     *,
     feature_template: FeatureGroups,
-    missing_sentinel: float,
+    feature_transforms: Mapping[str, Any] | None,
 ) -> tuple[list[pa.Array], list[str]]:
-    """Build feature-vector arrays and names in canonical group order."""
+    """Build transformed feature-vector arrays and names in canonical group order."""
     arrays: list[pa.Array] = []
     names: list[str] = []
+
+    raw_values, raw_masks = _raw_feature_matrix_from_frame(frame, feature_template=feature_template)
+    transformed_values, transformed_masks, transformed_template = transform_feature_matrices(
+        raw_feature_template=_feature_contract.feature_template_dict(feature_template),
+        raw_values=raw_values,
+        raw_masks=raw_masks,
+        transform_spec=feature_transforms,
+    )
+
+    start = 0
     for group_name in FEATURE_GROUPS:
-        values, missing_mask = vector_from_columns(
-            frame,
-            getattr(feature_template, group_name),
-            missing_sentinel=missing_sentinel,
-        )
+        width = len(transformed_template[group_name])
+        group_values = transformed_values[:, start : start + width]
+        group_masks = transformed_masks[:, start : start + width]
+        if width == 0:
+            values = pa.array([None] * len(frame), type=pa.list_(pa.float32()))
+            missing_mask = pa.array([None] * len(frame), type=pa.list_(pa.int8()))
+        else:
+            values_flat = pa.array(group_values.reshape(-1), type=pa.float32())
+            mask_flat = pa.array(group_masks.astype(np.int8, copy=False).reshape(-1), type=pa.int8())
+            values = pa.FixedSizeListArray.from_arrays(values_flat, list_size=width)
+            missing_mask = pa.FixedSizeListArray.from_arrays(mask_flat, list_size=width)
         arrays.extend([values, missing_mask])
         names.extend([GROUP_TO_FEATURE_COLUMN[group_name], GROUP_TO_MASK_COLUMN[group_name]])
+        start += width
     return arrays, names
 
 
@@ -585,6 +670,27 @@ def classify_feature_name(column_name: str) -> str | None:
         return "temporal"
 
     return None
+
+
+def classify_feature_value_type(column_name: str) -> str:
+    """Classify one raw feature column as numeric, categorical, or circular."""
+    name = column_name.lower()
+    catalog_rules = _load_catalog_feature_rules()
+
+    exact_map = dict(catalog_rules.value_type_exact)
+    if name in exact_map:
+        value_type = exact_map[name]
+        if value_type in {"categorical", "circular"}:
+            return value_type
+        return "numeric"
+
+    for prefix, value_type in catalog_rules.value_type_prefixes:
+        if name.startswith(prefix):
+            if value_type in {"categorical", "circular"}:
+                return value_type
+            return "numeric"
+
+    return "numeric"
 
 
 def is_numeric_arrow_type(data_type: pa.DataType) -> bool:
@@ -709,21 +815,18 @@ def build_feature_template(
     )
 
 
-def transform_frame(
+def _prepared_feature_frame(
     frame: pd.DataFrame,
     *,
-    feature_version: str,
     cell_size_deg: float,
     region_size_deg: float,
     fallback_species_key: int | None,
-    feature_template: FeatureGroups,
     fallback_time_policy: str,
-    missing_feature_sentinel: float,
     warn_min_cells_per_species: int,
     static_context: pd.DataFrame | None,
     temporal_context: pd.DataFrame | None,
-) -> tuple[pa.Table, list[str], int, int]:
-    """Transform one raw occurrence frame into schema-aligned training rows."""
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, list[str], int, int]:
+    """Prepare one raw frame with split keys and merged context before feature encoding."""
     lat_col = choose_column(frame, _LAT_COLUMNS)
     lon_col = choose_column(frame, _LON_COLUMNS)
     species_col = choose_column(frame, _SPECIES_COLUMNS)
@@ -777,7 +880,6 @@ def transform_frame(
 
     event_time = event_time.fillna(pd.Timestamp("1970-01-01", tz="UTC"))
     event_time = event_time.dt.floor("ms")
-
     year_month = event_time.dt.strftime("%Y-%m")
 
     cell_ids = [
@@ -790,18 +892,13 @@ def transform_frame(
     ]
     splits = [stable_split(cell_id, ym) for cell_id, ym in zip(cell_ids, year_month, strict=True)]
 
-    static_context_rows = 0
-    temporal_context_rows = 0
     filtered["cell_id"] = np.asarray(cell_ids, dtype=object)
     filtered["year_month"] = year_month.to_numpy(dtype=object)
 
+    static_context_rows = 0
+    temporal_context_rows = 0
     if static_context is not None:
-        filtered, static_context_rows = merge_context_columns(
-            filtered,
-            static_context,
-            join_keys=["cell_id"],
-        )
-
+        filtered, static_context_rows = merge_context_columns(filtered, static_context, join_keys=["cell_id"])
     if temporal_context is not None:
         filtered, temporal_context_rows = merge_context_columns(
             filtered,
@@ -839,6 +936,474 @@ def transform_frame(
     else:
         source = pd.Series(["unknown"] * len(filtered), index=filtered.index)
 
+    filtered["region_id"] = np.asarray(region_ids, dtype=object)
+    filtered["split"] = np.asarray(splits, dtype=object)
+    filtered["source"] = source.to_numpy(dtype=object)
+    filtered["observation_id"] = observation_id.to_numpy(dtype=object)
+    filtered["event_time_utc"] = event_time.to_numpy()
+
+    return filtered, lat, lon, species_key, low_cell_warnings, static_context_rows, temporal_context_rows
+
+
+def _raw_feature_matrix_from_frame(
+    frame: pd.DataFrame,
+    *,
+    feature_template: FeatureGroups,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build raw grouped feature and mask matrices from a prepared frame."""
+    values_by_group: list[np.ndarray] = []
+    masks_by_group: list[np.ndarray] = []
+    for group_name in FEATURE_GROUPS:
+        columns = getattr(feature_template, group_name)
+        if not columns:
+            continue
+        numeric = frame.reindex(columns=columns).apply(pd.to_numeric, errors="coerce")
+        group_mask = numeric.isna().to_numpy(dtype=np.float32, copy=False)
+        group_values = numeric.fillna(0.0).astype(np.float32).to_numpy(copy=False)
+        values_by_group.append(group_values)
+        masks_by_group.append(group_mask)
+
+    if not values_by_group:
+        rows = len(frame)
+        return np.zeros((rows, 0), dtype=np.float32), np.zeros((rows, 0), dtype=np.float32)
+
+    return np.concatenate(values_by_group, axis=1), np.concatenate(masks_by_group, axis=1)
+
+
+def _maybe_log_feature_transform_spec_progress(
+    *,
+    processed_features: int,
+    total_features: int,
+    group_name: str,
+    build_start: float,
+    last_progress: float,
+    progress_interval_seconds: float,
+    progress_log_interval_features: int,
+) -> float:
+    now = time.perf_counter()
+    if (
+        processed_features == total_features
+        or (progress_log_interval_features > 0 and processed_features % progress_log_interval_features == 0)
+        or now - last_progress >= max(1.0, progress_interval_seconds)
+    ):
+        elapsed = now - build_start
+        print(
+            "Feature transform spec progress | "
+            f"features: {processed_features:,}/{total_features:,} | "
+            f"group: {group_name} | elapsed: {elapsed:.1f}s"
+        )
+        return now
+    return last_progress
+
+
+def build_feature_transforms_from_feature_stats(
+    *,
+    feature_template: FeatureGroups,
+    numeric_feature_stats: Mapping[str, NumericFeatureAccumulator] | None,
+    categorical_feature_values: Mapping[str, set[int]] | None,
+    source_summary: str,
+    progress_interval_seconds: float = 30.0,
+    progress_log_interval_features: int = 25,
+) -> FittedFeatureTransforms:
+    """Build transform metadata from aggregated per-feature statistics."""
+    raw_template = _feature_contract.feature_template_dict(feature_template)
+    transformed_template = _feature_contract.empty_feature_template()
+    feature_specs: dict[str, dict[str, Any]] = {}
+    total_features = sum(len(raw_template[group_name]) for group_name in FEATURE_GROUPS)
+    processed_features = 0
+    build_start = time.perf_counter()
+    last_progress = build_start
+
+    print(
+        f"Building feature transform spec from aggregated train rows | {source_summary} | features: {total_features:,}"
+    )
+
+    for group_name in FEATURE_GROUPS:
+        for feature_name in raw_template[group_name]:
+            value_type = classify_feature_value_type(feature_name)
+
+            if value_type == "categorical":
+                categories = (
+                    sorted(categorical_feature_values.get(feature_name, set())) if categorical_feature_values else []
+                )
+                output_features = [
+                    *[categorical_output_name(feature_name, category_value) for category_value in categories],
+                    categorical_unknown_output_name(feature_name),
+                ]
+                transformed_template[group_name].extend(output_features)
+                feature_specs[feature_name] = {
+                    "group": group_name,
+                    "value_type": "categorical",
+                    "categories": categories,
+                    "output_features": output_features,
+                }
+                processed_features += 1
+                last_progress = _maybe_log_feature_transform_spec_progress(
+                    processed_features=processed_features,
+                    total_features=total_features,
+                    group_name=group_name,
+                    build_start=build_start,
+                    last_progress=last_progress,
+                    progress_interval_seconds=progress_interval_seconds,
+                    progress_log_interval_features=progress_log_interval_features,
+                )
+                continue
+
+            if value_type == "circular":
+                output_features = circular_output_names(feature_name)
+                transformed_template[group_name].extend(output_features)
+                feature_specs[feature_name] = {
+                    "group": group_name,
+                    "value_type": "circular",
+                    "output_features": output_features,
+                }
+                processed_features += 1
+                last_progress = _maybe_log_feature_transform_spec_progress(
+                    processed_features=processed_features,
+                    total_features=total_features,
+                    group_name=group_name,
+                    build_start=build_start,
+                    last_progress=last_progress,
+                    progress_interval_seconds=progress_interval_seconds,
+                    progress_log_interval_features=progress_log_interval_features,
+                )
+                continue
+
+            stats = numeric_feature_stats.get(feature_name) if numeric_feature_stats else None
+            mean, std = stats.finalize() if stats is not None else (0.0, 1.0)
+            output_features = [feature_name]
+            transformed_template[group_name].extend(output_features)
+            feature_specs[feature_name] = {
+                "group": group_name,
+                "value_type": "numeric",
+                "mean": mean,
+                "std": std,
+                "output_features": output_features,
+            }
+            processed_features += 1
+            last_progress = _maybe_log_feature_transform_spec_progress(
+                processed_features=processed_features,
+                total_features=total_features,
+                group_name=group_name,
+                build_start=build_start,
+                last_progress=last_progress,
+                progress_interval_seconds=progress_interval_seconds,
+                progress_log_interval_features=progress_log_interval_features,
+            )
+
+    return FittedFeatureTransforms(
+        raw_feature_template=raw_template,
+        transformed_feature_template=transformed_template,
+        feature_specs=feature_specs,
+    )
+
+
+def build_feature_transforms_from_frames(
+    train_frames: list[pd.DataFrame],
+    *,
+    feature_template: FeatureGroups,
+    progress_interval_seconds: float = 30.0,
+    progress_log_interval_features: int = 25,
+) -> FittedFeatureTransforms:
+    """Fit transform metadata from prepared train-split frames."""
+    numeric_feature_stats: dict[str, NumericFeatureAccumulator] = {}
+    categorical_feature_values: dict[str, set[int]] = {}
+    raw_template = _feature_contract.feature_template_dict(feature_template)
+
+    for group_name in FEATURE_GROUPS:
+        for feature_name in raw_template[group_name]:
+            value_type = classify_feature_value_type(feature_name)
+            for frame in train_frames:
+                if feature_name not in frame.columns:
+                    continue
+                numeric = pd.to_numeric(frame[feature_name], errors="coerce")
+                valid = numeric[numeric.notna()].to_numpy(dtype=np.float32, copy=False)
+                if valid.size == 0:
+                    continue
+                if value_type == "categorical":
+                    categorical_feature_values.setdefault(feature_name, set()).update(
+                        int(np.rint(value)) for value in valid.tolist()
+                    )
+                elif value_type == "numeric":
+                    numeric_feature_stats.setdefault(feature_name, NumericFeatureAccumulator()).update(valid)
+
+    return build_feature_transforms_from_feature_stats(
+        feature_template=feature_template,
+        numeric_feature_stats=numeric_feature_stats,
+        categorical_feature_values=categorical_feature_values,
+        source_summary=f"frames: {len(train_frames):,}",
+        progress_interval_seconds=progress_interval_seconds,
+        progress_log_interval_features=progress_log_interval_features,
+    )
+
+
+def _merge_fit_shard_stats(
+    *,
+    target_numeric_feature_stats: dict[str, NumericFeatureAccumulator],
+    target_categorical_feature_values: dict[str, set[int]],
+    shard_stats: FitShardStats,
+) -> None:
+    """Merge one file's compact fit statistics into the global accumulators."""
+    for feature_name, stats in shard_stats.numeric_feature_stats.items():
+        merged = target_numeric_feature_stats.setdefault(feature_name, NumericFeatureAccumulator())
+        merged.count += stats.count
+        merged.sum_value += stats.sum_value
+        merged.sum_sq_value += stats.sum_sq_value
+
+    for feature_name, values in shard_stats.categorical_feature_values.items():
+        target_categorical_feature_values.setdefault(feature_name, set()).update(values)
+
+
+def _fit_feature_transforms_for_file(
+    src_path: Path,
+    *,
+    cell_size_deg: float,
+    region_size_deg: float,
+    feature_template: FeatureGroups,
+    feature_types: Mapping[str, str],
+    fallback_time_policy: str,
+    warn_min_cells_per_species: int,
+    static_context_template: str,
+    static_context_path: Path | None,
+    static_context_required: bool,
+    temporal_context_template: str,
+    temporal_context_path: Path | None,
+    temporal_context_required: bool,
+) -> FitShardStats:
+    """Collect compact transform-fit statistics for one source parquet file."""
+    frame = load_occurrence_frame(src_path, feature_template=feature_template)
+
+    static_context: pd.DataFrame | None = None
+    static_path = resolve_context_path(
+        src_path,
+        template=static_context_template,
+        fixed_path=static_context_path,
+        context_kind="static",
+    )
+    if static_path is not None:
+        if not static_path.exists():
+            if static_context_required:
+                raise ValueError(f"Static context parquet missing: {static_path}")
+        else:
+            try:
+                static_context = load_context_features(static_path, join_keys=("cell_id",))
+            except ValueError:
+                if static_context_required:
+                    raise
+                static_context = None
+
+    temporal_context: pd.DataFrame | None = None
+    temporal_path = resolve_context_path(
+        src_path,
+        template=temporal_context_template,
+        fixed_path=temporal_context_path,
+        context_kind="temporal",
+    )
+    if temporal_path is not None:
+        if not temporal_path.exists():
+            if temporal_context_required:
+                raise ValueError(f"Temporal context parquet missing: {temporal_path}")
+        else:
+            try:
+                temporal_context = load_context_features(temporal_path, join_keys=("cell_id", "year_month"))
+            except ValueError:
+                if temporal_context_required:
+                    raise
+                temporal_context = None
+
+    fallback_species_key = species_key_from_path(src_path)
+    try:
+        prepared, _, _, _, _, _, _ = _prepared_feature_frame(
+            frame,
+            cell_size_deg=cell_size_deg,
+            region_size_deg=region_size_deg,
+            fallback_species_key=fallback_species_key,
+            fallback_time_policy=fallback_time_policy,
+            warn_min_cells_per_species=warn_min_cells_per_species,
+            static_context=static_context,
+            temporal_context=temporal_context,
+        )
+    except ValueError as exc:
+        if not is_skippable_empty_frame_error(exc):
+            raise
+        return FitShardStats(
+            numeric_feature_stats={},
+            categorical_feature_values={},
+            train_rows=0,
+            skipped=True,
+        )
+
+    train_frame = prepared.loc[prepared["split"] == "train"].copy()
+    if train_frame.empty:
+        return FitShardStats(
+            numeric_feature_stats={},
+            categorical_feature_values={},
+            train_rows=0,
+            skipped=False,
+        )
+
+    numeric_feature_stats: dict[str, NumericFeatureAccumulator] = {}
+    categorical_feature_values: dict[str, set[int]] = {}
+    for feature_name, value_type in feature_types.items():
+        if feature_name not in train_frame.columns:
+            continue
+        numeric = pd.to_numeric(train_frame[feature_name], errors="coerce")
+        valid = numeric[numeric.notna()].to_numpy(dtype=np.float32, copy=False)
+        if valid.size == 0:
+            continue
+        if value_type == "categorical":
+            categorical_feature_values.setdefault(feature_name, set()).update(
+                int(np.rint(value)) for value in valid.tolist()
+            )
+        elif value_type == "numeric":
+            numeric_feature_stats.setdefault(feature_name, NumericFeatureAccumulator()).update(valid)
+
+    return FitShardStats(
+        numeric_feature_stats=numeric_feature_stats,
+        categorical_feature_values=categorical_feature_values,
+        train_rows=int(len(train_frame)),
+        skipped=False,
+    )
+
+
+def fit_feature_transforms(
+    files: list[Path],
+    *,
+    cell_size_deg: float,
+    region_size_deg: float,
+    feature_template: FeatureGroups,
+    fallback_time_policy: str,
+    warn_min_cells_per_species: int,
+    static_context_template: str,
+    static_context_path: Path | None,
+    static_context_required: bool,
+    temporal_context_template: str,
+    temporal_context_path: Path | None,
+    temporal_context_required: bool,
+    fit_threads: int = 1,
+    progress_interval_seconds: float = 30.0,
+    progress_log_interval_files: int = 500,
+) -> FittedFeatureTransforms:
+    """Fit transform metadata from train-split rows across all input files."""
+    raw_template = _feature_contract.feature_template_dict(feature_template)
+    feature_types = {
+        feature_name: classify_feature_value_type(feature_name)
+        for group_name in FEATURE_GROUPS
+        for feature_name in raw_template[group_name]
+    }
+    numeric_feature_stats: dict[str, NumericFeatureAccumulator] = {}
+    categorical_feature_values: dict[str, set[int]] = {}
+    total_files = len(files)
+    fit_start = time.perf_counter()
+    last_progress = fit_start
+    kept_train_rows = 0
+    skipped_files = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(fit_threads))) as pool:
+        future_to_path = {
+            pool.submit(
+                _fit_feature_transforms_for_file,
+                path,
+                cell_size_deg=cell_size_deg,
+                region_size_deg=region_size_deg,
+                feature_template=feature_template,
+                feature_types=feature_types,
+                fallback_time_policy=fallback_time_policy,
+                warn_min_cells_per_species=warn_min_cells_per_species,
+                static_context_template=static_context_template,
+                static_context_path=static_context_path,
+                static_context_required=static_context_required,
+                temporal_context_template=temporal_context_template,
+                temporal_context_path=temporal_context_path,
+                temporal_context_required=temporal_context_required,
+            ): path
+            for path in files
+        }
+        pending = set(future_to_path.keys())
+        processed_files = 0
+
+        while pending:
+            done, pending = wait(
+                pending,
+                timeout=max(1.0, progress_interval_seconds),
+                return_when=FIRST_COMPLETED,
+            )
+
+            if not done:
+                elapsed = time.perf_counter() - fit_start
+                print(
+                    "Feature transform fit heartbeat | "
+                    f"files: {processed_files:,}/{total_files:,} | "
+                    f"train rows kept: {kept_train_rows:,} | "
+                    f"skipped: {skipped_files:,} | "
+                    f"in-flight: {len(pending):,} | elapsed: {elapsed:.1f}s"
+                )
+                continue
+
+            for future in done:
+                processed_files += 1
+                shard_stats = future.result()
+                kept_train_rows += shard_stats.train_rows
+                if shard_stats.skipped:
+                    skipped_files += 1
+                _merge_fit_shard_stats(
+                    target_numeric_feature_stats=numeric_feature_stats,
+                    target_categorical_feature_values=categorical_feature_values,
+                    shard_stats=shard_stats,
+                )
+
+                now = time.perf_counter()
+                if (
+                    processed_files == total_files
+                    or (progress_log_interval_files > 0 and processed_files % progress_log_interval_files == 0)
+                    or now - last_progress >= max(1.0, progress_interval_seconds)
+                ):
+                    elapsed = now - fit_start
+                    print(
+                        "Feature transform fit progress | "
+                        f"files: {processed_files:,}/{total_files:,} | "
+                        f"train rows kept: {kept_train_rows:,} | "
+                        f"skipped: {skipped_files:,} | "
+                        f"elapsed: {elapsed:.1f}s"
+                    )
+                    last_progress = now
+
+    return build_feature_transforms_from_feature_stats(
+        feature_template=feature_template,
+        numeric_feature_stats=numeric_feature_stats,
+        categorical_feature_values=categorical_feature_values,
+        source_summary=(f"files: {total_files:,} | train rows kept: {kept_train_rows:,} | skipped: {skipped_files:,}"),
+        progress_interval_seconds=progress_interval_seconds,
+        progress_log_interval_features=25,
+    )
+
+
+def transform_frame(
+    frame: pd.DataFrame,
+    *,
+    feature_version: str,
+    cell_size_deg: float,
+    region_size_deg: float,
+    fallback_species_key: int | None,
+    feature_template: FeatureGroups,
+    feature_transforms: Mapping[str, Any] | None = None,
+    fallback_time_policy: str,
+    warn_min_cells_per_species: int,
+    static_context: pd.DataFrame | None,
+    temporal_context: pd.DataFrame | None,
+) -> tuple[pa.Table, list[str], int, int]:
+    """Transform one raw occurrence frame into schema-aligned training rows."""
+    filtered, lat, lon, species_key, low_cell_warnings, static_context_rows, temporal_context_rows = (
+        _prepared_feature_frame(
+            frame,
+            cell_size_deg=cell_size_deg,
+            region_size_deg=region_size_deg,
+            fallback_species_key=fallback_species_key,
+            fallback_time_policy=fallback_time_policy,
+            warn_min_cells_per_species=warn_min_cells_per_species,
+            static_context=static_context,
+            temporal_context=temporal_context,
+        )
+    )
     sample_id = pd.Series(
         [str(uuid.uuid4()) for _ in range(len(filtered))],
         index=filtered.index,
@@ -848,25 +1413,25 @@ def transform_frame(
     feature_arrays, feature_names = build_feature_group_arrays(
         filtered,
         feature_template=feature_template,
-        missing_sentinel=missing_feature_sentinel,
+        feature_transforms=feature_transforms,
     )
 
     return (
         pa.Table.from_arrays(
             [
                 pa.array(sample_id.tolist(), type=pa.string()),
-                pa.array(observation_id.tolist(), type=pa.string()),
+                pa.array(filtered["observation_id"].tolist(), type=pa.string()),
                 pa.array(species_key.tolist(), type=pa.int64()),
                 pa.array([1] * len(filtered), type=pa.int8()),
                 pa.array([1.0] * len(filtered), type=pa.float32()),
-                pa.array(cell_ids, type=pa.string()),
-                pa.array(region_ids, type=pa.string()),
+                pa.array(filtered["cell_id"].tolist(), type=pa.string()),
+                pa.array(filtered["region_id"].tolist(), type=pa.string()),
                 pa.array(lat.to_numpy(), type=pa.float64()),
                 pa.array(lon.to_numpy(), type=pa.float64()),
-                pa.Array.from_pandas(event_time, type=pa.timestamp("ms", tz="UTC")),
-                pa.array(year_month.tolist(), type=pa.string()),
-                pa.array(splits, type=pa.string()),
-                pa.array(source.tolist(), type=pa.string()),
+                pa.Array.from_pandas(filtered["event_time_utc"], type=pa.timestamp("ms", tz="UTC")),
+                pa.array(filtered["year_month"].tolist(), type=pa.string()),
+                pa.array(filtered["split"].tolist(), type=pa.string()),
+                pa.array(filtered["source"].tolist(), type=pa.string()),
                 pa.array([feature_version] * len(filtered), type=pa.string()),
                 *feature_arrays,
             ],
@@ -902,8 +1467,8 @@ def transform_file(
     cell_size_deg: float,
     region_size_deg: float,
     feature_template: FeatureGroups,
+    feature_transforms: Mapping[str, Any] | None = None,
     fallback_time_policy: str,
-    missing_feature_sentinel: float,
     warn_min_cells_per_species: int,
     static_context_template: str,
     static_context_path: Path | None,
@@ -915,9 +1480,8 @@ def transform_file(
     """Transform one source parquet file into one staged training parquet shard."""
     start = time.perf_counter()
     read_start = time.perf_counter()
-    table = pq.read_table(src_path, use_threads=True)
+    frame = load_occurrence_frame(src_path, feature_template=feature_template)
     read_seconds = time.perf_counter() - read_start
-    frame = table.to_pandas(types_mapper=None)
 
     static_context: pd.DataFrame | None = None
     static_path = resolve_context_path(
@@ -961,19 +1525,34 @@ def transform_file(
                 temporal_context = None
 
     fallback_species_key = species_key_from_path(src_path)
-    transformed, low_cell_warnings, static_context_rows, temporal_context_rows = transform_frame(
-        frame,
-        feature_version=feature_version,
-        cell_size_deg=cell_size_deg,
-        region_size_deg=region_size_deg,
-        fallback_species_key=fallback_species_key,
-        feature_template=feature_template,
-        fallback_time_policy=fallback_time_policy,
-        missing_feature_sentinel=missing_feature_sentinel,
-        warn_min_cells_per_species=warn_min_cells_per_species,
-        static_context=static_context,
-        temporal_context=temporal_context,
-    )
+    try:
+        transformed, low_cell_warnings, static_context_rows, temporal_context_rows = transform_frame(
+            frame,
+            feature_version=feature_version,
+            cell_size_deg=cell_size_deg,
+            region_size_deg=region_size_deg,
+            fallback_species_key=fallback_species_key,
+            feature_template=feature_template,
+            feature_transforms=feature_transforms,
+            fallback_time_policy=fallback_time_policy,
+            warn_min_cells_per_species=warn_min_cells_per_species,
+            static_context=static_context,
+            temporal_context=temporal_context,
+        )
+    except ValueError as exc:
+        if not is_skippable_empty_frame_error(exc):
+            raise
+        duration_seconds = time.perf_counter() - start
+        return TransformResult(
+            out_path=None,
+            rows=0,
+            duration_seconds=duration_seconds,
+            read_seconds=read_seconds,
+            low_cell_warnings=[],
+            static_context_rows=0,
+            temporal_context_rows=0,
+            skipped_reason=str(exc),
+        )
 
     staging_dir.mkdir(parents=True, exist_ok=True)
     out_path = staging_dir / (

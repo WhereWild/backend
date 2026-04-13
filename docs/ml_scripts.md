@@ -20,7 +20,7 @@ alias ww-train='uv run python -m scripts.machine_learning.train.cli'
     - Entry script for `train_encoder.py`, `train_heads.py`, `model.py`, `losses.py`, `data.py`.
 - `scripts/machine_learning/train/export.py`
     - Packages the encoder, species heads, and a pre-computed geocell feature table into a single `.pt` inference bundle.
-    - Also embeds feature names so the inference engine can sample GIS rasters on the fly for catalog-backed groups and preserve the unsampleable `temporal` and `other` group widths.
+    - Also embeds raw feature names, transformed model feature names, and transform metadata so the inference engine can sample raw GIS rasters on the fly and reconstruct model-aligned inputs.
 - `scripts/machine_learning/validate_training_schema.py`
     - Validates dataset schema compatibility against `schemas/training_observation.schema.json`.
 - `scripts/machine_learning/generate_training_schema_docs.py`
@@ -55,6 +55,8 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
 
 ### Large run (OOM-safer schema scan)
 
+This example sets `--template-scan-max-files 50000` as an explicit override for large runs. It is not the default.
+
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.cli \
     --input-root ./data/species/taxonomy/Plantae_6 \
@@ -66,6 +68,8 @@ uv run python -m scripts.machine_learning.preprocess_training.cli \
 ```
 
 ### Full-data run in WSL (OOM-aware)
+
+This example also overrides `--template-scan-max-files` to `50000`; the CLI default remains `0`.
 
 ```bash
 uv run python -m scripts.machine_learning.preprocess_training.cli \
@@ -97,7 +101,7 @@ is greater than `1.0`.
     - Rows that conflict with target-species positives on `(cell_id, year_month)` are excluded.
     - Set `0.0` for positives-only debug runs.
 - `--background-split-chunk-rows`
-    - Default is `250000`.
+    - Default is `50000`.
     - Lower values reduce peak RAM during pooled background generation.
     - Higher values can improve throughput but increase the size of in-memory split chunks.
 - `--max-rows-per-file`
@@ -108,7 +112,9 @@ is greater than `1.0`.
     - Clears the staging directory before a fresh run.
     - Keeps the previous published dataset in place until the replacement dataset has been written and verified.
 - `--template-scan-max-files`
+    - Default is `0`.
     - Caps how many files are scanned for feature-template schema inference (`0` scans all discovered files).
+    - Large-run examples in this doc use `50000` as a manual override, not as the default.
 - `--warn-min-cells-per-species`
     - Logs warning lines when a species has too few unique cells in a shard (helps detect split brittleness).
 - `--static-context-template` / `--static-context-path`
@@ -125,8 +131,9 @@ is greater than `1.0`.
     - The preprocessor logs warnings when uncatalogued numeric columns are encountered.
     - The preprocessor also writes `_meta/uncatalogued_columns.json` under the dataset root with kept/skipped examples.
 - Feature grouping
-    - Catalog-backed numeric columns are grouped into `bioclimate_features`, `landclass_features`, `terrain_features`, `edaphic_features`, and `temporal_features`.
-    - Within each group, vector order comes from the discovered feature template written to `_meta/feature_template.json`.
+    - Catalog-backed columns are grouped into `bioclimate_features`, `landclass_features`, `terrain_features`, and `temporal_features`.
+    - Stored vectors are model-ready transformed features, not raw source layer values.
+    - Raw source ordering comes from `_meta/feature_template.json`; transformed model ordering comes from `_meta/feature_transforms.json`.
     - `other_features` retains uncatalogued numeric columns from occurrence parquet files only.
 
 ### Not implemented yet
@@ -158,6 +165,7 @@ uv run python -m scripts.machine_learning.preprocess_training.resume_from_stagin
 Notes:
 
 - `--resume-output-files` writes a verified replacement dataset to a temporary directory and only publishes it after parquet verification passes.
+- Resume preserves metadata from the published dataset when present, and otherwise falls back to `staging/_meta`, including `_meta/feature_transforms.json`.
 - Use `--regenerate-background` with `--resume-background-files` to delete and rebuild existing `background_pooled_*.parquet` shards.
 - If background shards already exist in staging, the resume CLI requires either `--reuse-existing-background` or `--regenerate-background` when `--resume-background-files` is set.
 - Keep `--max-rows-per-file` aligned with your normal preprocess settings for consistent output sizing.
@@ -212,6 +220,7 @@ Before starting model training, verify:
 - `year_month` coverage looks reasonable and not dominated by fallback timestamps.
 - Feature vectors are non-null and consistent in dimensionality.
 - Catalog-group widths in `_meta/feature_template.json` look reasonable for the source schemas you expect.
+- `_meta/feature_transforms.json` looks consistent with the intended model layout and transform policy.
 - `other_features` width looks reasonable for the occurrence schema you expect.
 
 ## 4. Train the model
@@ -311,12 +320,14 @@ The bundle contains:
 - Per-species head weights and metadata (prior, val_loss, counts).
 - Optional shared combined-head weights, species ordering, and metadata when trained with `--train-combined-head`.
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
-- Feature names per group (`bioclimate`, `landclass`, `terrain`, `temporal`, `other`). GIS sampling reconstructs catalog-backed static groups, while runtime paths can also fill temporal features from current rasters under `data/gis/temporal` when using the combined-head weather-delta helpers.
+- `raw_feature_names` for GIS/context sampling, `feature_names` for model input layout, and `feature_transforms` for reconstructing transformed runtime inputs. GIS sampling reconstructs catalog-backed static groups, while runtime paths can also fill temporal features from current rasters under `data/gis/temporal` when using the combined-head weather-delta helpers.
 
-The preprocessing step also writes `feature_template.json` under
-`<output-root>/_meta/`. Export reads this file automatically. If it is missing (e.g. older
-preprocessed datasets), export falls back to deriving catalog-backed feature names from the GIS
-catalog; uncatalogued `other` names require the saved template.
+The preprocessing step writes both `feature_template.json` and
+`feature_transforms.json` under `<output-root>/_meta/`. Export reads these files automatically.
+If `feature_template.json` is missing (for example older preprocessed datasets), export falls back
+to deriving catalog-backed raw feature names from the GIS catalog; uncatalogued `other` names still
+require the saved template. Without `feature_transforms.json`, export can still build a bundle, but
+runtime sampled inference falls back to identity feature handling rather than the fitted transform path.
 
 ## 6. Run inference / serve the API
 

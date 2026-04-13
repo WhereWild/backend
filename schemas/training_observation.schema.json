@@ -12,7 +12,7 @@
   },
   "notes": {
     "presence_label": "1 = known occurrence, 0 = unlabeled/background pseudo-absence",
-    "feature_vectors": "Feature vectors are dense and fixed-order per feature_version. Catalog-backed numeric columns are grouped into bioclimate, landclass, terrain, edaphic, and temporal vectors. Uncatalogued numeric observation columns are retained in other_features.",
+    "feature_vectors": "Feature vectors are dense, fixed-order, and model-ready per feature_version. Catalog-backed columns are grouped into bioclimate, landclass, terrain, and temporal vectors. Uncatalogued numeric observation columns are retained in other_features. The exact raw and transformed layouts are written under _meta/feature_template.json and _meta/feature_transforms.json.",
     "feature_role": "input columns are allowed in model tensors; metadata columns are retained for joins, splits, auditing, and calibration only.",
     "partitioning": "Datasets are partitioned only by split. year_month and region_id remain metadata columns for sampling, analysis, and leakage checks.",
     "sampling_semantics": "For PU runs, generated unlabeled/background rows are sampled from other-species positive rows within the same split. Candidate rows that conflict with target-species positives on (cell_id, year_month) are excluded. Generated rows keep unlabeled semantics (presence_label=0) and are not treated as true negatives."
@@ -121,7 +121,7 @@
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
-      "description": "Dense feature vector for catalog bioclimate layers observed in the source data."
+      "description": "Dense transformed feature vector for catalog bioclimate layers in model input order."
     },
     {
       "name": "bioclimate_missing_mask",
@@ -135,7 +135,7 @@
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
-      "description": "Dense feature vector for catalog landclass layers observed in the source data."
+      "description": "Dense transformed feature vector for catalog landclass layers in model input order."
     },
     {
       "name": "landclass_missing_mask",
@@ -149,7 +149,7 @@
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
-      "description": "Dense feature vector for catalog terrain layers observed in the source data."
+      "description": "Dense transformed feature vector for catalog terrain layers in model input order."
     },
     {
       "name": "terrain_missing_mask",
@@ -159,25 +159,11 @@
       "description": "Missingness mask aligned to terrain_features (1=missing, 0=observed)."
     },
     {
-      "name": "edaphic_features",
-      "parquet_type": "list<float32>",
-      "required": false,
-      "feature_role": "input",
-      "description": "Dense feature vector for catalog edaphic layers observed in the source data."
-    },
-    {
-      "name": "edaphic_missing_mask",
-      "parquet_type": "list<int8>",
-      "required": false,
-      "feature_role": "metadata",
-      "description": "Missingness mask aligned to edaphic_features (1=missing, 0=observed)."
-    },
-    {
       "name": "temporal_features",
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
-      "description": "Dense feature vector for catalog temporal layers observed in the source data."
+      "description": "Dense transformed feature vector for catalog temporal layers in model input order."
     },
     {
       "name": "temporal_missing_mask",
@@ -191,7 +177,7 @@
       "parquet_type": "list<float32>",
       "required": false,
       "feature_role": "input",
-      "description": "Dense feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files."
+      "description": "Dense transformed feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files."
     },
     {
       "name": "other_missing_mask",

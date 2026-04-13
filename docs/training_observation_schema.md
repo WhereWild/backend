@@ -7,12 +7,12 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 ## Storage
 
 - Format: `parquet`
-- Partition key: `split`
+- Partition keys: `split`
 - Compression: `zstd`
 
 ## Partitioning Guidance
 
-- Datasets use a split-only partition layout.
+- Datasets are partitioned only by split. year_month and region_id remain metadata columns for sampling, analysis, and leakage checks.
 
 ## Sampling Semantics
 
@@ -41,17 +41,15 @@ Canonical contract: [schemas/training_observation.schema.json](../schemas/traini
 | `split` | `string` | yes | `metadata` | Dataset split label (train/val/test) from spatiotemporal splitter. |
 | `source` | `string` | yes | `metadata` | Data source tag (e.g., gbif, inat, generated_background). |
 | `feature_version` | `string` | yes | `metadata` | Version of feature engineering order and normalization. |
-| `bioclimate_features` | `list<float32>` | no | `input` | Dense feature vector for catalog bioclimate layers observed in the source data. |
+| `bioclimate_features` | `list<float32>` | no | `input` | Dense transformed feature vector for catalog bioclimate layers in model input order. |
 | `bioclimate_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to bioclimate_features (1=missing, 0=observed). |
-| `landclass_features` | `list<float32>` | no | `input` | Dense feature vector for catalog landclass layers observed in the source data. |
+| `landclass_features` | `list<float32>` | no | `input` | Dense transformed feature vector for catalog landclass layers in model input order. |
 | `landclass_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to landclass_features (1=missing, 0=observed). |
-| `terrain_features` | `list<float32>` | no | `input` | Dense feature vector for catalog terrain layers observed in the source data. |
+| `terrain_features` | `list<float32>` | no | `input` | Dense transformed feature vector for catalog terrain layers in model input order. |
 | `terrain_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to terrain_features (1=missing, 0=observed). |
-| `edaphic_features` | `list<float32>` | no | `input` | Dense feature vector for catalog edaphic layers observed in the source data. |
-| `edaphic_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to edaphic_features (1=missing, 0=observed). |
-| `temporal_features` | `list<float32>` | no | `input` | Dense feature vector for catalog temporal layers observed in the source data. |
+| `temporal_features` | `list<float32>` | no | `input` | Dense transformed feature vector for catalog temporal layers in model input order. |
 | `temporal_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to temporal_features (1=missing, 0=observed). |
-| `other_features` | `list<float32>` | no | `input` | Dense feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files. |
+| `other_features` | `list<float32>` | no | `input` | Dense transformed feature vector for uncatalogued numeric observation columns retained from source occurrence parquet files. |
 | `other_missing_mask` | `list<int8>` | no | `metadata` | Missingness mask aligned to other_features (1=missing, 0=observed). |
 
 ## Validation
