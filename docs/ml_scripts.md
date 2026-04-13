@@ -267,6 +267,23 @@ uv run python -m scripts.machine_learning.train.cli heads \
     --train-combined-head
 ```
 
+Train only the combined head after per-species heads already exist:
+
+```bash
+uv run python -m scripts.machine_learning.train.cli heads \
+    --data-root ./data_ml/species_observation_canary_plants \
+    --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
+    --output-dir ./checkpoints/canary_plants/heads \
+    --train-combined-head \
+    --combined-head-only
+```
+
+Notes:
+
+- `--combined-head-only` requires an existing `species_heads.pt` in the Stage C output directory.
+- That checkpoint must come from a normal Stage C run written by the current codepath so encoder-checkpoint metadata is available for compatibility checks.
+- This mode preserves existing per-species heads and metadata, retrains only the shared combined head, and writes the updated combined-head payload back into the same checkpoint.
+
 ### Both stages sequentially
 
 ```bash
@@ -281,7 +298,7 @@ uv run python -m scripts.machine_learning.train.cli all \
 - `--hidden-dim`: encoder hidden layer dimension (default 256).
 - `--epochs`: encoder training epochs (default 50).
 - `--head-epochs`: epochs per species head (default 50).
-- `--combined-head-epochs`: epochs for the shared multiclass combined head (default 10).
+- `--combined-head-epochs`: epochs for the shared multiclass combined head (default 50).
 - `--batch-size`: shared batch-size flag.
     - Stage B (`encoder`): encoder training mini-batch size (default 32768).
     - Stage C (`heads`): embedding pass chunk size only; per-species head optimization is full-batch.
@@ -292,6 +309,7 @@ uv run python -m scripts.machine_learning.train.cli all \
 - `--recon-weight`: reconstruction loss weight for encoder pretraining.
 - `--min-positives`: skip species with fewer positives (default 50).
 - `--train-combined-head`: enable the shared multiclass combined species head (default disabled).
+- `--combined-head-only`: skip per-species head retraining and train only the shared combined head, preserving the existing `species_heads.pt` payload.
 - `--combined-head-min-positives`: minimum positives for a species to participate in the combined head (default 50).
 - `--combined-head-weight-decay`: combined-head weight decay (default 1e-4).
 - `--device`: auto (default), cuda, mps, cpu.

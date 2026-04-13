@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -234,6 +235,7 @@ def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.Monk
             "--encoder-checkpoint",
             str(tmp_path / "encoder_best.pt"),
             "--train-combined-head",
+            "--combined-head-only",
             "--batch-size",
             "16384",
             "--combined-head-batch-size",
@@ -247,6 +249,7 @@ def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.Monk
     assert args.batch_size == 16384
     assert args.combined_head_batch_size == 512
     assert args.train_combined_head is True
+    assert args.combined_head_only is True
 
 
 def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -274,6 +277,7 @@ def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytes
             "--encoder-checkpoint",
             str(tmp_path / "encoder_best.pt"),
             "--train-combined-head",
+            "--combined-head-only",
             "--batch-size",
             "8192",
             "--combined-head-batch-size",
@@ -285,6 +289,386 @@ def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytes
     assert forwarded["batch_size"] == 8192
     assert forwarded["combined_head_batch_size"] == 256
     assert forwarded["train_combined_head"] is True
+    assert forwarded["combined_head_only"] is True
+
+
+def test_train_cli_main_rejects_combined_head_only_with_all(tmp_path: Path) -> None:
+    import sys
+
+    argv = sys.argv
+    sys.argv = [
+        "train-cli",
+        "all",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--combined-head-only",
+    ]
+    try:
+        with pytest.raises(SystemExit, match="only supported with the 'heads' stage"):
+            train_cli.main()
+    finally:
+        sys.argv = argv
+
+
+def test_train_species_heads_combined_head_only_requires_existing_checkpoint(tmp_path: Path) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+    _write_split_part(
+        data_root,
+        split="train",
+        part_name="train.parquet",
+        cell_id="train_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+    _write_split_part(
+        data_root,
+        split="val",
+        part_name="val.parquet",
+        cell_id="val_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        train_heads.train_species_heads(
+            data_root=data_root,
+            encoder_checkpoint=encoder_checkpoint,
+            output_dir=output_dir,
+            device="cpu",
+            train_combined_head=True,
+            combined_head_only=True,
+        )
+
+
+def test_train_species_heads_combined_head_only_rejects_legacy_checkpoint_without_encoder_metadata(
+    tmp_path: Path,
+) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+    _write_split_part(
+        data_root,
+        split="train",
+        part_name="train.parquet",
+        cell_id="train_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+    _write_split_part(
+        data_root,
+        split="val",
+        part_name="val.parquet",
+        cell_id="val_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "embed_dim": 4,
+            "head_states": {},
+            "species_meta": {},
+            "combined_head_state": None,
+            "combined_species_keys": [],
+            "combined_head_meta": None,
+        },
+        output_dir / "species_heads.pt",
+    )
+
+    with pytest.raises(ValueError, match="written with encoder checkpoint metadata"):
+        train_heads.train_species_heads(
+            data_root=data_root,
+            encoder_checkpoint=encoder_checkpoint,
+            output_dir=output_dir,
+            device="cpu",
+            train_combined_head=True,
+            combined_head_only=True,
+        )
+
+
+def test_train_species_heads_combined_head_only_preserves_existing_species_heads(tmp_path: Path) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+
+    def _group_values(first: float, second: float) -> list[float]:
+        values = [0.0] * n_groups
+        if n_groups > 0:
+            values[0] = first
+        if n_groups > 1:
+            values[1] = second
+        return values
+
+    row_specs = [
+        ("train", "train_sp101_pos_a.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("train", "train_sp101_pos_b.parquet", 101, 1, _group_values(0.9, 0.0)),
+        ("train", "train_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("train", "train_sp202_pos_a.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("train", "train_sp202_pos_b.parquet", 202, 1, _group_values(0.0, 0.9)),
+        ("train", "train_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+        ("val", "val_sp101_pos.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("val", "val_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("val", "val_sp202_pos.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("val", "val_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+    ]
+
+    for split, part_name, species_key, presence_label, feature_values in row_specs:
+        _write_split_part(
+            data_root,
+            split=split,
+            part_name=part_name,
+            cell_id=f"{split}_{species_key}_{presence_label}_{part_name}",
+            feature_values=feature_values,
+            mask_values=zero_mask,
+            species_key=species_key,
+            presence_label=presence_label,
+        )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    existing_head_101 = SpeciesHead(embed_dim=4)
+    existing_head_202 = SpeciesHead(embed_dim=4)
+    with torch.no_grad():
+        existing_head_101.linear.bias.fill_(1.5)
+        existing_head_202.linear.bias.fill_(-2.5)
+    existing_species_meta = {
+        101: {"name": "species-101", "val_loss": 0.3},
+        202: {"name": "species-202", "val_loss": 0.4},
+    }
+    existing_checkpoint_path = output_dir / "species_heads.pt"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "embed_dim": 4,
+            "encoder_checkpoint": {
+                "path": str(encoder_checkpoint.resolve()),
+                "sha256": train_heads._sha256_file(encoder_checkpoint),
+                "input_dim": input_dim,
+                "embed_dim": 4,
+                "hidden_dim": 8,
+            },
+            "head_states": {
+                101: existing_head_101.state_dict(),
+                202: existing_head_202.state_dict(),
+            },
+            "species_meta": existing_species_meta,
+            "combined_head_state": None,
+            "combined_species_keys": [],
+            "combined_head_meta": None,
+        },
+        existing_checkpoint_path,
+    )
+
+    heads_path = train_heads.train_species_heads(
+        data_root=data_root,
+        encoder_checkpoint=encoder_checkpoint,
+        output_dir=output_dir,
+        min_positives=2,
+        head_epochs=1,
+        head_lr=1e-2,
+        head_weight_decay=1e-3,
+        batch_size=4,
+        device="cpu",
+        train_combined_head=True,
+        combined_head_only=True,
+        combined_head_min_positives=2,
+        combined_head_epochs=1,
+        combined_head_lr=1e-2,
+        combined_head_batch_size=2,
+        combined_head_weight_decay=1e-4,
+    )
+
+    checkpoint = torch.load(heads_path, map_location="cpu", weights_only=True)
+
+    assert heads_path == existing_checkpoint_path
+    assert checkpoint["combined_head_state"] is not None
+    assert checkpoint["combined_species_keys"] == [101, 202]
+    assert checkpoint["combined_head_meta"]["n_species"] == 2
+    assert checkpoint["head_states"].keys() == {101, 202}
+    assert checkpoint["species_meta"] == existing_species_meta
+    assert torch.equal(
+        checkpoint["head_states"][101]["linear.bias"],
+        existing_head_101.state_dict()["linear.bias"],
+    )
+    assert torch.equal(
+        checkpoint["head_states"][202]["linear.bias"],
+        existing_head_202.state_dict()["linear.bias"],
+    )
+
+
+def test_train_species_heads_combined_head_only_clears_stale_combined_head_when_no_species_are_eligible(
+    tmp_path: Path,
+) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+
+    def _group_values(first: float, second: float) -> list[float]:
+        values = [0.0] * n_groups
+        if n_groups > 0:
+            values[0] = first
+        if n_groups > 1:
+            values[1] = second
+        return values
+
+    row_specs = [
+        ("train", "train_sp101_pos.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("train", "train_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("train", "train_sp202_pos.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("train", "train_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+        ("val", "val_sp101_pos.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("val", "val_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("val", "val_sp202_pos.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("val", "val_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+    ]
+
+    for split, part_name, species_key, presence_label, feature_values in row_specs:
+        _write_split_part(
+            data_root,
+            split=split,
+            part_name=part_name,
+            cell_id=f"{split}_{species_key}_{presence_label}_{part_name}",
+            feature_values=feature_values,
+            mask_values=zero_mask,
+            species_key=species_key,
+            presence_label=presence_label,
+        )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    existing_head_101 = SpeciesHead(embed_dim=4)
+    existing_head_202 = SpeciesHead(embed_dim=4)
+    stale_combined_head = CombinedSpeciesHead(embed_dim=4, species_count=2)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing_checkpoint_path = output_dir / "species_heads.pt"
+    torch.save(
+        {
+            "embed_dim": 4,
+            "encoder_checkpoint": {
+                "path": str(encoder_checkpoint.resolve()),
+                "sha256": train_heads._sha256_file(encoder_checkpoint),
+                "input_dim": input_dim,
+                "embed_dim": 4,
+                "hidden_dim": 8,
+            },
+            "head_states": {
+                101: existing_head_101.state_dict(),
+                202: existing_head_202.state_dict(),
+            },
+            "species_meta": {
+                101: {"name": "species-101"},
+                202: {"name": "species-202"},
+            },
+            "combined_head_state": stale_combined_head.state_dict(),
+            "combined_species_keys": [101, 202],
+            "combined_head_meta": {"n_species": 2, "min_positives": 1},
+        },
+        existing_checkpoint_path,
+    )
+
+    heads_path = train_heads.train_species_heads(
+        data_root=data_root,
+        encoder_checkpoint=encoder_checkpoint,
+        output_dir=output_dir,
+        min_positives=1,
+        head_epochs=1,
+        head_lr=1e-2,
+        head_weight_decay=1e-3,
+        batch_size=4,
+        device="cpu",
+        train_combined_head=True,
+        combined_head_only=True,
+        combined_head_min_positives=3,
+        combined_head_epochs=1,
+        combined_head_lr=1e-2,
+        combined_head_batch_size=2,
+        combined_head_weight_decay=1e-4,
+    )
+
+    checkpoint = torch.load(heads_path, map_location="cpu", weights_only=True)
+
+    assert heads_path == existing_checkpoint_path
+    assert checkpoint["head_states"].keys() == {101, 202}
+    assert checkpoint["combined_head_state"] is None
+    assert checkpoint["combined_species_keys"] == []
+    assert checkpoint["combined_head_meta"] is None
 
 
 def test_train_species_heads_end_to_end_writes_combined_head_payload(tmp_path: Path) -> None:
@@ -371,6 +755,39 @@ def test_train_species_heads_end_to_end_writes_combined_head_payload(tmp_path: P
     assert checkpoint["combined_head_meta"]["val_loss"] is not None
     assert set(checkpoint["head_states"]) == {101, 202}
     assert set(checkpoint["species_meta"]) == {101, 202}
+
+
+def test_iter_combined_positive_batches_skips_positive_species_outside_eligible_set() -> None:
+    from scripts.machine_learning.train import train_heads
+
+    embeddings = np.asarray(
+        [
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 0.0],
+            [4.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    species = np.asarray([101, 202, 999, 202], dtype=np.int64)
+    labels = np.asarray([1, 1, 1, 0], dtype=np.int8)
+    eligible_species = np.asarray([101, 202], dtype=np.int64)
+
+    batches = list(
+        train_heads._iter_combined_positive_batches(
+            embeddings,
+            species,
+            labels,
+            eligible_species=eligible_species,
+            batch_size=8,
+            shuffle=False,
+        )
+    )
+
+    assert len(batches) == 1
+    batch_embeddings, batch_targets = batches[0]
+    assert batch_embeddings.shape == (2, 2)
+    assert batch_targets.tolist() == [0, 1]
 
 
 def test_build_feature_template_uses_catalog_groups_and_occurrence_other(tmp_path: Path) -> None:

@@ -116,9 +116,15 @@ def parse_args() -> argparse.Namespace:
         help="Train a shared multiclass species-ranking head alongside per-species PU heads.",
     )
     heads_args.add_argument(
+        "--combined-head-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip per-species head retraining and train only the shared combined head, preserving existing species_heads.pt.",
+    )
+    heads_args.add_argument(
         "--combined-head-epochs",
         type=int,
-        default=10,
+        default=50,
         help="Epochs for the shared multiclass combined species head.",
     )
     heads_args.add_argument(
@@ -164,6 +170,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """CLI entrypoint."""
     args = parse_args()
+
+    if args.stage == "all" and args.combined_head_only:
+        raise SystemExit("--combined-head-only is only supported with the 'heads' stage.")
 
     if args.stage in ("encoder", "all"):
         train_encoder = import_local_symbol("train_encoder", "train_encoder")
@@ -213,6 +222,7 @@ def main() -> int:
             batch_size=args.batch_size,
             device=args.device,
             train_combined_head=args.train_combined_head,
+            combined_head_only=args.combined_head_only,
             combined_head_min_positives=args.combined_head_min_positives,
             combined_head_epochs=args.combined_head_epochs,
             combined_head_lr=args.combined_head_lr,

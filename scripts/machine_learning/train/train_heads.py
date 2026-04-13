@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -38,6 +39,38 @@ class _StreamingSplitDataset(Protocol):
 HEARTBEAT_INTERVAL_SPECIES = 50
 COMBINED_HEAD_EVAL_INTERVAL_EPOCHS = 5
 COMBINED_HEAD_SCAN_MULTIPLIER = 8
+
+
+def _sha256_file(path: Path) -> str:
+    """Return a stable sha256 digest for one file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _encoder_checkpoint_metadata(
+    encoder_checkpoint: Path,
+    checkpoint_payload: dict[str, object],
+) -> dict[str, str | int]:
+    """Build comparable encoder metadata for Stage C checkpoint safety."""
+    input_dim_raw = checkpoint_payload["input_dim"]
+    embed_dim_raw = checkpoint_payload["embed_dim"]
+    hidden_dim_raw = checkpoint_payload["hidden_dim"]
+    if not isinstance(input_dim_raw, int | float):
+        raise TypeError("encoder checkpoint input_dim must be numeric")
+    if not isinstance(embed_dim_raw, int | float):
+        raise TypeError("encoder checkpoint embed_dim must be numeric")
+    if not isinstance(hidden_dim_raw, int | float):
+        raise TypeError("encoder checkpoint hidden_dim must be numeric")
+    return {
+        "path": str(encoder_checkpoint.resolve()),
+        "sha256": _sha256_file(encoder_checkpoint),
+        "input_dim": int(input_dim_raw),
+        "embed_dim": int(embed_dim_raw),
+        "hidden_dim": int(hidden_dim_raw),
+    }
 
 
 def compute_embeddings(
@@ -229,7 +262,10 @@ def _iter_combined_positive_batches(
         chunk_species = np.asarray(species[start:end], dtype=np.int64)
         positive_species = chunk_species[pos_mask]
         class_indices = np.searchsorted(eligible_species, positive_species)
-        valid_mask = (class_indices < eligible_species.shape[0]) & (eligible_species[class_indices] == positive_species)
+        valid_mask = class_indices < eligible_species.shape[0]
+        if valid_mask.any():
+            matched_species = eligible_species[class_indices[valid_mask]]
+            valid_mask[valid_mask] = matched_species == positive_species[valid_mask]
         if not valid_mask.any():
             continue
 
@@ -303,8 +339,9 @@ def train_species_heads(
     batch_size: int = 4096,
     device: str = "auto",
     train_combined_head: bool = False,
+    combined_head_only: bool = False,
     combined_head_min_positives: int = 50,
-    combined_head_epochs: int = 10,
+    combined_head_epochs: int = 50,
     combined_head_lr: float = 5e-3,
     combined_head_batch_size: int = 4096,
     combined_head_weight_decay: float = 1e-4,
@@ -335,9 +372,45 @@ def train_species_heads(
         raise ValueError("combined_head_min_positives must be >= 1")
     if combined_head_batch_size < 1:
         raise ValueError("combined_head_batch_size must be >= 1")
+    if combined_head_only and not train_combined_head:
+        raise ValueError("combined_head_only requires train_combined_head=True")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    encoder_checkpoint = Path(encoder_checkpoint)
+
+    existing_head_states: dict[int, dict] = {}
+    existing_species_meta: dict[int, dict] = {}
+    existing_combined_head_state: dict[str, torch.Tensor] | None = None
+    existing_combined_species_keys: list[int] = []
+    existing_combined_head_meta: dict[str, int | float | None] | None = None
+    existing_encoder_metadata: dict[str, object] | None = None
+    heads_path = output_dir / "species_heads.pt"
+    if combined_head_only:
+        if not heads_path.exists():
+            raise FileNotFoundError(f"combined_head_only requires an existing checkpoint at {heads_path}")
+        existing_checkpoint = torch.load(heads_path, map_location="cpu", weights_only=True)
+        existing_encoder_metadata = existing_checkpoint.get("encoder_checkpoint")
+        if not isinstance(existing_encoder_metadata, dict):
+            raise ValueError(
+                "combined_head_only requires species_heads.pt written with encoder checkpoint metadata. "
+                "Run Stage C once without --combined-head-only to refresh the checkpoint."
+            )
+        existing_head_states = {
+            int(species_key): state for species_key, state in existing_checkpoint.get("head_states", {}).items()
+        }
+        existing_species_meta = {
+            int(species_key): meta for species_key, meta in existing_checkpoint.get("species_meta", {}).items()
+        }
+        existing_combined_head_state = existing_checkpoint.get("combined_head_state")
+        existing_combined_species_keys = [
+            int(species_key) for species_key in existing_checkpoint.get("combined_species_keys", [])
+        ]
+        existing_combined_head_meta = existing_checkpoint.get("combined_head_meta")
+        print(
+            f"Loaded existing heads checkpoint from {heads_path}; "
+            f"preserving {len(existing_head_states):,} species heads and retraining only the combined head."
+        )
 
     if device == "auto":
         if torch.cuda.is_available():
@@ -350,6 +423,14 @@ def train_species_heads(
 
     # Load encoder
     checkpoint = torch.load(encoder_checkpoint, map_location=dev, weights_only=True)
+    encoder_metadata = _encoder_checkpoint_metadata(encoder_checkpoint, checkpoint)
+    if combined_head_only:
+        assert existing_encoder_metadata is not None
+        existing_sha256 = existing_encoder_metadata.get("sha256")
+        if existing_sha256 != encoder_metadata["sha256"]:
+            raise ValueError(
+                "combined_head_only requires the same encoder checkpoint used for the preserved species heads."
+            )
     input_dim = checkpoint["input_dim"]
     embed_dim = checkpoint["embed_dim"]
     hidden_dim = checkpoint["hidden_dim"]
@@ -440,105 +521,109 @@ def train_species_heads(
     else:
         val_ranges = {}
 
-    head_states: dict[int, dict] = {}
-    species_meta: dict[int, dict] = {}
+    head_states: dict[int, dict] = dict(existing_head_states)
+    species_meta: dict[int, dict] = dict(existing_species_meta)
     total_start = time.perf_counter()
 
-    for idx, sp_key in enumerate(eligible):
-        assert int(sp_key) in train_ranges, "eligible species must exist in train_ranges"
-        train_start, train_end = train_ranges[int(sp_key)]
-        train_idx = train_order[train_start:train_end]
+    if combined_head_only:
+        print("Skipping per-species head retraining (--combined-head-only).")
+    else:
+        for idx, sp_key in enumerate(eligible):
+            assert int(sp_key) in train_ranges, "eligible species must exist in train_ranges"
+            train_start, train_end = train_ranges[int(sp_key)]
+            train_idx = train_order[train_start:train_end]
 
-        sp_z_np = np.asarray(train_z[train_idx], dtype=np.float32)
-        sp_labels_np = np.asarray(train_labels[train_idx], dtype=np.int8)
-        sp_weights_np = np.asarray(train_weights[train_idx], dtype=np.float32)
+            sp_z_np = np.asarray(train_z[train_idx], dtype=np.float32)
+            sp_labels_np = np.asarray(train_labels[train_idx], dtype=np.int8)
+            sp_weights_np = np.asarray(train_weights[train_idx], dtype=np.float32)
 
-        sp_z = torch.from_numpy(sp_z_np).to(dev)
-        sp_labels = torch.from_numpy(sp_labels_np).to(dev)
-        sp_weights = torch.from_numpy(sp_weights_np).to(dev)
+            sp_z = torch.from_numpy(sp_z_np).to(dev)
+            sp_labels = torch.from_numpy(sp_labels_np).to(dev)
+            sp_weights = torch.from_numpy(sp_weights_np).to(dev)
 
-        pos_mask = sp_labels == 1
-        unl_mask = sp_labels == 0
-        n_pos = int(pos_mask.sum().item())
-        n_unl = int(unl_mask.sum().item())
+            pos_mask = sp_labels == 1
+            unl_mask = sp_labels == 0
+            n_pos = int(pos_mask.sum().item())
+            n_unl = int(unl_mask.sum().item())
 
-        if n_unl == 0:
-            continue
+            if n_unl == 0:
+                continue
 
-        n_species_rows = n_pos + n_unl
-        prior_pi = estimate_prior(
-            n_pos,
-            n_species_rows,
-            global_positive_rate,
-        )
-
-        head = SpeciesHead(embed_dim=embed_dim).to(dev)
-        optimizer = torch.optim.AdamW(head.parameters(), lr=head_lr, weight_decay=head_weight_decay)
-
-        best_val_loss = float("inf")
-        best_state = None
-
-        for epoch in range(head_epochs):
-            head.train()
-            f_pos = head(sp_z[pos_mask])
-            f_unl = head(sp_z[unl_mask])
-            loss = nnpu_loss(
-                f_pos,
-                f_unl,
-                prior_pi,
-                weights_positive=sp_weights[pos_mask],
-                weights_unlabeled=sp_weights[unl_mask],
+            n_species_rows = n_pos + n_unl
+            prior_pi = estimate_prior(
+                n_pos,
+                n_species_rows,
+                global_positive_rate,
             )
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
 
-            # Val check every 10 epochs. Species absent from the val
-            # split (common for rare species under spatial blocking) never
-            # update best_state, so the final-epoch state is used as fallback.
-            if (epoch + 1) % 10 == 0 or epoch == head_epochs - 1:
-                head.eval()
-                with torch.no_grad():
-                    val_range = val_ranges.get(int(sp_key))
-                    if val_range is not None:
-                        val_start, val_end = val_range
-                        val_idx = val_order[val_start:val_end]
-                        sp_val_z_np = np.asarray(val_z[val_idx], dtype=np.float32)
-                        sp_val_labels_np = np.asarray(val_labels[val_idx], dtype=np.int8)
-                        sp_val_z = torch.from_numpy(sp_val_z_np).to(dev)
-                        sp_val_labels = torch.from_numpy(sp_val_labels_np).to(dev)
-                        val_pos = sp_val_labels == 1
-                        val_unl = sp_val_labels == 0
-                        if val_pos.any() and val_unl.any():
-                            v_loss = nnpu_loss(
-                                head(sp_val_z[val_pos]),
-                                head(sp_val_z[val_unl]),
-                                prior_pi,
-                            ).item()
-                            if v_loss < best_val_loss:
-                                best_val_loss = v_loss
-                                best_state = {k: v.clone() for k, v in head.state_dict().items()}
+            head = SpeciesHead(embed_dim=embed_dim).to(dev)
+            optimizer = torch.optim.AdamW(head.parameters(), lr=head_lr, weight_decay=head_weight_decay)
 
-        if best_state is None:
-            best_state = {k: v.clone() for k, v in head.state_dict().items()}
+            best_val_loss = float("inf")
+            best_state = None
 
-        head_states[sp_key] = best_state
-        species_meta[sp_key] = {
-            "n_positives": n_pos,
-            "n_unlabeled": n_unl,
-            "n_rows": n_species_rows,
-            "prior_pi": prior_pi,
-            "prior_global_positive_rate": global_positive_rate,
-            "prior_smoothing_strength": 50.0,
-            "val_loss": best_val_loss if best_val_loss < float("inf") else None,
-        }
+            for epoch in range(head_epochs):
+                head.train()
+                f_pos = head(sp_z[pos_mask])
+                f_unl = head(sp_z[unl_mask])
+                loss = nnpu_loss(
+                    f_pos,
+                    f_unl,
+                    prior_pi,
+                    weights_positive=sp_weights[pos_mask],
+                    weights_unlabeled=sp_weights[unl_mask],
+                )
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
 
-        if (idx + 1) % HEARTBEAT_INTERVAL_SPECIES == 0:
-            elapsed = time.perf_counter() - total_start
-            print(f"  Heads trained: {idx + 1:,}/{len(eligible):,} | elapsed: {elapsed:.1f}s")
+                # Val check every 10 epochs. Species absent from the val
+                # split (common for rare species under spatial blocking) never
+                # update best_state, so the final-epoch state is used as fallback.
+                if (epoch + 1) % 10 == 0 or epoch == head_epochs - 1:
+                    head.eval()
+                    with torch.no_grad():
+                        val_range = val_ranges.get(int(sp_key))
+                        if val_range is not None:
+                            val_start, val_end = val_range
+                            val_idx = val_order[val_start:val_end]
+                            sp_val_z_np = np.asarray(val_z[val_idx], dtype=np.float32)
+                            sp_val_labels_np = np.asarray(val_labels[val_idx], dtype=np.int8)
+                            sp_val_z = torch.from_numpy(sp_val_z_np).to(dev)
+                            sp_val_labels = torch.from_numpy(sp_val_labels_np).to(dev)
+                            val_pos = sp_val_labels == 1
+                            val_unl = sp_val_labels == 0
+                            if val_pos.any() and val_unl.any():
+                                v_loss = nnpu_loss(
+                                    head(sp_val_z[val_pos]),
+                                    head(sp_val_z[val_unl]),
+                                    prior_pi,
+                                ).item()
+                                if v_loss < best_val_loss:
+                                    best_val_loss = v_loss
+                                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
 
-    combined_head_state: dict[str, torch.Tensor] | None = None
-    combined_head_meta: dict[str, int | float | None] | None = None
+            if best_state is None:
+                best_state = {k: v.clone() for k, v in head.state_dict().items()}
+
+            head_states[sp_key] = best_state
+            species_meta[sp_key] = {
+                "n_positives": n_pos,
+                "n_unlabeled": n_unl,
+                "n_rows": n_species_rows,
+                "prior_pi": prior_pi,
+                "prior_global_positive_rate": global_positive_rate,
+                "prior_smoothing_strength": 50.0,
+                "val_loss": best_val_loss if best_val_loss < float("inf") else None,
+            }
+
+            if (idx + 1) % HEARTBEAT_INTERVAL_SPECIES == 0:
+                elapsed = time.perf_counter() - total_start
+                print(f"  Heads trained: {idx + 1:,}/{len(eligible):,} | elapsed: {elapsed:.1f}s")
+
+    combined_head_state: dict[str, torch.Tensor] | None = existing_combined_head_state
+    combined_head_meta: dict[str, int | float | None] | None = existing_combined_head_meta
+    combined_species_keys_out: list[int] = list(existing_combined_species_keys)
 
     if train_combined_head and combined_species.shape[0] > 0:
         print(f"Training combined species head for {combined_species.shape[0]:,} species...")
@@ -615,26 +700,35 @@ def train_species_heads(
             best_combined_state = {k: v.clone() for k, v in combined_head.state_dict().items()}
 
         combined_head_state = best_combined_state
+        combined_species_keys_out = combined_species.tolist()
         combined_head_meta = {
             "n_species": int(combined_species.shape[0]),
             "n_positive_rows_train": combined_positive_train_rows,
             "val_loss": best_combined_val_loss if best_combined_val_loss < float("inf") else None,
             "min_positives": int(combined_head_min_positives),
         }
+    elif train_combined_head:
+        combined_head_state = None
+        combined_head_meta = None
+        combined_species_keys_out = []
+        print("Skipping combined head training; no species met the combined-head eligibility criteria.")
 
     total_seconds = time.perf_counter() - total_start
-    heads_path = output_dir / "species_heads.pt"
     torch.save(
         {
             "embed_dim": embed_dim,
+            "encoder_checkpoint": encoder_metadata,
             "head_states": head_states,
             "species_meta": species_meta,
             "combined_head_state": combined_head_state,
-            "combined_species_keys": combined_species.tolist() if combined_head_state is not None else [],
+            "combined_species_keys": combined_species_keys_out if combined_head_state is not None else [],
             "combined_head_meta": combined_head_meta,
         },
         heads_path,
     )
-    print(f"Trained {len(head_states):,} species heads in {total_seconds:.1f}s")
+    if combined_head_only:
+        print(f"Preserved {len(head_states):,} species heads while updating the combined head in {total_seconds:.1f}s")
+    else:
+        print(f"Trained {len(head_states):,} species heads in {total_seconds:.1f}s")
     print(f"Saved to: {heads_path}")
     return heads_path
