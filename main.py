@@ -2469,7 +2469,7 @@ class HeatmapJobDeleteResponse(BaseModel):
 
 
 @app.get("/api/species/{taxon_id}/heatmap")
-def species_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
+def species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
     """Return metadata for the species heatmap tile surface."""
     if not inference.is_loaded():
         return {"available": False, "species_key": taxon_id}
@@ -2483,7 +2483,7 @@ def species_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
 
 
 @app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
-async def species_heatmap_tile(
+async def species_inference_heatmap_tile(
     request: Request,
     taxon_id: int,
     z: int,
