@@ -51,12 +51,47 @@ transformed_feature_template_from_spec = _feature_transforms.transformed_feature
 _EXPORT_SCAN_BATCH_ROWS = 65_536
 _EXPORT_PROGRESS_EVERY_ROWS = 5_000_000
 _DEFAULT_BUNDLE_FILENAME = "inference_bundle.pt"
+_BUNDLE_VERSION = 2
+
+
+def _build_bundle_payload(
+    *,
+    encoder_ckpt: dict[str, Any],
+    heads_ckpt: dict[str, Any],
+    cell_table: dict[str, torch.Tensor],
+    cell_size_deg: float,
+    raw_feature_names: dict[str, list[str]] | None,
+    feature_transforms: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Assemble the persisted bundle payload using a versioned nested layout."""
+    return {
+        "bundle_version": _BUNDLE_VERSION,
+        "model": {
+            "input_dim": encoder_ckpt["input_dim"],
+            "embed_dim": encoder_ckpt["embed_dim"],
+            "hidden_dim": encoder_ckpt["hidden_dim"],
+            "encoder_state_dict": encoder_ckpt["encoder_state_dict"],
+            "raw_feature_names": raw_feature_names,
+            "feature_transforms": feature_transforms,
+        },
+        "heads": {
+            "head_states": heads_ckpt["head_states"],
+            "species_meta": heads_ckpt["species_meta"],
+            "combined_head_state": heads_ckpt.get("combined_head_state"),
+            "combined_species_keys": heads_ckpt.get("combined_species_keys", []),
+            "combined_head_meta": heads_ckpt.get("combined_head_meta"),
+        },
+        "serving": {
+            "cell_table": cell_table,
+            "cell_size_deg": cell_size_deg,
+        },
+    }
 
 
 def build_cell_table(
     data_root: Path,
-) -> dict[str, dict[str, torch.Tensor]]:
-    """Build a cell_id -> mean-feature / mean-mask lookup from all splits.
+) -> dict[str, torch.Tensor]:
+    """Build a cell_id -> model-ready feature tensor lookup from all splits.
 
     Uses the actual training data so the lookup covers every cell the
     model was trained on.  For cells with multiple observations the
@@ -118,7 +153,7 @@ def build_cell_table(
 
         print(f"  Split {split}: processed {split_seen_rows:,} rows")
 
-    result: dict[str, dict[str, torch.Tensor]] = {}
+    result: dict[str, torch.Tensor] = {}
     for cid in cell_feat_sum:
         observed_count = cell_mask_sum[cid]
         avg_feat = np.divide(
@@ -130,10 +165,7 @@ def build_cell_table(
         avg_mask = (observed_count <= 0.0).astype(np.float32)
         avg_feat[avg_mask > 0.5] = 0.0
         model_feat = np.concatenate([avg_feat, avg_mask], axis=0)
-        result[cid] = {
-            "features": torch.from_numpy(model_feat),
-            "mask": torch.from_numpy(avg_mask),
-        }
+        result[cid] = torch.from_numpy(model_feat)
 
     return result
 
@@ -249,26 +281,14 @@ def export_bundle(
     else:
         print("Warning: could not determine model feature names.")
 
-    bundle = {
-        # Encoder config + weights
-        "input_dim": encoder_ckpt["input_dim"],
-        "embed_dim": encoder_ckpt["embed_dim"],
-        "hidden_dim": encoder_ckpt["hidden_dim"],
-        "encoder_state_dict": encoder_ckpt["encoder_state_dict"],
-        # Species heads
-        "head_states": heads_ckpt["head_states"],
-        "species_meta": heads_ckpt["species_meta"],
-        "combined_head_state": heads_ckpt.get("combined_head_state"),
-        "combined_species_keys": heads_ckpt.get("combined_species_keys", []),
-        "combined_head_meta": heads_ckpt.get("combined_head_meta"),
-        # Geocell feature lookup
-        "cell_table": cell_table,
-        "cell_size_deg": cell_size_deg,
-        # Feature metadata for on-the-fly GIS sampling and runtime transforms
-        "feature_names": model_feature_names,
-        "raw_feature_names": raw_feature_names,
-        "feature_transforms": feature_transforms,
-    }
+    bundle = _build_bundle_payload(
+        encoder_ckpt=encoder_ckpt,
+        heads_ckpt=heads_ckpt,
+        cell_table=cell_table,
+        cell_size_deg=cell_size_deg,
+        raw_feature_names=raw_feature_names,
+        feature_transforms=feature_transforms,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, output_path)

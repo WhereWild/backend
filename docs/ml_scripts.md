@@ -349,16 +349,12 @@ runtime sampled inference falls back to identity feature handling rather than th
 
 ## 6. Run inference / serve the API
 
-### Load the bundle and prepare a heatmap stream in Python
+### Load the bundle in Python
 
 ```python
-from util.inference import load_bundle, predict_heatmap_stream
+from util.inference import load_bundle
 
 load_bundle("checkpoints/canary_plants/inference_bundle.pt")
-stream_result = predict_heatmap_stream(
-    11498251,
-    (24.0, -106.0, 32.0, -94.0),
-)
 ```
 
 ### Load the bundle and rank species with the combined head
@@ -404,11 +400,8 @@ Runtime device env vars:
     Controls parallel raster-layer sampling for heatmaps.
     Keep at `1` unless benchmarked on your deployment.
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
-    Controls sampling chunk size for heatmap job streams.
+    Controls sampling chunk size for heatmap tile rendering.
     Independent from model scoring batch size.
-- `WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS`: integer `>=1` (default: `2`).
-    Controls how many prepared stream chunks can queue ahead.
-    Increase for more read-ahead overlap (uses more memory).
 
 Example forcing both inference compute and cell table to CUDA:
 
@@ -417,7 +410,6 @@ WHEREWILD_INFERENCE_DEVICE=cuda \
 WHEREWILD_INFERENCE_CELL_TABLE_DEVICE=cuda \
 WHEREWILD_INFERENCE_SAMPLE_WORKERS=1 \
 WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE=8192 \
-WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS=2 \
 WHEREWILD_INFERENCE_BUNDLE=checkpoints/canary_plants/inference_bundle.pt \
     uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -434,9 +426,6 @@ docker compose up -d gdal
 
 - `GET /api/species/{taxon_id}/heatmap` -- heatmap tile metadata for one species.
 - `GET /api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png` -- rendered PNG heatmap tiles.
-- `POST /api/predict/heatmap-jobs` -- create a cancellable heatmap job.
-- `GET /api/predict/heatmap-jobs/{job_id}/stream` -- stream heatmap NDJSON events.
-- `DELETE /api/predict/heatmap-jobs/{job_id}` -- cancel a stale or running heatmap job.
 
 Tile endpoint notes:
 

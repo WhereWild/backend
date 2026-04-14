@@ -9,8 +9,7 @@ Start with:
 - `util.summary_stats`: summary stats, categorical distributions, and index-backed slice queries.
 - `util.indexing`: occurrence index builders plus relative ranking/KDE helpers.
 - `util.taxa_navigation`: taxonomy traversal and occurrence parquet filters.
-- `util.inference`: streaming heatmap inference engine for the Darwin SDM.
-  Loads an inference bundle and exposes `predict_heatmap_stream()`. Supports
-  on-the-fly GIS raster sampling for arbitrary heatmap coordinates not present
-  in the pre-computed cell table.
+- `util.inference`: bundle loading and runtime scoring helpers for the Darwin SDM.
+  Loads an inference bundle used by the species heatmap tile endpoints and
+  shared ranking utilities.
 - `util.heatmap_tiles`: heatmap tile rendering helpers built on top of `util.inference`.

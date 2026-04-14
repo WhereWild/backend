@@ -168,11 +168,8 @@ Runtime device env vars:
   Controls parallel raster-layer sampling for heatmaps.
   Keep at `1` unless benchmarked on your deployment.
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
-  Controls sampling chunk size for heatmap job streaming.
+  Controls sampling chunk size for heatmap tile rendering.
   This is independent from model scoring batch size.
-- `WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS`: integer `>=1` (default: `2`).
-  Controls how many prepared stream chunks can queue ahead.
-  Increase for more read-ahead overlap (uses more memory).
 
 ### `GET /api/species/{taxon_id}/heatmap`
 
@@ -212,52 +209,3 @@ Notes:
 - Tile renders are not currently mid-flight cancellable once scoring starts.
 - High zoom requests may render the closest reusable parent tile that still
   fits under the configured tile-size cap, then crop the requested subtile.
-
-### Job resource model for stale-call cancellation
-
-For robust client workflows, use cancellable heatmap jobs:
-
-### `POST /api/predict/heatmap-jobs`
-
-Create a job resource and receive stable URLs to stream and cancel it.
-
-Request body fields:
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `species_key` | int | required | GBIF species key. |
-| `min_lat` | float | required | Southern edge. |
-| `min_lon` | float | required | Western edge. |
-| `max_lat` | float | required | Northern edge. |
-| `max_lon` | float | required | Eastern edge. |
-| `resolution` | float | model native (0.25) | Output cell size in degrees. |
-| `include_source` | bool | false | Include per-cell feature source (`sampled` or `cell_table`) for debugging. |
-| `feature_mode` | string | `prefer_cell_table` | Feature source strategy: `prefer_cell_table` or `cell_table_only`. |
-| `max_cells` | int | 20000 | Hard cap on output cells; oversized requests return 400. |
-
-In `prefer_cell_table`, native/coarser requests use precomputed cell-table
-features first; finer-than-native requests prefer sampled GIS features when
-available, with cell-table fallback for missing samples.
-
-Response includes:
-
-- `job_id`
-- `status` (`created`)
-- `stream_url`
-- `cancel_url`
-
-### `GET /api/predict/heatmap-jobs/{job_id}/stream`
-
-Stream job output as NDJSON. Event lines:
-
-- `{"type":"meta", "job_id":..., ...}`
-- many `{"type":"cell", ...}`
-- terminal `{"type":"done", "job_id":..., "n_cells":...}`
-- or `{"type":"cancelled", "job_id":..., "n_cells":...}`
-
-Only one active stream is allowed per job.
-
-### `DELETE /api/predict/heatmap-jobs/{job_id}`
-
-Cancel stale jobs. Running streams will stop quickly and emit a
-`cancelled` terminal event.

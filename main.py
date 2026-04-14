@@ -7,14 +7,13 @@ import logging
 import math
 import re
 import os
-import json
 import shutil
 import time
 import threading
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass as _dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, List, Literal, Optional
@@ -25,9 +24,7 @@ import numpy as _np_global
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from PIL import Image
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
 import pandas as pd
 from pydantic import BaseModel, Field
 
@@ -48,6 +45,7 @@ from util import (
 from util.tile_request import log_tile_cancellation, render_species_deep_zoom_tile, run_tile_render_with_cancellation
 from util import inference
 from util import heatmap_tiles
+from util.species_heatmap_scorers import DarwinSpeciesHeatmapScorer, LegacySpeciesHeatmapScorer
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -463,16 +461,100 @@ async def variable_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
-@app.get("/api/species/{taxon_id}/heatmap")
-def species_heatmap_metadata(
+def _build_species_legacy_heatmap_metadata(
+    taxon_id: int,
+    *,
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    metadata = models.describe_model(model_id or models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
+    available = bool(metadata.get("available"))
+    return {
+        **metadata,
+        "tile_url": f"/api/species/{taxon_id}/heatmap/legacy/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
+    }
+
+
+def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
+    if not inference.is_loaded():
+        return {
+            "available": False,
+            "species_key": taxon_id,
+            "native_resolution": 0.0,
+            "tile_url": None,
+        }
+
+    available = inference.has_species(taxon_id)
+    return {
+        "available": available,
+        "species_key": taxon_id,
+        "native_resolution": inference.native_resolution(),
+        "tile_url": f"/api/species/{taxon_id}/heatmap/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
+    }
+
+
+def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
+    legacy = _build_species_legacy_heatmap_metadata(taxon_id)
+    inference_metadata = _build_species_inference_heatmap_metadata(taxon_id)
+    return {
+        "available": bool(legacy.get("available") or inference_metadata.get("available")),
+        "resolved_model_id": legacy.get("resolved_model_id"),
+        "phenology_available": legacy.get("phenology_available"),
+        "full_available": legacy.get("full_available"),
+        "legacy": legacy,
+        "inference": inference_metadata,
+    }
+
+
+async def _render_species_heatmap_tile_response(
+    request: Request,
+    *,
+    scorer: LegacySpeciesHeatmapScorer | DarwinSpeciesHeatmapScorer,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    max_native_zoom: int,
+    cache_seconds: int,
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    try:
+        payload = await run_in_threadpool(
+            scorer.render_runtime_tile_bytes,
+            taxon_id,
+            z,
+            x,
+            y,
+            tile_size=tile_size,
+            max_native_zoom=max_native_zoom,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    return Response(
+        content=payload,
+        media_type="image/png",
+        headers={"Cache-Control": f"public, max-age={cache_seconds}"},
+    )
+
+
+@app.get("/api/species/{taxon_id}/heatmap/legacy")
+def species_legacy_heatmap_metadata_route(
     taxon_id: int,
     model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
 ) -> dict[str, Any]:
-    return models.describe_model(model_id, taxon_id=taxon_id)
+    """Return metadata for the legacy forecast-aware species heatmap system."""
+    return _build_species_legacy_heatmap_metadata(taxon_id, model_id=model_id)
 
 
-@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
-async def species_heatmap_tile(
+@app.get("/api/species/{taxon_id}/heatmap/legacy/tiles/{z}/{x}/{y}.png")
+async def species_legacy_heatmap_tile_route(
     request: Request,
     taxon_id: int,
     z: int,
@@ -494,18 +576,7 @@ async def species_heatmap_tile(
     apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
     phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
 ) -> Response:
-    if await request.is_disconnected():
-        log_tile_cancellation(
-            "species",
-            "preflight_disconnect",
-            taxon_id=taxon_id,
-            z=z,
-            x=x,
-            y=y,
-            model_id=model_id,
-        )
-        return Response(status_code=204)
-
+    """Render a legacy model-backed species heatmap tile as PNG."""
     resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
     if not resolved_model.get("available"):
         raise HTTPException(
@@ -513,86 +584,68 @@ async def species_heatmap_tile(
             detail=f"No heatmap model found for taxon_id {taxon_id}.",
         )
 
-    if z > max_native_zoom:
-        try:
-            payload = await render_species_deep_zoom_tile(
-                request,
-                _SPECIES_DEEP_ZOOM_RENDER_SEMAPHORE,
-                taxon_id=taxon_id,
-                z=z,
-                x=x,
-                y=y,
-                tile_size=tile_size,
-                max_native_zoom=max_native_zoom,
-                parent_tile_max_size=variable_parent_tile_max_size,
-                model_id=model_id,
-                reproject=reproject,
-                forecast_hours=forecast_hours,
-                apply_phenology=apply_phenology,
-                phenology_only=phenology_only,
-            )
-            if payload is None:
-                return Response(status_code=204)
-        except tiles.TileRenderCancelled:
-            return Response(status_code=204)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    else:
-        try:
-            if await request.is_disconnected():
-                log_tile_cancellation(
-                    "species",
-                    "pre_render_disconnect",
-                    taxon_id=taxon_id,
-                    z=z,
-                    x=x,
-                    y=y,
-                    model_id=model_id,
-                )
-                return Response(status_code=204)
-            payload = await run_tile_render_with_cancellation(
-                request,
-                tiles.render_model_tile_bytes,
-                taxon_id=taxon_id,
-                z=z,
-                x=x,
-                y=y,
-                model_id=model_id,
-                tile_size=tile_size,
-                reproject=reproject,
-                forecast_hours=forecast_hours,
-                apply_phenology=apply_phenology,
-                phenology_only=phenology_only,
-            )
-        except tiles.TileRenderCancelled:
-            log_tile_cancellation(
-                "species",
-                "during_render",
-                taxon_id=taxon_id,
-                z=z,
-                x=x,
-                y=y,
-                model_id=model_id,
-            )
-            return Response(status_code=204)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scorer = LegacySpeciesHeatmapScorer(
+        model_id=model_id,
+        reproject=reproject,
+        forecast_hours=forecast_hours,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
+        max_tile_size=variable_tile_max_size,
+    )
+    return await _render_species_heatmap_tile_response(
+        request,
+        scorer=scorer,
+        taxon_id=taxon_id,
+        z=z,
+        x=x,
+        y=y,
+        tile_size=tile_size,
+        max_native_zoom=max_native_zoom,
+        cache_seconds=variable_tile_cache_seconds,
+    )
 
-    if await request.is_disconnected():
-        log_tile_cancellation(
-            "species",
-            "post_render_disconnect",
-            taxon_id=taxon_id,
-            z=z,
-            x=x,
-            y=y,
-            model_id=model_id,
-        )
-        return Response(status_code=204)
-    headers = {
-        "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
-    }
-    return Response(content=payload, media_type="image/png", headers=headers)
+
+@app.get("/api/species/{taxon_id}/heatmap")
+def species_inference_heatmap_metadata_route(taxon_id: int) -> dict[str, Any]:
+    """Return metadata for the species heatmap tile surface."""
+    return _build_species_inference_heatmap_metadata(taxon_id)
+
+
+@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
+async def species_inference_heatmap_tile_route(
+    request: Request,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = Query(heatmap_tile_default_size, ge=32, le=heatmap_tile_max_size),
+    feature_mode: str = Query(
+        "prefer_cell_table",
+        description="Feature source strategy: prefer_cell_table or cell_table_only.",
+    ),
+    max_native_zoom: int = Query(
+        heatmap_tile_default_max_native_zoom,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+) -> Response:
+    """Render a species heatmap tile as PNG."""
+    scorer = DarwinSpeciesHeatmapScorer(
+        feature_mode=feature_mode,
+        max_tile_size=heatmap_tile_max_size,
+    )
+    return await _render_species_heatmap_tile_response(
+        request,
+        scorer=scorer,
+        taxon_id=taxon_id,
+        z=z,
+        x=x,
+        y=y,
+        tile_size=tile_size,
+        max_native_zoom=max_native_zoom,
+        cache_seconds=heatmap_tile_cache_seconds,
+    )
 
 
 @app.get("/api/heatmap/aggregate/tiles/{z}/{x}/{y}.png")
@@ -1387,7 +1440,7 @@ def get_species_detail(
         payload["description_profile"] = description_profile
     except Exception:
         traceback.print_exc()
-    payload["heatmap"] = models.describe_model(models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
+    payload["heatmap"] = _build_species_heatmap_summary(taxon_id)
     return payload
 
 
@@ -2438,41 +2491,28 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
     )
 
 
-# ---------------------------------------------------------------------------
-# SDM heatmap job models
-# ---------------------------------------------------------------------------
+def _build_species_legacy_heatmap_metadata(
+    taxon_id: int,
+    *,
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    metadata = models.describe_model(model_id or models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
+    available = bool(metadata.get("available"))
+    return {
+        **metadata,
+        "tile_url": f"/api/species/{taxon_id}/heatmap/legacy/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
+    }
 
 
-class HeatmapJobCreateRequest(BaseModel):
-    species_key: int
-    min_lat: float
-    min_lon: float
-    max_lat: float
-    max_lon: float
-    resolution: float | None = None
-    include_source: bool = False
-    feature_mode: str = "prefer_cell_table"
-    max_cells: int = 20000
-
-
-class HeatmapJobResponse(BaseModel):
-    job_id: str
-    status: str
-    created_at: str
-    stream_url: str
-    cancel_url: str
-
-
-class HeatmapJobDeleteResponse(BaseModel):
-    job_id: str
-    status: str
-
-
-@app.get("/api/species/{taxon_id}/heatmap")
-def species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
-    """Return metadata for the species heatmap tile surface."""
+def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
     if not inference.is_loaded():
-        return {"available": False, "species_key": taxon_id}
+        return {
+            "available": False,
+            "species_key": taxon_id,
+            "native_resolution": 0.0,
+            "tile_url": None,
+        }
+
     available = inference.has_species(taxon_id)
     return {
         "available": available,
@@ -2482,8 +2522,127 @@ def species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
     }
 
 
+def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
+    legacy = _build_species_legacy_heatmap_metadata(taxon_id)
+    inference_metadata = _build_species_inference_heatmap_metadata(taxon_id)
+    return {
+        "available": bool(legacy.get("available") or inference_metadata.get("available")),
+        "resolved_model_id": legacy.get("resolved_model_id"),
+        "phenology_available": legacy.get("phenology_available"),
+        "full_available": legacy.get("full_available"),
+        "legacy": legacy,
+        "inference": inference_metadata,
+    }
+
+
+async def _render_species_heatmap_tile_response(
+    request: Request,
+    *,
+    scorer: LegacySpeciesHeatmapScorer | DarwinSpeciesHeatmapScorer,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    max_native_zoom: int,
+    cache_seconds: int,
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    try:
+        payload = await run_in_threadpool(
+            scorer.render_runtime_tile_bytes,
+            taxon_id,
+            z,
+            x,
+            y,
+            tile_size=tile_size,
+            max_native_zoom=max_native_zoom,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    return Response(
+        content=payload,
+        media_type="image/png",
+        headers={"Cache-Control": f"public, max-age={cache_seconds}"},
+    )
+
+
+@app.get("/api/species/{taxon_id}/heatmap/legacy")
+def species_legacy_heatmap_metadata_route(
+    taxon_id: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+) -> dict[str, Any]:
+    """Return metadata for the legacy forecast-aware species heatmap system."""
+    return _build_species_legacy_heatmap_metadata(taxon_id, model_id=model_id)
+
+
+@app.get("/api/species/{taxon_id}/heatmap/legacy/tiles/{z}/{x}/{y}.png")
+async def species_legacy_heatmap_tile_route(
+    request: Request,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    reproject: bool = Query(
+        variable_tile_default_reproject,
+        description="If true, warp to Web Mercator; if false, keep WGS84.",
+    ),
+    max_native_zoom: int = Query(
+        10,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
+    apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
+    phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
+) -> Response:
+    """Render a legacy model-backed species heatmap tile as PNG."""
+    resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
+    if not resolved_model.get("available"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No heatmap model found for taxon_id {taxon_id}.",
+        )
+
+    scorer = LegacySpeciesHeatmapScorer(
+        model_id=model_id,
+        reproject=reproject,
+        forecast_hours=forecast_hours,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
+        max_tile_size=variable_tile_max_size,
+    )
+    return await _render_species_heatmap_tile_response(
+        request,
+        scorer=scorer,
+        taxon_id=taxon_id,
+        z=z,
+        x=x,
+        y=y,
+        tile_size=tile_size,
+        max_native_zoom=max_native_zoom,
+        cache_seconds=variable_tile_cache_seconds,
+    )
+
+
+@app.get("/api/species/{taxon_id}/heatmap")
+def species_inference_heatmap_metadata_route(taxon_id: int) -> dict[str, Any]:
+    """Return metadata for the species heatmap tile surface."""
+    return _build_species_inference_heatmap_metadata(taxon_id)
+
+
 @app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
-async def species_inference_heatmap_tile(
+async def species_inference_heatmap_tile_route(
     request: Request,
     taxon_id: int,
     z: int,
@@ -2505,314 +2664,21 @@ async def species_inference_heatmap_tile(
     if not inference.is_loaded():
         raise HTTPException(status_code=503, detail="Inference model not loaded.")
 
-    if await request.is_disconnected():
-        return Response(status_code=204)
-
-    try:
-        if z > max_native_zoom:
-            max_parent_scale = max(1, heatmap_tile_max_size // tile_size)
-            max_parent_zoom_diff = int(math.floor(math.log2(max_parent_scale))) if max_parent_scale > 1 else 0
-            parent_zoom = max(max_native_zoom, z - max_parent_zoom_diff)
-            zoom_diff = z - parent_zoom
-            scale = 2**zoom_diff
-            parent_x = x // scale
-            parent_y = y // scale
-            subtile_x = x % scale
-            subtile_y = y % scale
-            parent_tile_size = tile_size * scale
-            parent_payload = await run_in_threadpool(
-                heatmap_tiles.render_heatmap_tile_bytes,
-                taxon_id,
-                parent_zoom,
-                parent_x,
-                parent_y,
-                tile_size=parent_tile_size,
-                feature_mode=feature_mode,
-            )
-            if await request.is_disconnected():
-                return Response(status_code=204)
-
-            parent_img = Image.open(BytesIO(parent_payload))
-            subtile_size = parent_tile_size // scale
-            left = subtile_x * subtile_size
-            top = subtile_y * subtile_size
-            tile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
-            if subtile_size != tile_size:
-                tile_img = tile_img.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
-            buffer = BytesIO()
-            tile_img.save(buffer, format="PNG")
-            payload = buffer.getvalue()
-        else:
-            payload = await run_in_threadpool(
-                heatmap_tiles.render_heatmap_tile_bytes,
-                taxon_id,
-                z,
-                x,
-                y,
-                tile_size=tile_size,
-                feature_mode=feature_mode,
-            )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if await request.is_disconnected():
-        return Response(status_code=204)
-    headers = {"Cache-Control": f"public, max-age={heatmap_tile_cache_seconds}"}
-    return Response(content=payload, media_type="image/png", headers=headers)
-
-
-_heatmap_jobs_lock = threading.Lock()
-_heatmap_jobs: dict[str, dict[str, Any]] = {}
-_HEATMAP_JOB_TTL_SECONDS = 6 * 60 * 60
-_HEATMAP_JOB_MAX_ENTRIES = 2000
-
-
-def _parse_iso8601(ts: Any) -> datetime | None:
-    """Parse an ISO8601 timestamp value into an aware datetime when possible."""
-    if not isinstance(ts, str) or not ts:
-        return None
-    try:
-        parsed = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _prune_heatmap_jobs() -> None:
-    """Prune stale/finished jobs and cap in-memory job count."""
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(seconds=_HEATMAP_JOB_TTL_SECONDS)
-    finished_statuses = {"cancelled", "completed", "failed"}
-
-    with _heatmap_jobs_lock:
-        stale_ids: list[str] = []
-        for job_id, job in _heatmap_jobs.items():
-            status = str(job.get("status") or "")
-            finished_at = _parse_iso8601(job.get("finished_at"))
-            if status in finished_statuses and finished_at is not None and finished_at <= cutoff:
-                stale_ids.append(job_id)
-
-        for job_id in stale_ids:
-            _heatmap_jobs.pop(job_id, None)
-
-        overflow = len(_heatmap_jobs) - _HEATMAP_JOB_MAX_ENTRIES
-        if overflow <= 0:
-            return
-
-        def _eviction_key(item: tuple[str, dict[str, Any]]) -> tuple[int, datetime]:
-            _id, job = item
-            status = str(job.get("status") or "")
-            is_finished = status in finished_statuses
-            finished_at = _parse_iso8601(job.get("finished_at"))
-            created_at = _parse_iso8601(job.get("created_at"))
-            ref_time = finished_at or created_at or now
-            return (0 if is_finished else 1, ref_time)
-
-        for job_id, _job in sorted(_heatmap_jobs.items(), key=_eviction_key)[:overflow]:
-            _heatmap_jobs.pop(job_id, None)
-
-
-def _validate_heatmap_bbox(min_lat: float, min_lon: float, max_lat: float, max_lon: float) -> None:
-    """Validate heatmap bbox ordering and raise HTTP 400 on invalid bounds."""
-    if min_lat >= max_lat:
-        raise HTTPException(status_code=400, detail="min_lat must be less than max_lat.")
-    if min_lon >= max_lon:
-        raise HTTPException(status_code=400, detail="min_lon must be less than max_lon.")
-
-
-def _get_heatmap_job(job_id: str) -> dict[str, Any]:
-    """Fetch a heatmap job by id or raise HTTP 404 when absent."""
-    _prune_heatmap_jobs()
-    with _heatmap_jobs_lock:
-        job = _heatmap_jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
-    return job
-
-
-def _build_heatmap_stream_response(
-    stream_result: dict[str, Any],
-    *,
-    job_id: str | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-    on_cancel: Callable[[int], None] | None = None,
-    on_done: Callable[[int], None] | None = None,
-) -> StreamingResponse:
-    """Build a reusable NDJSON stream response for heatmap cell iterators."""
-    cells_iter = stream_result["cells"]
-    meta_payload: dict[str, Any] = {
-        "type": "meta",
-        "species_key": stream_result["species_key"],
-        "bbox": stream_result["bbox"],
-        "resolution": stream_result["resolution"],
-        "native_resolution": stream_result["native_resolution"],
-        "requested_cells": stream_result["requested_cells"],
-    }
-    if job_id is not None:
-        meta_payload["job_id"] = job_id
-
-    def _terminal_payload(event_type: str, yielded: int) -> dict[str, Any]:
-        payload: dict[str, Any] = {"type": event_type, "n_cells": yielded}
-        if job_id is not None:
-            payload["job_id"] = job_id
-        return payload
-
-    def _ndjson_events():
-        yielded = 0
-        yield json.dumps(meta_payload) + "\n"
-        for cell in cells_iter:
-            if cancel_check is not None and cancel_check():
-                if on_cancel is not None:
-                    on_cancel(yielded)
-                yield json.dumps(_terminal_payload("cancelled", yielded)) + "\n"
-                return
-            yielded += 1
-            yield json.dumps({"type": "cell", **cell}) + "\n"
-
-        was_cancelled = cancel_check is not None and cancel_check()
-        if was_cancelled:
-            if on_cancel is not None:
-                on_cancel(yielded)
-            yield json.dumps(_terminal_payload("cancelled", yielded)) + "\n"
-            return
-
-        if on_done is not None:
-            on_done(yielded)
-        yield json.dumps(_terminal_payload("done", yielded)) + "\n"
-
-    return StreamingResponse(_ndjson_events(), media_type="application/x-ndjson")
-
-
-# ---------------------------------------------------------------------------
-# SDM heatmap job endpoints
-# ---------------------------------------------------------------------------
-
-
-@app.post("/api/predict/heatmap-jobs", response_model=HeatmapJobResponse)
-def create_predict_heatmap_job(payload: HeatmapJobCreateRequest) -> HeatmapJobResponse:
-    """Create a cancellable heatmap job resource."""
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-    _prune_heatmap_jobs()
-    _validate_heatmap_bbox(payload.min_lat, payload.min_lon, payload.max_lat, payload.max_lon)
-
-    job_id = uuid4().hex
-    created_at = datetime.now(timezone.utc).isoformat()
-    job = {
-        "job_id": job_id,
-        "status": "created",
-        "created_at": created_at,
-        "params": payload.model_dump(),
-        "cancel_event": threading.Event(),
-        "started_at": None,
-        "finished_at": None,
-    }
-    with _heatmap_jobs_lock:
-        _heatmap_jobs[job_id] = job
-
-    return HeatmapJobResponse(
-        job_id=job_id,
-        status="created",
-        created_at=created_at,
-        stream_url=f"/api/predict/heatmap-jobs/{job_id}/stream",
-        cancel_url=f"/api/predict/heatmap-jobs/{job_id}",
+    scorer = DarwinSpeciesHeatmapScorer(
+        feature_mode=feature_mode,
+        max_tile_size=heatmap_tile_max_size,
     )
-
-
-@app.get("/api/predict/heatmap-jobs/{job_id}/stream")
-def stream_predict_heatmap_job(job_id: str) -> StreamingResponse:
-    """Stream job results as NDJSON and support cancellation via DELETE."""
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-
-    _prune_heatmap_jobs()
-    _get_heatmap_job(job_id)
-
-    with _heatmap_jobs_lock:
-        job = _heatmap_jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
-        if job["status"] == "cancelled":
-            raise HTTPException(status_code=409, detail=f"Heatmap job {job_id} is cancelled.")
-        if job["status"] == "running":
-            raise HTTPException(status_code=409, detail=f"Heatmap job {job_id} is already streaming.")
-        job["status"] = "running"
-        job["started_at"] = datetime.now(timezone.utc).isoformat()
-
-    params = job["params"]
-    cancel_event: threading.Event = job["cancel_event"]
-
-    try:
-        stream_result = inference.predict_heatmap_stream(
-            params["species_key"],
-            (params["min_lat"], params["min_lon"], params["max_lat"], params["max_lon"]),
-            resolution=params.get("resolution"),
-            include_source=params.get("include_source", False),
-            feature_mode=params.get("feature_mode", "prefer_cell_table"),
-            max_cells=params.get("max_cells", 20000),
-            cancel_check=cancel_event.is_set,
-        )
-    except KeyError as exc:
-        with _heatmap_jobs_lock:
-            job["status"] = "failed"
-            job["finished_at"] = datetime.now(timezone.utc).isoformat()
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        with _heatmap_jobs_lock:
-            job["status"] = "failed"
-            job["finished_at"] = datetime.now(timezone.utc).isoformat()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    def _on_cancel(_yielded: int) -> None:
-        with _heatmap_jobs_lock:
-            tracked = _heatmap_jobs.get(job_id)
-            if tracked is None:
-                return
-            tracked["status"] = "cancelled"
-            tracked["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    def _on_done(_yielded: int) -> None:
-        with _heatmap_jobs_lock:
-            tracked = _heatmap_jobs.get(job_id)
-            if tracked is None:
-                return
-            tracked["status"] = "cancelled" if cancel_event.is_set() else "completed"
-            tracked["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    return _build_heatmap_stream_response(
-        stream_result,
-        job_id=job_id,
-        cancel_check=cancel_event.is_set,
-        on_cancel=_on_cancel,
-        on_done=_on_done,
+    return await _render_species_heatmap_tile_response(
+        request,
+        scorer=scorer,
+        taxon_id=taxon_id,
+        z=z,
+        x=x,
+        y=y,
+        tile_size=tile_size,
+        max_native_zoom=max_native_zoom,
+        cache_seconds=heatmap_tile_cache_seconds,
     )
-
-
-@app.delete("/api/predict/heatmap-jobs/{job_id}", response_model=HeatmapJobDeleteResponse)
-def cancel_predict_heatmap_job(job_id: str) -> HeatmapJobDeleteResponse:
-    """Cancel a stale heatmap job."""
-    _prune_heatmap_jobs()
-    _get_heatmap_job(job_id)
-    with _heatmap_jobs_lock:
-        job = _heatmap_jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail=f"Unknown heatmap job {job_id}.")
-        cancel_event: threading.Event = job["cancel_event"]
-        if not cancel_event.is_set():
-            cancel_event.set()
-        if job["status"] == "created":
-            job["status"] = "cancelled"
-            job["finished_at"] = datetime.now(timezone.utc).isoformat()
-        elif job["status"] == "running":
-            job["status"] = "cancelling"
-
-        current_status = job["status"]
-
-    return HeatmapJobDeleteResponse(job_id=job_id, status=current_status)
 
 
 if __name__ == "__main__":

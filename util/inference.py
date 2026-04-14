@@ -1,17 +1,8 @@
-"""Streaming heatmap inference for the Darwin SDM.
+"""Bundle loading and inference helpers for the Darwin SDM.
 
-Loads an inference bundle (exported by ``scripts/machine_learning/train/export.py``)
-and provides ``predict_heatmap_stream(...)`` for per-species NDJSON heatmap APIs.
-
-Typical startup flow (called once at import / FastAPI startup)::
-
-    from util.inference import load_bundle, predict_heatmap_stream
-
-    load_bundle("checkpoints/canary_cactus/inference_bundle.pt")
-    stream = predict_heatmap_stream(
-        11498251,
-        (24.0, -106.0, 32.0, -94.0),
-    )
+Loads an inference bundle exported by
+``scripts/machine_learning/train/export.py`` and exposes runtime helpers used
+by the tile-rendering backend.
 
 By default, runtime inference prefers CUDA when available and otherwise
 falls back to CPU.
@@ -22,11 +13,9 @@ from __future__ import annotations
 import math
 import os
 import logging
-import queue
 from importlib import import_module
 from pathlib import Path
-from threading import Event, Thread
-from typing import Any, Callable, Iterator, NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 
@@ -50,8 +39,8 @@ _bundle: dict[str, Any] | None = None
 _encoder: torch.nn.Module | None = None
 _heads: dict[int, torch.nn.Module] = {}
 _combined_head: torch.nn.Module | None = None
-_cell_table: dict[str, dict[str, torch.Tensor]] = {}
-_cell_table_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+_cell_table: dict[str, torch.Tensor] = {}
+_cell_table_by_bin: dict[tuple[int, int], torch.Tensor] = {}
 _cell_size_deg: float = 0.25
 _species_meta: dict[int, dict] = {}
 _combined_species_keys: list[int] = []
@@ -86,7 +75,6 @@ _TEMPORAL_WINDOW_TO_FORECAST_HOURS: dict[int, int] = {
 
 HEATMAP_DEFAULT_MAX_CELLS = 40000
 HEATMAP_DEFAULT_SCORE_BATCH_SIZE = 4096
-_QUEUE_PUT_POLL_SECONDS = 0.1
 LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
 
@@ -186,18 +174,6 @@ def _resolve_sample_chunk_size(score_batch_size: int) -> int:
     return max(score_batch_size, requested)
 
 
-def _resolve_stream_prefetch_chunks() -> int:
-    """Resolve how many prepared stream chunks can queue ahead."""
-    raw = os.environ.get("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS", "2").strip()
-    try:
-        requested = int(raw)
-    except ValueError as exc:
-        raise ValueError("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS must be an integer >= 1") from exc
-    if requested < 1:
-        raise ValueError("WHEREWILD_INFERENCE_STREAM_PREFETCH_CHUNKS must be >= 1")
-    return requested
-
-
 def _close_dataset_cache(cache: dict[tuple[str, str], Any]) -> None:
     """Close cached raster datasets created during a stream request."""
     for ds in cache.values():
@@ -209,22 +185,13 @@ def _close_dataset_cache(cache: dict[tuple[str, str], Any]) -> None:
 
 
 def _move_cell_table_to_device(
-    cell_table: dict[str, dict[str, torch.Tensor]], target_device: torch.device
-) -> dict[str, dict[str, torch.Tensor]]:
-    """Move tensor payloads in cell_table to target device."""
+    cell_table: dict[str, torch.Tensor], target_device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Move cell-table tensors to the target device."""
     if target_device.type == "cpu":
         return cell_table
 
-    moved: dict[str, dict[str, torch.Tensor]] = {}
-    for cid, payload in cell_table.items():
-        moved_payload: dict[str, torch.Tensor] = {}
-        for key, value in payload.items():
-            if isinstance(value, torch.Tensor):
-                moved_payload[key] = value.to(target_device)
-            else:
-                moved_payload[key] = value
-        moved[cid] = moved_payload
-    return moved
+    return {cid: payload.to(target_device) for cid, payload in cell_table.items()}
 
 
 def _raw_feature_dim_from_names() -> int | None:
@@ -264,15 +231,17 @@ def _coerce_model_input(features: torch.Tensor, mask: torch.Tensor | None = None
     if int(feat.shape[0]) == _input_dim:
         return feat
 
-    if isinstance(mask, torch.Tensor) and mask.ndim == 1:
-        mask_t = mask.to(dtype=torch.float32)
+    if isinstance(mask, torch.Tensor):
+        mask_tensor = cast(torch.Tensor, mask)
+        if mask_tensor.ndim != 1:
+            raise ValueError("mask must be a 1-d torch.Tensor")
+        mask_t = mask_tensor.to(dtype=torch.float32)
         if int(feat.shape[0] + mask_t.shape[0]) == _input_dim:
             return torch.cat([feat, mask_t], dim=0)
-
-    raise ValueError(
-        f"cannot align features ({feat.shape[0]}) + mask ({mask.shape[0] if isinstance(mask, torch.Tensor) else 'None'}) "
-        f"to input_dim={_input_dim}"
-    )
+        mask_width = mask_tensor.shape[0]
+    else:
+        mask_width = "None"
+    raise ValueError(f"cannot align features ({feat.shape[0]}) + mask ({mask_width}) to input_dim={_input_dim}")
 
 
 def _coerce_model_input_batch(features: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -289,15 +258,17 @@ def _coerce_model_input_batch(features: torch.Tensor, mask: torch.Tensor | None 
     if int(feat.shape[1]) == _input_dim:
         return feat
 
-    if isinstance(mask, torch.Tensor) and mask.ndim == 2:
-        mask_t = mask.to(dtype=torch.float32)
+    if isinstance(mask, torch.Tensor):
+        mask_tensor = cast(torch.Tensor, mask)
+        if mask_tensor.ndim != 2:
+            raise ValueError("batched mask must be a 2-d torch.Tensor")
+        mask_t = mask_tensor.to(dtype=torch.float32)
         if int(feat.shape[1] + mask_t.shape[1]) == _input_dim:
             return torch.cat([feat, mask_t], dim=1)
-
-    raise ValueError(
-        f"cannot align batched features ({feat.shape[1]}) + mask "
-        f"({mask.shape[1] if isinstance(mask, torch.Tensor) else 'None'}) to input_dim={_input_dim}"
-    )
+        mask_width = mask_tensor.shape[1]
+    else:
+        mask_width = "None"
+    raise ValueError(f"cannot align batched features ({feat.shape[1]}) + mask ({mask_width}) to input_dim={_input_dim}")
 
 
 def _stack_feature_batch(
@@ -324,17 +295,15 @@ def _stack_feature_batch(
     return torch.stack(features)
 
 
-def _payload_model_input(payload: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Return a model-ready feature tensor from a payload."""
-    features = payload.get("features")
-    mask = payload.get("mask")
-    if isinstance(features, torch.Tensor):
-        if features.ndim != 1:
-            raise ValueError("payload features must be a 1-d torch.Tensor")
-        if int(features.shape[0]) == _input_dim and features.dtype == torch.float32:
-            return features
-        return _coerce_model_input(features, mask)
-    raise ValueError("payload features must be a torch.Tensor")
+def _payload_model_input(payload: torch.Tensor) -> torch.Tensor:
+    """Return a model-ready feature tensor from a v2 cell-table payload."""
+    if not isinstance(payload, torch.Tensor):
+        raise ValueError("cell payload must be a torch.Tensor")
+    if payload.ndim != 1:
+        raise ValueError("cell payload tensor must be a 1-d torch.Tensor")
+    if int(payload.shape[0]) == _input_dim and payload.dtype == torch.float32:
+        return payload
+    return _coerce_model_input(payload)
 
 
 def _sampled_feature_support_status() -> tuple[bool, str | None]:
@@ -468,7 +437,7 @@ def _prepare_feature_batch_for_coords(
         for i, (lat, lon) in enumerate(coords):
             cell = _cell_lookup_by_bin(lat, lon, native)
             if cell is not None:
-                features_per_coord[i] = cell["features"]
+                features_per_coord[i] = cell
                 if feature_source_per_coord is not None:
                     feature_source_per_coord[i] = "cell_table"
                 continue
@@ -483,7 +452,7 @@ def _prepare_feature_batch_for_coords(
             )
             for i, cell in zip(missing_indices, sampled):
                 if cell is not None:
-                    features_per_coord[i] = cell["features"]
+                    features_per_coord[i] = cell
                     if feature_source_per_coord is not None:
                         feature_source_per_coord[i] = "sampled"
     else:
@@ -494,7 +463,7 @@ def _prepare_feature_batch_for_coords(
         )
         for i, cell in enumerate(sampled):
             if cell is not None:
-                features_per_coord[i] = cell["features"]
+                features_per_coord[i] = cell
                 if feature_source_per_coord is not None:
                     feature_source_per_coord[i] = "sampled"
                 continue
@@ -505,7 +474,7 @@ def _prepare_feature_batch_for_coords(
             for i, (lat, lon) in zip(missing_indices, missing_coords, strict=True):
                 cell = _cell_lookup_by_bin(lat, lon, native)
                 if cell is not None:
-                    features_per_coord[i] = cell["features"]
+                    features_per_coord[i] = cell
                     if feature_source_per_coord is not None:
                         feature_source_per_coord[i] = "cell_table"
 
@@ -945,8 +914,8 @@ def _bin_id(lat: float, lon: float, size_deg: float) -> str:
     return f"cell_{lat_bin}_{lon_bin}"
 
 
-def _cell_lookup_by_bin(lat: float, lon: float, size_deg: float) -> dict[str, torch.Tensor] | None:
-    """Lookup a precomputed cell payload without constructing a string key."""
+def _cell_lookup_by_bin(lat: float, lon: float, size_deg: float) -> torch.Tensor | None:
+    """Lookup a precomputed cell tensor without constructing a string key."""
     cell = _cell_table_by_bin.get(_bin_index(lat, lon, size_deg))
     if cell is not None:
         return cell
@@ -964,14 +933,9 @@ def _parse_cell_id(cell_id: str) -> tuple[int, int] | None:
         return None
 
 
-def _normalize_loaded_cell_payload(payload: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _normalize_loaded_cell_payload(payload: torch.Tensor) -> torch.Tensor:
     """Normalize one loaded cell payload so its feature vector is model-ready."""
-    normalized = dict(payload)
-    normalized["features"] = _payload_model_input(payload).to(dtype=torch.float32).contiguous()
-    mask = payload.get("mask")
-    if isinstance(mask, torch.Tensor):
-        normalized["mask"] = mask.to(dtype=torch.float32).contiguous()
-    return normalized
+    return _payload_model_input(payload).to(dtype=torch.float32).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -1440,25 +1404,37 @@ def load_bundle(path: str | Path) -> None:
     loaded = torch.load(str(path), map_location="cpu", weights_only=False)
     if not isinstance(loaded, dict):
         raise ValueError("Invalid inference bundle: expected dict payload.")
+    if loaded.get("bundle_version") != 2:
+        raise ValueError("Invalid inference bundle: expected bundle_version=2.")
     _bundle = loaded
 
-    input_dim: int = loaded["input_dim"]
-    embed_dim: int = loaded["embed_dim"]
-    hidden_dim: int = loaded["hidden_dim"]
+    model_payload = loaded.get("model")
+    heads_payload = loaded.get("heads")
+    serving_payload = loaded.get("serving")
+    if (
+        not isinstance(model_payload, dict)
+        or not isinstance(heads_payload, dict)
+        or not isinstance(serving_payload, dict)
+    ):
+        raise ValueError("Invalid inference bundle: expected dict sections.")
+
+    input_dim: int = model_payload["input_dim"]
+    embed_dim: int = model_payload["embed_dim"]
+    hidden_dim: int = model_payload["hidden_dim"]
     _input_dim = input_dim
 
     if SharedEncoder is None or SpeciesHead is None or CombinedSpeciesHead is None:
         raise RuntimeError("Training model classes are unavailable.")
 
     encoder = SharedEncoder(input_dim, embed_dim=embed_dim, hidden_dim=hidden_dim).to(_device)
-    encoder.load_state_dict(loaded["encoder_state_dict"])
+    encoder.load_state_dict(model_payload["encoder_state_dict"])
     encoder.eval()
     for p in encoder.parameters():
         p.requires_grad = False
     _encoder = encoder
 
     _heads = {}
-    for sp_key, state in loaded["head_states"].items():
+    for sp_key, state in heads_payload["head_states"].items():
         head = SpeciesHead(embed_dim=embed_dim).to(_device)
         head.load_state_dict(state)
         head.eval()
@@ -1466,8 +1442,8 @@ def load_bundle(path: str | Path) -> None:
             p.requires_grad = False
         _heads[int(sp_key)] = head
 
-    loaded_combined_species_keys = [int(species_key) for species_key in loaded.get("combined_species_keys", [])]
-    loaded_combined_state = loaded.get("combined_head_state")
+    loaded_combined_species_keys = [int(species_key) for species_key in heads_payload.get("combined_species_keys", [])]
+    loaded_combined_state = heads_payload.get("combined_head_state")
     _combined_head = None
     if loaded_combined_state is not None and loaded_combined_species_keys:
         combined_head = CombinedSpeciesHead(
@@ -1480,27 +1456,32 @@ def load_bundle(path: str | Path) -> None:
             p.requires_grad = False
         _combined_head = combined_head
 
-    _cell_table = loaded.get("cell_table", {})
-    _cell_table = _move_cell_table_to_device(_cell_table, cell_table_device)
-    _cell_size_deg = loaded.get("cell_size_deg", 0.25)
-    _species_meta = loaded.get("species_meta", {})
+    raw_cell_table = serving_payload.get("cell_table", {})
+    if not isinstance(raw_cell_table, dict):
+        raise ValueError("Invalid inference bundle: serving.cell_table must be a dict payload.")
+    loaded_cell_table = cast(dict[str, torch.Tensor], raw_cell_table)
+    loaded_cell_table = _move_cell_table_to_device(loaded_cell_table, cell_table_device)
+    _cell_size_deg = serving_payload.get("cell_size_deg", 0.25)
+    _species_meta = heads_payload.get("species_meta", {})
     _combined_species_keys = loaded_combined_species_keys
-    _combined_head_meta = loaded.get("combined_head_meta")
+    _combined_head_meta = heads_payload.get("combined_head_meta")
     _combined_species_head_class_indices = [
         class_index for class_index, species_key in enumerate(_combined_species_keys) if int(species_key) in _heads
     ]
-    _raw_feature_names = loaded.get("raw_feature_names", loaded.get("feature_names"))
-    _feature_names = loaded.get("feature_names", _raw_feature_names)
-    _feature_transforms_spec = normalize_feature_transform_spec(loaded.get("feature_transforms"))
-    if _feature_transforms_spec is not None and _feature_names is None:
+    _feature_transforms_spec = normalize_feature_transform_spec(model_payload.get("feature_transforms"))
+    _raw_feature_names = model_payload.get("raw_feature_names")
+    _feature_names = model_payload.get("feature_names")
+    if _feature_names is None and _feature_transforms_spec is not None:
         _feature_names = _feature_transforms_spec.get("transformed_feature_template")
+    if _feature_names is None:
+        _feature_names = _raw_feature_names
 
     model_dim = _model_feature_dim_from_names()
     _model_uses_mask = model_dim is not None and input_dim == model_dim * 2
-    normalized_table: dict[str, dict[str, torch.Tensor]] = {}
-    normalized_by_bin: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+    normalized_table: dict[str, torch.Tensor] = {}
+    normalized_by_bin: dict[tuple[int, int], torch.Tensor] = {}
     bad_cells: list[str] = []
-    for cid, payload in _cell_table.items():
+    for cid, payload in loaded_cell_table.items():
         try:
             normalized_payload = _normalize_loaded_cell_payload(payload)
         except ValueError:
@@ -1547,163 +1528,3 @@ def cell_count() -> int:
 def native_resolution() -> float:
     """Return the loaded model's native cell size in degrees."""
     return _cell_size_deg
-
-
-def predict_heatmap_stream(
-    species_key: int,
-    bbox: tuple[float, float, float, float],
-    *,
-    resolution: float | None = None,
-    include_source: bool = False,
-    feature_mode: str = "prefer_cell_table",
-    max_cells: int | None = HEATMAP_DEFAULT_MAX_CELLS,
-    score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
-    cancel_check: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
-    """Stream a species heatmap as an iterator of scored cells.
-
-    This variant avoids constructing a giant ``cells`` list in memory and is
-    suitable for NDJSON/SSE APIs. It yields one scored cell dict at a time.
-    """
-    if _encoder is None:
-        raise RuntimeError("Inference bundle not loaded. Call load_bundle() first.")
-    if species_key not in _heads:
-        raise KeyError(f"Species {species_key} not in loaded bundle.")
-
-    native = _cell_size_deg
-    res = resolution if resolution is not None else native
-    if res <= 0:
-        raise ValueError("resolution must be > 0")
-    min_lat, min_lon, max_lat, max_lon = bbox
-
-    if min_lat >= max_lat:
-        raise ValueError("min_lat must be less than max_lat")
-    if min_lon >= max_lon:
-        raise ValueError("min_lon must be less than max_lon")
-    if score_batch_size <= 0:
-        raise ValueError("score_batch_size must be > 0")
-
-    coords, requested_cells = _build_heatmap_coords(bbox, res, max_cells)
-    sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
-    prefetch_chunks = _resolve_stream_prefetch_chunks()
-    raster_dataset_cache: dict[tuple[str, str], Any] = {}
-    dem_dataset_cache: dict[tuple[str, str], Any] = {}
-
-    def _prepare_stream_chunk(
-        chunk_coords: list[tuple[float, float]],
-    ) -> tuple[list[tuple[float, float]], list[int], torch.Tensor | None, list[str | None] | None]:
-        """Resolve features for one stream chunk before model scoring."""
-        valid_indices, stacked_features, feature_source_per_coord = _prepare_feature_batch_for_coords(
-            chunk_coords,
-            resolution_hint=res,
-            include_source=include_source,
-            feature_mode=feature_mode,
-            raster_dataset_cache=raster_dataset_cache,
-            dem_dataset_cache=dem_dataset_cache,
-        )
-        return chunk_coords, valid_indices, stacked_features, feature_source_per_coord
-
-    def _iter_cells() -> Iterator[dict[str, Any]]:
-        """Yield scored cells chunk-by-chunk to keep streaming memory-bounded."""
-        try:
-            with torch.no_grad():
-                # Producer/consumer queue allows multiple prepared chunks to
-                # stay ahead so raster reads overlap scoring and streaming.
-                chunk_queue: queue.Queue[
-                    tuple[list[tuple[float, float]], list[int], torch.Tensor | None, list[str | None] | None]
-                    | Exception
-                    | None
-                ] = queue.Queue(maxsize=prefetch_chunks)
-                stop_event = Event()
-
-                def _put_queue_item(item: Any) -> None:
-                    while True:
-                        if stop_event.is_set():
-                            return
-                        try:
-                            chunk_queue.put(item, timeout=_QUEUE_PUT_POLL_SECONDS)
-                            return
-                        except queue.Full:
-                            continue
-
-                def _prefetch_chunks() -> None:
-                    try:
-                        for chunk_start in range(0, len(coords), sample_chunk_size):
-                            if stop_event.is_set():
-                                return
-                            if cancel_check is not None and cancel_check():
-                                return
-                            prepared = _prepare_stream_chunk(coords[chunk_start : chunk_start + sample_chunk_size])
-                            _put_queue_item(prepared)
-                    except Exception as exc:  # pragma: no cover - runtime guard
-                        _put_queue_item(exc)
-                    finally:
-                        _put_queue_item(None)
-
-                # Daemon so a stuck raster read can't prevent process exit
-                # under SIGTERM; normal path joins explicitly in the finally block.
-                prefetch_thread = Thread(target=_prefetch_chunks, name="wherewild-heatmap-prefetch", daemon=True)
-                prefetch_thread.start()
-                try:
-                    while True:
-                        if cancel_check is not None and cancel_check():
-                            stop_event.set()
-                            return
-
-                        item = chunk_queue.get()
-                        if item is None:
-                            return
-                        if isinstance(item, Exception):
-                            raise item
-
-                        chunk_coords, valid_indices, valid_feature_tensor, feature_source_per_coord = item
-                        if valid_feature_tensor is None or valid_feature_tensor.numel() == 0:
-                            continue
-
-                        scores_list = _score_species_feature_tensor(
-                            species_key,
-                            valid_feature_tensor,
-                            score_batch_size=score_batch_size,
-                        )
-
-                        for idx, score in zip(valid_indices, scores_list):
-                            if cancel_check is not None and cancel_check():
-                                stop_event.set()
-                                return
-                            lat, lon = chunk_coords[idx]
-                            cell_entry: dict[str, Any] = {
-                                "lat": round(lat, 4),
-                                "lon": round(lon, 4),
-                                "score": round(score, 6),
-                                "n_native": 1,
-                            }
-                            if include_source and feature_source_per_coord is not None:
-                                cell_entry["source"] = feature_source_per_coord[idx] or "unknown"
-                            yield cell_entry
-                finally:
-                    stop_event.set()
-                    prefetch_thread.join(timeout=1.0)
-                    if prefetch_thread.is_alive():
-                        logging.warning(
-                            "wherewild-heatmap-prefetch thread did not terminate within 1s; "
-                            "waiting up to 5s more before closing dataset caches."
-                        )
-                        prefetch_thread.join(timeout=5.0)
-                        if prefetch_thread.is_alive():
-                            logging.error(
-                                "wherewild-heatmap-prefetch thread is still running after "
-                                "extended shutdown wait; proceeding to close dataset caches "
-                                "anyway."
-                            )
-        finally:
-            _close_dataset_cache(raster_dataset_cache)
-            _close_dataset_cache(dem_dataset_cache)
-
-    return {
-        "species_key": species_key,
-        "bbox": list(bbox),
-        "resolution": res,
-        "native_resolution": native,
-        "requested_cells": requested_cells,
-        "cells": _iter_cells(),
-    }

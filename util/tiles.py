@@ -23,6 +23,7 @@ from rasterio.windows import Window, from_bounds as window_from_bounds, transfor
 
 from util.config import load_config
 from util import gis_lookup, models, units
+from util.species_heatmap_feature_sources import load_model_feature_layers, render_feature_stack
 
 from rasterio.errors import NotGeoreferencedWarning
 
@@ -155,7 +156,9 @@ def _resolve_model_render_inputs(
     else:
         active_model_id = model_id
 
-    active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
+    active_layers = load_model_feature_layers(
+        taxon_id, active_model_id, layers if active_model_id == model_id else None
+    )
     render_layers = list(active_layers)
     resolved_model_ids: list[str] = []
 
@@ -164,7 +167,7 @@ def _resolve_model_render_inputs(
         resolved_model_ids.append(active_artifact.model_id)
 
     if apply_phenology and not phenology_only and has_phenology and active_model_id == model_id:
-        pheno_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+        pheno_layers = load_model_feature_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
         render_layers = list(dict.fromkeys(active_layers + pheno_layers))
         pheno_artifact = models.resolve_model_artifact(models.AUTO_PHENOLOGY_MODEL_ID, taxon_id=taxon_id)
         if pheno_artifact is not None:
@@ -206,10 +209,6 @@ def _temporal_layers_version_token(layer_ids: Sequence[str], forecast_hours: int
         return None
     raw = "|".join(sorted(temporal_versions))
     return hashlib.md5(raw.encode()).hexdigest()[:12]
-
-
-def _is_temporal_column(col: str) -> bool:
-    return gis_lookup.is_temporal_layer_id(col)
 
 
 WGS84_CRS = "EPSG:4326"
@@ -1089,102 +1088,6 @@ def _colorize_heatmap(values: np.ndarray, vmin: float = 0.0, vmax: float = 1.0) 
     return rgba
 
 
-def _load_model_layers(
-    taxon_id: int,
-    model_id: str | None,
-    layers: Sequence[str] | None,
-) -> list[str]:
-    if layers:
-        layer_list = [str(layer).strip() for layer in layers if str(layer).strip()]
-    else:
-        layer_list = models.model_feature_columns(model_id, taxon_id=taxon_id)
-
-    if not layer_list:
-        requested = (model_id or "").strip() or models.DEFAULT_MODEL_ID
-        raise ValueError(f"No feature columns available for taxon {taxon_id} and model '{requested}'.")
-
-    # Temporal columns don't live in the GIS catalog — only validate non-temporal ones.
-    layer_meta = gis_lookup.load_layer_metadata()
-    unknown_gis = [layer for layer in layer_list if not _is_temporal_column(layer) and layer not in layer_meta]
-    if unknown_gis:
-        raise ValueError(
-            "Model feature columns are not available in the GIS catalog: " + ", ".join(sorted(unknown_gis))
-        )
-    return layer_list
-
-
-def _render_feature_stack(
-    layer_list: list[str],
-    spec: "TileSpec",
-    reproject: bool,
-    forecast_hours: int,
-    *,
-    layer_cache: "dict[str, np.ndarray] | None" = None,
-    overview_bias: int = 0,
-    cancel_check: CancelCheck | None = None,
-) -> np.ndarray:
-    """Render a (tile_size, tile_size, C) feature tensor for the given layer list.
-
-    If *layer_cache* is provided, already-rendered layers are read from it and
-    newly rendered layers are stored back into it so subsequent calls sharing the
-    same cache dict skip redundant I/O.
-    Layers not already cached are rendered in parallel using a thread pool.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from util import weather_tiles as _wt
-
-    tile_size = spec.tile_size
-    stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
-
-    # Populate from cache first; collect indices that still need rendering.
-    to_render: list[tuple[int, str]] = []
-    for idx, layer_id in enumerate(layer_list):
-        _check_cancel(cancel_check)
-        if layer_cache is not None and layer_id in layer_cache:
-            stack[:, :, idx] = layer_cache[layer_id]
-        else:
-            to_render.append((idx, layer_id))
-
-    def _render_one(idx_layer: tuple[int, str]) -> tuple[int, str, np.ndarray]:
-        _check_cancel(cancel_check)
-        idx, layer_id = idx_layer
-        parsed_temporal = gis_lookup.parse_temporal_layer_id(layer_id)
-        if parsed_temporal is not None:
-            variable_id, _agg, window_hours = parsed_temporal
-            try:
-                arr = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
-            except Exception:
-                arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-        else:
-            try:
-                arr = _render_layer_values(
-                    layer_id,
-                    spec,
-                    reproject_to_mercator=reproject,
-                    overview_bias=overview_bias,
-                )
-            except Exception:
-                arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-        _check_cancel(cancel_check)
-        return idx, layer_id, arr
-
-    n_workers = min(len(to_render), 2) if to_render else 1
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        futures = [pool.submit(_render_one, idx_layer) for idx_layer in to_render]
-        try:
-            for future in as_completed(futures):
-                _check_cancel(cancel_check)
-                idx, layer_id, arr = future.result()
-                _check_cancel(cancel_check)
-                stack[:, :, idx] = arr
-                if layer_cache is not None:
-                    layer_cache[layer_id] = arr
-        except TileRenderCancelled:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-    return stack
-
-
 def _compute_model_probs(
     taxon_id: int,
     spec: TileSpec,
@@ -1213,14 +1116,18 @@ def _compute_model_probs(
     render_layers = resolved.render_layers
 
     _check_cancel(cancel_check)
-    stack = _render_feature_stack(
+    stack = render_feature_stack(
         render_layers,
         spec,
         reproject,
         forecast_hours,
+        static_layer_renderer=lambda layer_id, tile_spec, render_to_mercator: _render_layer_values(
+            layer_id,
+            tile_spec,
+            reproject_to_mercator=render_to_mercator,
+            overview_bias=overview_bias,
+        ),
         layer_cache=layer_cache,
-        overview_bias=overview_bias,
-        cancel_check=cancel_check,
     )
     # render_layers preserves active_layers as a prefix, so the base model can reuse a view of the same stack.
     active_stack = stack[:, :, : len(active_layers)] if render_layers != active_layers else stack

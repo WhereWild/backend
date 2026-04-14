@@ -63,7 +63,7 @@ def _write_inference_bundle(
     path: Path,
     *,
     input_dim: int,
-    cell_table: dict[str, dict[str, torch.Tensor]],
+    cell_table: dict[str, torch.Tensor],
     feature_names: dict[str, list[str]],
     species_key: int = 101,
     species_name: str = "Test species",
@@ -77,19 +77,27 @@ def _write_inference_bundle(
     head = SpeciesHead(embed_dim=embed_dim)
     if species_meta is None:
         species_meta = {species_key: {"name": species_name}}
+
     torch.save(
         {
-            "input_dim": input_dim,
-            "embed_dim": embed_dim,
-            "hidden_dim": hidden_dim,
-            "encoder_state_dict": encoder.state_dict(),
-            "head_states": {species_key: head.state_dict()},
-            "species_meta": species_meta,
-            "combined_head_state": combined_head_state,
-            "combined_species_keys": combined_species_keys or [],
-            "cell_table": cell_table,
-            "cell_size_deg": 0.25,
-            "feature_names": feature_names,
+            "bundle_version": 2,
+            "model": {
+                "input_dim": input_dim,
+                "embed_dim": embed_dim,
+                "hidden_dim": hidden_dim,
+                "encoder_state_dict": encoder.state_dict(),
+                "raw_feature_names": feature_names,
+            },
+            "heads": {
+                "head_states": {species_key: head.state_dict()},
+                "species_meta": species_meta,
+                "combined_head_state": combined_head_state,
+                "combined_species_keys": combined_species_keys or [],
+            },
+            "serving": {
+                "cell_table": cell_table,
+                "cell_size_deg": 0.25,
+            },
         },
         path,
     )
@@ -1179,20 +1187,14 @@ def test_build_cell_table_averages_rows_and_zeroes_tied_missing_features(tmp_pat
     # Missing values are excluded from the per-feature mean, so the second
     # feature keeps the observed value from the train row instead of being
     # biased by the missing val row.
-    assert payload["features"].tolist() == [6.0, 2.0, 8.0, 9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    assert payload["mask"].tolist() == [0.0, 0.0, 0.0, 0.0, 0.0]
+    assert payload.tolist() == [6.0, 2.0, 8.0, 9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
-def test_load_bundle_and_predict_heatmap_stream_uses_loaded_cell_table(tmp_path: Path) -> None:
+def test_load_bundle_exposes_species_metadata_and_cell_table(tmp_path: Path) -> None:
     bundle_path = _write_inference_bundle(
         tmp_path / "bundle.pt",
         input_dim=4,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([1.0, 2.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0, 0.0], dtype=torch.float32),
-            }
-        },
+        cell_table={"cell_0_0": torch.tensor([1.0, 2.0, 0.0, 0.0], dtype=torch.float32)},
         feature_names={
             "bioclimate": ["bio_1"],
             "landclass": ["landcover"],
@@ -1203,40 +1205,19 @@ def test_load_bundle_and_predict_heatmap_stream_uses_loaded_cell_table(tmp_path:
     )
 
     inference.load_bundle(bundle_path)
-    stream = inference.predict_heatmap_stream(
-        101,
-        (0.0, 0.0, 0.24, 0.24),
-        resolution=0.25,
-        feature_mode="cell_table_only",
-        include_source=True,
-        max_cells=1,
-        score_batch_size=1,
-    )
-    cells = list(stream["cells"])
 
     assert inference.is_loaded() is True
     assert inference.known_species() == [101]
+    assert inference.has_species(101) is True
     assert inference.cell_count() == 1
     assert inference.native_resolution() == 0.25
-    assert stream["requested_cells"] == 1
-    assert len(cells) == 1
-    assert cells[0]["lat"] == 0.125
-    assert cells[0]["lon"] == 0.125
-    assert cells[0]["n_native"] == 1
-    assert cells[0]["source"] == "cell_table"
-    assert isinstance(cells[0]["score"], float)
 
 
 def test_load_bundle_rejects_incompatible_cell_payload(tmp_path: Path) -> None:
     bundle_path = _write_inference_bundle(
         tmp_path / "invalid_bundle.pt",
         input_dim=4,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([1.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0], dtype=torch.float32),
-            }
-        },
+        cell_table={"cell_0_0": torch.tensor([1.0], dtype=torch.float32)},
         feature_names={
             "bioclimate": ["bio_1"],
             "landclass": ["landcover"],
@@ -1248,36 +1229,6 @@ def test_load_bundle_rejects_incompatible_cell_payload(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match=r"cell\(s\) in bundle have incompatible feature width"):
         inference.load_bundle(bundle_path)
-
-
-def test_predict_heatmap_stream_rejects_invalid_requests(tmp_path: Path) -> None:
-    bundle_path = _write_inference_bundle(
-        tmp_path / "bundle.pt",
-        input_dim=4,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([1.0, 2.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0, 0.0], dtype=torch.float32),
-            }
-        },
-        feature_names={
-            "bioclimate": ["bio_1"],
-            "landclass": ["landcover"],
-            "terrain": [],
-            "temporal": [],
-            "other": [],
-        },
-    )
-    inference.load_bundle(bundle_path)
-
-    with pytest.raises(KeyError, match="Species 999"):
-        inference.predict_heatmap_stream(999, (0.0, 0.0, 0.24, 0.24), feature_mode="cell_table_only")
-    with pytest.raises(ValueError, match="resolution must be > 0"):
-        inference.predict_heatmap_stream(101, (0.0, 0.0, 0.24, 0.24), resolution=0.0)
-    with pytest.raises(ValueError, match="min_lat must be less than max_lat"):
-        inference.predict_heatmap_stream(101, (1.0, 0.0, 0.0, 0.24), feature_mode="cell_table_only")
-    with pytest.raises(ValueError, match="score_batch_size must be > 0"):
-        inference.predict_heatmap_stream(101, (0.0, 0.0, 0.24, 0.24), score_batch_size=0)
 
 
 def test_run_preprocess_writes_partitioned_dataset_and_metadata(tmp_path: Path) -> None:
@@ -1555,45 +1506,52 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
         "temporal": ["temperature_2m_24h"],
         "other": ["custom_measure"],
     }
+    transformed_feature_names = {
+        "bioclimate": ["bio_1_scaled"],
+        "landclass": ["landcover_scaled"],
+        "terrain": ["landform_scaled"],
+        "temporal": ["temperature_2m_24h_scaled"],
+        "other": ["custom_measure_scaled"],
+    }
     feature_transforms = {
         "version": "v1",
         "raw_feature_template": feature_names,
-        "transformed_feature_template": feature_names,
+        "transformed_feature_template": transformed_feature_names,
         "feature_specs": {
             "bio_1": {
                 "group": "bioclimate",
                 "value_type": "numeric",
                 "mean": 0.0,
                 "std": 1.0,
-                "output_features": ["bio_1"],
+                "output_features": ["bio_1_scaled"],
             },
             "landcover": {
                 "group": "landclass",
                 "value_type": "numeric",
                 "mean": 0.0,
                 "std": 1.0,
-                "output_features": ["landcover"],
+                "output_features": ["landcover_scaled"],
             },
             "landform": {
                 "group": "terrain",
                 "value_type": "numeric",
                 "mean": 0.0,
                 "std": 1.0,
-                "output_features": ["landform"],
+                "output_features": ["landform_scaled"],
             },
             "temperature_2m_24h": {
                 "group": "temporal",
                 "value_type": "numeric",
                 "mean": 0.0,
                 "std": 1.0,
-                "output_features": ["temperature_2m_24h"],
+                "output_features": ["temperature_2m_24h_scaled"],
             },
             "custom_measure": {
                 "group": "other",
                 "value_type": "numeric",
                 "mean": 0.0,
                 "std": 1.0,
-                "output_features": ["custom_measure"],
+                "output_features": ["custom_measure_scaled"],
             },
         },
     }
@@ -1652,32 +1610,26 @@ def test_export_bundle_roundtrip_loads_and_scores(tmp_path: Path) -> None:
     bundle_path = export.export_bundle(data_root, encoder_path, heads_path, output_bundle)
     bundle_payload = torch.load(bundle_path, map_location="cpu", weights_only=False)
     inference.load_bundle(bundle_path)
-    stream = inference.predict_heatmap_stream(
-        101,
-        (0.0, 0.0, 0.24, 0.24),
-        resolution=0.25,
-        feature_mode="cell_table_only",
-        include_source=True,
-        max_cells=1,
-        score_batch_size=1,
-    )
-    cells = list(stream["cells"])
 
     assert bundle_path.exists()
-    assert bundle_payload["raw_feature_names"] == feature_names
-    assert bundle_payload["feature_names"] == feature_names
-    assert bundle_payload["feature_transforms"]["raw_feature_template"] == feature_names
+    assert bundle_payload["bundle_version"] == 2
+    assert bundle_payload["model"]["raw_feature_names"] == feature_names
+    assert "feature_names" not in bundle_payload["model"]
+    assert bundle_payload["model"]["feature_transforms"]["raw_feature_template"] == feature_names
+    assert bundle_payload["model"]["feature_transforms"]["transformed_feature_template"] == transformed_feature_names
+    exported_cell_payload = bundle_payload["serving"]["cell_table"]["cell_0_0"]
+    assert isinstance(exported_cell_payload, torch.Tensor)
+    assert torch.equal(
+        exported_cell_payload,
+        torch.tensor([6.0, 2.0, 8.0, 9.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
+    )
     assert inference.is_loaded() is True
+    assert inference._feature_names == transformed_feature_names
     assert inference.has_species(101) is True
     assert inference.has_combined_head() is True
     assert inference.combined_species_keys() == [101]
     assert inference.cell_count() == 2
     assert inference.species_meta()[101]["name"] == "Test species"
-    assert len(cells) == 1
-    assert cells[0]["source"] == "cell_table"
-    assert cells[0]["lat"] == 0.125
-    assert cells[0]["lon"] == 0.125
-    assert isinstance(cells[0]["score"], float)
 
 
 def test_export_bundle_accepts_output_directory(tmp_path: Path) -> None:
@@ -1748,12 +1700,7 @@ def test_rank_species_coords_uses_combined_head(tmp_path: Path) -> None:
     _write_inference_bundle(
         bundle_path,
         input_dim=2,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([1.0, 0.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0], dtype=torch.float32),
-            }
-        },
+        cell_table={"cell_0_0": torch.tensor([1.0, 0.0], dtype=torch.float32)},
         feature_names=feature_names,
         species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
         combined_head_state=combined_head.state_dict(),
@@ -1796,12 +1743,7 @@ def test_rank_species_coords_filters_to_species_with_heads(tmp_path: Path) -> No
     _write_inference_bundle(
         bundle_path,
         input_dim=2,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([1.0, 0.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0], dtype=torch.float32),
-            }
-        },
+        cell_table={"cell_0_0": torch.tensor([1.0, 0.0], dtype=torch.float32)},
         feature_names=feature_names,
         species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
         combined_head_state=combined_head.state_dict(),
@@ -1849,12 +1791,7 @@ def test_rank_species_weather_delta_coords_uses_current_temporal(
     _write_inference_bundle(
         bundle_path,
         input_dim=4,
-        cell_table={
-            "cell_0_0": {
-                "features": torch.tensor([0.5, 0.0, 0.0, 1.0], dtype=torch.float32),
-                "mask": torch.tensor([0.0, 1.0], dtype=torch.float32),
-            }
-        },
+        cell_table={"cell_0_0": torch.tensor([0.5, 0.0, 0.0, 1.0], dtype=torch.float32)},
         feature_names=feature_names,
         species_meta={101: {"name": "Alpha"}, 202: {"name": "Beta"}},
         combined_head_state=combined_head.state_dict(),
