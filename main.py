@@ -16,8 +16,7 @@ from dataclasses import dataclass as _dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, List, Literal, Optional
-from uuid import uuid4
+from typing import Any, List, Literal, Optional
 
 import numpy as _np_global
 
@@ -42,9 +41,8 @@ from util import (
     tiles,
     weather_tiles,
 )
-from util.tile_request import log_tile_cancellation, render_species_deep_zoom_tile, run_tile_render_with_cancellation
+from util.tile_request import log_tile_cancellation, run_tile_render_with_cancellation
 from util import inference
-from util import heatmap_tiles
 from util.species_heatmap_scorers import DarwinSpeciesHeatmapScorer, LegacySpeciesHeatmapScorer
 from util.storage import get_parquet_storage
 
@@ -91,6 +89,7 @@ heatmap_tile_cache_seconds = int(getattr(CONFIG, "sdm_tile_cache_seconds", 60))
 heatmap_tile_default_max_native_zoom = int(getattr(CONFIG, "sdm_tile_max_native_zoom", 8))
 
 INFERENCE_BUNDLE_PATH = Path(os.environ.get("WHEREWILD_INFERENCE_BUNDLE", "checkpoints/inference_bundle.pt"))
+
 
 def _warm_taxa_name_index() -> None:
     try:
@@ -631,6 +630,9 @@ async def species_inference_heatmap_tile_route(
     ),
 ) -> Response:
     """Render a species heatmap tile as PNG."""
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+
     scorer = DarwinSpeciesHeatmapScorer(
         feature_mode=feature_mode,
         max_tile_size=heatmap_tile_max_size,
@@ -1643,13 +1645,15 @@ def species_locations(
         if not matches_parent(gid_key, location_name, hierarchy, hierarchy_gids):
             continue
 
-        results.append({
-            "gid": gid_key,
-            "name": location_name,
-            "level": location_level,
-            "hierarchy": hierarchy,
-            "count": int(count),
-        })
+        results.append(
+            {
+                "gid": gid_key,
+                "name": location_name,
+                "level": location_level,
+                "hierarchy": hierarchy,
+                "count": int(count),
+            }
+        )
 
     results.sort(
         key=lambda item: (
@@ -2354,12 +2358,14 @@ def species_environment_slice(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     observations: list[dict[str, Any]] = []
     for catalog, lat, lon, value in rows:
-        observations.append({
-            "catalogNumber": catalog,
-            "value": float(value) if isinstance(value, (int, float)) else value,
-            "latitude": lat,
-            "longitude": lon,
-        })
+        observations.append(
+            {
+                "catalogNumber": catalog,
+                "value": float(value) if isinstance(value, (int, float)) else value,
+                "latitude": lat,
+                "longitude": lon,
+            }
+        )
     response = {
         "speciesId": taxon_id,
         "variable": variable_id,
@@ -2488,196 +2494,6 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
         path=archive_path,
         media_type="application/zip",
         filename=out_name,
-    )
-
-
-def _build_species_legacy_heatmap_metadata(
-    taxon_id: int,
-    *,
-    model_id: str | None = None,
-) -> dict[str, Any]:
-    metadata = models.describe_model(model_id or models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
-    available = bool(metadata.get("available"))
-    return {
-        **metadata,
-        "tile_url": f"/api/species/{taxon_id}/heatmap/legacy/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
-    }
-
-
-def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
-    if not inference.is_loaded():
-        return {
-            "available": False,
-            "species_key": taxon_id,
-            "native_resolution": 0.0,
-            "tile_url": None,
-        }
-
-    available = inference.has_species(taxon_id)
-    return {
-        "available": available,
-        "species_key": taxon_id,
-        "native_resolution": inference.native_resolution(),
-        "tile_url": f"/api/species/{taxon_id}/heatmap/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
-    }
-
-
-def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
-    legacy = _build_species_legacy_heatmap_metadata(taxon_id)
-    inference_metadata = _build_species_inference_heatmap_metadata(taxon_id)
-    return {
-        "available": bool(legacy.get("available") or inference_metadata.get("available")),
-        "resolved_model_id": legacy.get("resolved_model_id"),
-        "phenology_available": legacy.get("phenology_available"),
-        "full_available": legacy.get("full_available"),
-        "legacy": legacy,
-        "inference": inference_metadata,
-    }
-
-
-async def _render_species_heatmap_tile_response(
-    request: Request,
-    *,
-    scorer: LegacySpeciesHeatmapScorer | DarwinSpeciesHeatmapScorer,
-    taxon_id: int,
-    z: int,
-    x: int,
-    y: int,
-    tile_size: int,
-    max_native_zoom: int,
-    cache_seconds: int,
-) -> Response:
-    if await request.is_disconnected():
-        return Response(status_code=204)
-
-    try:
-        payload = await run_in_threadpool(
-            scorer.render_runtime_tile_bytes,
-            taxon_id,
-            z,
-            x,
-            y,
-            tile_size=tile_size,
-            max_native_zoom=max_native_zoom,
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if await request.is_disconnected():
-        return Response(status_code=204)
-    return Response(
-        content=payload,
-        media_type="image/png",
-        headers={"Cache-Control": f"public, max-age={cache_seconds}"},
-    )
-
-
-@app.get("/api/species/{taxon_id}/heatmap/legacy")
-def species_legacy_heatmap_metadata_route(
-    taxon_id: int,
-    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
-) -> dict[str, Any]:
-    """Return metadata for the legacy forecast-aware species heatmap system."""
-    return _build_species_legacy_heatmap_metadata(taxon_id, model_id=model_id)
-
-
-@app.get("/api/species/{taxon_id}/heatmap/legacy/tiles/{z}/{x}/{y}.png")
-async def species_legacy_heatmap_tile_route(
-    request: Request,
-    taxon_id: int,
-    z: int,
-    x: int,
-    y: int,
-    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
-    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
-    reproject: bool = Query(
-        variable_tile_default_reproject,
-        description="If true, warp to Web Mercator; if false, keep WGS84.",
-    ),
-    max_native_zoom: int = Query(
-        10,
-        ge=1,
-        le=18,
-        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
-    ),
-    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
-    apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
-    phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
-) -> Response:
-    """Render a legacy model-backed species heatmap tile as PNG."""
-    resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
-    if not resolved_model.get("available"):
-        raise HTTPException(
-            status_code=404,
-            detail=f"No heatmap model found for taxon_id {taxon_id}.",
-        )
-
-    scorer = LegacySpeciesHeatmapScorer(
-        model_id=model_id,
-        reproject=reproject,
-        forecast_hours=forecast_hours,
-        apply_phenology=apply_phenology,
-        phenology_only=phenology_only,
-        max_tile_size=variable_tile_max_size,
-    )
-    return await _render_species_heatmap_tile_response(
-        request,
-        scorer=scorer,
-        taxon_id=taxon_id,
-        z=z,
-        x=x,
-        y=y,
-        tile_size=tile_size,
-        max_native_zoom=max_native_zoom,
-        cache_seconds=variable_tile_cache_seconds,
-    )
-
-
-@app.get("/api/species/{taxon_id}/heatmap")
-def species_inference_heatmap_metadata_route(taxon_id: int) -> dict[str, Any]:
-    """Return metadata for the species heatmap tile surface."""
-    return _build_species_inference_heatmap_metadata(taxon_id)
-
-
-@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
-async def species_inference_heatmap_tile_route(
-    request: Request,
-    taxon_id: int,
-    z: int,
-    x: int,
-    y: int,
-    tile_size: int = Query(heatmap_tile_default_size, ge=32, le=heatmap_tile_max_size),
-    feature_mode: str = Query(
-        "prefer_cell_table",
-        description="Feature source strategy: prefer_cell_table or cell_table_only.",
-    ),
-    max_native_zoom: int = Query(
-        heatmap_tile_default_max_native_zoom,
-        ge=1,
-        le=18,
-        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
-    ),
-) -> Response:
-    """Render a species heatmap tile as PNG."""
-    if not inference.is_loaded():
-        raise HTTPException(status_code=503, detail="Inference model not loaded.")
-
-    scorer = DarwinSpeciesHeatmapScorer(
-        feature_mode=feature_mode,
-        max_tile_size=heatmap_tile_max_size,
-    )
-    return await _render_species_heatmap_tile_response(
-        request,
-        scorer=scorer,
-        taxon_id=taxon_id,
-        z=z,
-        x=x,
-        y=y,
-        tile_size=tile_size,
-        max_native_zoom=max_native_zoom,
-        cache_seconds=heatmap_tile_cache_seconds,
     )
 
 
