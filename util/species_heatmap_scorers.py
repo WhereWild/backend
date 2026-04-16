@@ -7,6 +7,7 @@ import math
 from PIL import Image
 
 from util import heatmap_tiles, tiles
+from util.request_cancellation import CancelCheck
 
 
 def _crop_tile_bytes(
@@ -39,7 +40,16 @@ class LegacySpeciesHeatmapScorer:
     phenology_only: bool
     max_tile_size: int
 
-    def render_tile_bytes(self, taxon_id: int, z: int, x: int, y: int, *, tile_size: int) -> bytes:
+    def render_tile_bytes(
+        self,
+        taxon_id: int,
+        z: int,
+        x: int,
+        y: int,
+        *,
+        tile_size: int,
+        cancel_check: CancelCheck | None = None,
+    ) -> bytes:
         return tiles.render_model_tile_bytes(
             taxon_id=taxon_id,
             z=z,
@@ -51,6 +61,7 @@ class LegacySpeciesHeatmapScorer:
             forecast_hours=self.forecast_hours,
             apply_phenology=self.apply_phenology,
             phenology_only=self.phenology_only,
+            cancel_check=cancel_check,
         )
 
     def render_runtime_tile_bytes(
@@ -62,9 +73,17 @@ class LegacySpeciesHeatmapScorer:
         *,
         tile_size: int,
         max_native_zoom: int,
+        cancel_check: CancelCheck | None = None,
     ) -> bytes:
         if z <= max_native_zoom:
-            return self.render_tile_bytes(taxon_id, z, x, y, tile_size=tile_size)
+            return self.render_tile_bytes(
+                taxon_id,
+                z,
+                x,
+                y,
+                tile_size=tile_size,
+                cancel_check=cancel_check,
+            )
 
         zoom_diff = z - max_native_zoom
         scale = 2**zoom_diff
@@ -79,7 +98,10 @@ class LegacySpeciesHeatmapScorer:
             parent_x,
             parent_y,
             tile_size=parent_tile_size,
+            cancel_check=cancel_check,
         )
+        if cancel_check is not None:
+            cancel_check()
         return _crop_tile_bytes(
             parent_payload,
             scale=scale,
@@ -95,7 +117,16 @@ class DarwinSpeciesHeatmapScorer:
     feature_mode: str
     max_tile_size: int
 
-    def render_tile_bytes(self, taxon_id: int, z: int, x: int, y: int, *, tile_size: int) -> bytes:
+    def render_tile_bytes(
+        self,
+        taxon_id: int,
+        z: int,
+        x: int,
+        y: int,
+        *,
+        tile_size: int,
+        cancel_check: CancelCheck | None = None,
+    ) -> bytes:
         return heatmap_tiles.render_heatmap_tile_bytes(
             taxon_id,
             z,
@@ -103,6 +134,7 @@ class DarwinSpeciesHeatmapScorer:
             y,
             tile_size=tile_size,
             feature_mode=self.feature_mode,
+            cancel_check=cancel_check,
         )
 
     def render_runtime_tile_bytes(
@@ -114,9 +146,17 @@ class DarwinSpeciesHeatmapScorer:
         *,
         tile_size: int,
         max_native_zoom: int,
+        cancel_check: CancelCheck | None = None,
     ) -> bytes:
         if z <= max_native_zoom:
-            return self.render_tile_bytes(taxon_id, z, x, y, tile_size=tile_size)
+            return self.render_tile_bytes(
+                taxon_id,
+                z,
+                x,
+                y,
+                tile_size=tile_size,
+                cancel_check=cancel_check,
+            )
 
         max_parent_scale = max(1, self.max_tile_size // tile_size)
         max_parent_zoom_diff = int(math.floor(math.log2(max_parent_scale))) if max_parent_scale > 1 else 0
@@ -134,7 +174,10 @@ class DarwinSpeciesHeatmapScorer:
             parent_x,
             parent_y,
             tile_size=parent_tile_size,
+            cancel_check=cancel_check,
         )
+        if cancel_check is not None:
+            cancel_check()
         return _crop_tile_bytes(
             parent_payload,
             scale=scale,

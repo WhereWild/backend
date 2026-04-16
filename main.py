@@ -520,15 +520,26 @@ async def _render_species_heatmap_tile_response(
         return Response(status_code=204)
 
     try:
-        payload = await run_in_threadpool(
+        payload = await run_tile_render_with_cancellation(
+            request,
             scorer.render_runtime_tile_bytes,
-            taxon_id,
-            z,
-            x,
-            y,
+            taxon_id=taxon_id,
+            z=z,
+            x=x,
+            y=y,
             tile_size=tile_size,
             max_native_zoom=max_native_zoom,
         )
+    except tiles.TileRenderCancelled:
+        log_tile_cancellation(
+            "species",
+            "during_render",
+            taxon_id=taxon_id,
+            z=z,
+            x=x,
+            y=y,
+        )
+        return Response(status_code=204)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

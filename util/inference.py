@@ -19,6 +19,8 @@ from typing import Any, NamedTuple, cast
 
 import torch
 
+from util.request_cancellation import CancelCheck
+
 _feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 _feature_transforms = import_module("scripts.machine_learning.feature_transforms")
 _SAMPLED_FEATURE_GROUPS = _feature_contract.SAMPLED_FEATURE_GROUPS
@@ -52,6 +54,8 @@ _feature_transforms_spec: dict[str, Any] | None = None
 _input_dim: int = 0
 _model_uses_mask: bool = False
 _device: torch.device = torch.device("cpu")
+_bundle_source_path: str | None = None
+_bundle_source_mtime_ns: int | None = None
 
 _TEMPORAL_RASTER_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
 _TEMPORAL_WINDOW_LABELS: dict[int, str] = {
@@ -184,6 +188,11 @@ def _close_dataset_cache(cache: dict[tuple[str, str], Any]) -> None:
             close()
 
 
+def _check_cancel(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None:
+        cancel_check()
+
+
 def _move_cell_table_to_device(
     cell_table: dict[str, torch.Tensor], target_device: torch.device
 ) -> dict[str, torch.Tensor]:
@@ -306,6 +315,18 @@ def _payload_model_input(payload: torch.Tensor) -> torch.Tensor:
     return _coerce_model_input(payload)
 
 
+def _resolved_feature_model_input(payload: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the model-input tensor from either a cell-table or sampled payload."""
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, dict):
+        features = payload.get("features")
+        if isinstance(features, torch.Tensor):
+            return features
+        raise ValueError("sampled feature payload missing tensor 'features'")
+    raise ValueError(f"unsupported feature payload type: {type(payload).__name__}")
+
+
 def _sampled_feature_support_status() -> tuple[bool, str | None]:
     """Return whether sampled GIS features can produce model-aligned inputs."""
     if _raw_feature_names is None:
@@ -416,6 +437,7 @@ def _prepare_feature_batch_for_coords(
     feature_mode: str,
     raster_dataset_cache: dict[tuple[str, str], Any] | None = None,
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> tuple[list[int], torch.Tensor | None, list[str | None] | None]:
     """Resolve model-ready feature rows for arbitrary coordinates."""
     native = _cell_size_deg
@@ -435,6 +457,7 @@ def _prepare_feature_batch_for_coords(
 
     if primary_source == "cell_table":
         for i, (lat, lon) in enumerate(coords):
+            _check_cancel(cancel_check)
             cell = _cell_lookup_by_bin(lat, lon, native)
             if cell is not None:
                 features_per_coord[i] = cell
@@ -445,6 +468,7 @@ def _prepare_feature_batch_for_coords(
             missing_coords.append((lat, lon))
 
         if allow_fallback and missing_coords:
+            _check_cancel(cancel_check)
             sampled = _batch_sample_features(
                 missing_coords,
                 raster_dataset_cache=raster_dataset_cache,
@@ -452,18 +476,20 @@ def _prepare_feature_batch_for_coords(
             )
             for i, cell in zip(missing_indices, sampled):
                 if cell is not None:
-                    features_per_coord[i] = cell
+                    features_per_coord[i] = _resolved_feature_model_input(cell)
                     if feature_source_per_coord is not None:
                         feature_source_per_coord[i] = "sampled"
     else:
+        _check_cancel(cancel_check)
         sampled = _batch_sample_features(
             coords,
             raster_dataset_cache=raster_dataset_cache,
             dem_dataset_cache=dem_dataset_cache,
         )
         for i, cell in enumerate(sampled):
+            _check_cancel(cancel_check)
             if cell is not None:
-                features_per_coord[i] = cell
+                features_per_coord[i] = _resolved_feature_model_input(cell)
                 if feature_source_per_coord is not None:
                     feature_source_per_coord[i] = "sampled"
                 continue
@@ -472,6 +498,7 @@ def _prepare_feature_batch_for_coords(
 
         if allow_fallback and missing_coords:
             for i, (lat, lon) in zip(missing_indices, missing_coords, strict=True):
+                _check_cancel(cancel_check)
                 cell = _cell_lookup_by_bin(lat, lon, native)
                 if cell is not None:
                     features_per_coord[i] = cell
@@ -481,6 +508,7 @@ def _prepare_feature_batch_for_coords(
     valid_indices: list[int] = []
     valid_features: list[torch.Tensor] = []
     for i, feat in enumerate(features_per_coord):
+        _check_cancel(cancel_check)
         if feat is None:
             continue
         valid_indices.append(i)
@@ -494,6 +522,7 @@ def _score_species_feature_tensor(
     feature_tensor: torch.Tensor,
     *,
     score_batch_size: int,
+    cancel_check: CancelCheck | None = None,
 ) -> list[float]:
     """Score one species head for a prebuilt feature tensor batch."""
     if _encoder is None:
@@ -506,6 +535,7 @@ def _score_species_feature_tensor(
     scores_list: list[float] = []
     with torch.no_grad():
         for start in range(0, int(feature_tensor.shape[0]), score_batch_size):
+            _check_cancel(cancel_check)
             batch_features = feature_tensor[start : start + score_batch_size]
             if batch_features.device != _device:
                 batch_features = batch_features.to(_device)
@@ -523,6 +553,7 @@ def score_species_coords(
     feature_mode: str = "prefer_cell_table",
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
     include_source: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> tuple[list[float | None], list[str | None] | None]:
     """Score one species for arbitrary coordinates.
 
@@ -538,6 +569,7 @@ def score_species_coords(
     dem_dataset_cache: dict[tuple[str, str], Any] = {}
     try:
         for chunk_start in range(0, len(coords), sample_chunk_size):
+            _check_cancel(cancel_check)
             chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
             valid_indices, feature_tensor, chunk_sources = _prepare_feature_batch_for_coords(
                 chunk_coords,
@@ -546,6 +578,7 @@ def score_species_coords(
                 feature_mode=feature_mode,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
+                cancel_check=cancel_check,
             )
             if chunk_sources is not None and feature_source_per_coord is not None:
                 for local_index, source in enumerate(chunk_sources):
@@ -553,10 +586,12 @@ def score_species_coords(
             if feature_tensor is None or feature_tensor.numel() == 0:
                 continue
 
+            _check_cancel(cancel_check)
             chunk_scores = _score_species_feature_tensor(
                 species_key,
                 feature_tensor,
                 score_batch_size=score_batch_size,
+                cancel_check=cancel_check,
             )
             for local_index, score in zip(valid_indices, chunk_scores):
                 scores_per_coord[chunk_start + local_index] = score
@@ -1392,16 +1427,22 @@ def load_bundle(path: str | Path) -> None:
     global _bundle, _encoder, _heads, _combined_head, _cell_table, _cell_table_by_bin  # noqa: PLW0603
     global _cell_size_deg, _species_meta, _combined_species_keys, _combined_head_meta  # noqa: PLW0603
     global _combined_species_head_class_indices, _raw_feature_names, _feature_names, _feature_transforms_spec  # noqa: PLW0603
-    global _input_dim, _model_uses_mask, _device  # noqa: PLW0603
+    global _input_dim, _model_uses_mask, _device, _bundle_source_path, _bundle_source_mtime_ns  # noqa: PLW0603
 
     _lazy_import_models()
     _device = _resolve_inference_device()
     cell_table_device = _resolve_cell_table_device(_device)
+    bundle_path = Path(path).resolve()
+    try:
+        _bundle_source_mtime_ns = bundle_path.stat().st_mtime_ns
+    except OSError:
+        _bundle_source_mtime_ns = None
+    _bundle_source_path = str(bundle_path)
 
     # Keep bundle tensors on CPU at load time. The bundle includes a large
     # cell_table; mapping the full payload directly to CUDA can exhaust GPU
     # memory. We move only encoder/heads and runtime batches to _device.
-    loaded = torch.load(str(path), map_location="cpu", weights_only=False)
+    loaded = torch.load(str(bundle_path), map_location="cpu", weights_only=False)
     if not isinstance(loaded, dict):
         raise ValueError("Invalid inference bundle: expected dict payload.")
     if loaded.get("bundle_version") != 2:
@@ -1528,3 +1569,10 @@ def cell_count() -> int:
 def native_resolution() -> float:
     """Return the loaded model's native cell size in degrees."""
     return _cell_size_deg
+
+
+def bundle_cache_token() -> str:
+    """Return a cache token that changes when the loaded inference bundle changes."""
+    path_token = _bundle_source_path or "<unloaded>"
+    mtime_token = "unknown" if _bundle_source_mtime_ns is None else str(_bundle_source_mtime_ns)
+    return f"{path_token}:{mtime_token}"

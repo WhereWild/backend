@@ -230,6 +230,70 @@ def test_export_load_feature_names_rebuilds_legacy_template(tmp_path: Path) -> N
     }
 
 
+def test_score_species_coords_honors_cancel_check_between_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Cancelled(RuntimeError):
+        pass
+
+    state = {"cancelled": False}
+    prepare_calls = 0
+    score_calls = 0
+
+    def _cancel_check() -> None:
+        if state["cancelled"]:
+            raise _Cancelled()
+
+    def _fake_prepare_feature_batch_for_coords(
+        coords: list[tuple[float, float]],
+        *,
+        resolution_hint: float,
+        include_source: bool,
+        feature_mode: str,
+        raster_dataset_cache=None,
+        dem_dataset_cache=None,
+        cancel_check=None,
+    ):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return [0 for _ in coords], torch.zeros((len(coords), 2), dtype=torch.float32), None
+
+    def _fake_score_species_feature_tensor(
+        species_key: int,
+        feature_tensor: torch.Tensor,
+        *,
+        score_batch_size: int,
+        cancel_check=None,
+    ) -> list[float]:
+        nonlocal score_calls
+        score_calls += 1
+        state["cancelled"] = True
+        return [0.5 for _ in range(int(feature_tensor.shape[0]))]
+
+    monkeypatch.setattr(inference, "_resolve_sample_chunk_size", lambda score_batch_size: 2)
+    monkeypatch.setattr(
+        inference,
+        "_prepare_feature_batch_for_coords",
+        _fake_prepare_feature_batch_for_coords,
+    )
+    monkeypatch.setattr(
+        inference,
+        "_score_species_feature_tensor",
+        _fake_score_species_feature_tensor,
+    )
+
+    with pytest.raises(_Cancelled):
+        inference.score_species_coords(
+            101,
+            [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)],
+            resolution_hint=0.25,
+            cancel_check=_cancel_check,
+        )
+
+    assert prepare_calls == 1
+    assert score_calls == 1
+
+
 def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "sys.argv",
@@ -1846,3 +1910,46 @@ def test_rank_species_weather_delta_coords_uses_current_temporal(
     assert ranked[0][1]["delta_logit"] < 0.0
     assert ranked[0][0]["has_species_head"] is True
     assert sources == ["sampled_weather"]
+
+
+def test_score_species_coords_accepts_sampled_feature_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bundle_path = tmp_path / "bundle.pt"
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": [],
+        "other": [],
+    }
+
+    _write_inference_bundle(
+        bundle_path,
+        input_dim=1,
+        cell_table={},
+        feature_names=feature_names,
+    )
+
+    sampled_payload = {"features": torch.tensor([0.25], dtype=torch.float32)}
+
+    monkeypatch.setattr(
+        inference,
+        "_batch_sample_features",
+        lambda coords, **_kwargs: [sampled_payload for _ in coords],
+    )
+    monkeypatch.setattr(
+        inference,
+        "_score_species_feature_tensor",
+        lambda species_key, feature_tensor, *, score_batch_size, cancel_check=None: feature_tensor[:, 0].cpu().tolist(),
+    )
+
+    inference.load_bundle(bundle_path)
+    scores, sources = inference.score_species_coords(
+        101,
+        [(0.125, 0.125)],
+        resolution_hint=0.01,
+        feature_mode="prefer_cell_table",
+        include_source=True,
+    )
+
+    assert scores == [0.25]
+    assert sources == ["sampled"]
