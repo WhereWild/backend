@@ -12,12 +12,15 @@ from PIL import Image
 from util.config import load_config
 from util import inference
 from util.request_cancellation import CancelCheck
+from util.tile_disk_cache import DiskTileCache, make_cache_key
 
 
 CONFIG = load_config("global")
 _HEATMAP_CACHE_NAMESPACE = hashlib.md5(str(CONFIG.data_root).encode()).hexdigest()[:12]
-_HEATMAP_TILE_CACHE_DIR = Path("/workspace/cache/darwin-heatmap-tiles")
-_HEATMAP_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_HEATMAP_TILE_DISK_CACHE = DiskTileCache(
+    cache_dir=Path("/workspace/cache/darwin-heatmap-tiles"),
+    max_bytes=256 * 1024 * 1024,
+)
 
 WEB_MERCATOR = 6378137.0 * math.pi
 
@@ -39,57 +42,6 @@ class TileSpec:
     x: int
     y: int
     tile_size: int
-
-
-def _tile_cache_path(key: str) -> Path:
-    return _HEATMAP_TILE_CACHE_DIR / f"{key}.png"
-
-
-def _read_tile_cache(key: str) -> bytes | None:
-    path = _tile_cache_path(key)
-    try:
-        data = path.read_bytes()
-        path.touch()
-        return data
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-
-
-def _write_tile_cache(key: str, data: bytes) -> None:
-    try:
-        _HEATMAP_TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _tile_cache_path(key).write_bytes(data)
-        _evict_tile_cache_if_needed()
-    except Exception:
-        pass
-
-
-def _evict_tile_cache_if_needed() -> None:
-    try:
-        entries = []
-        total = 0
-        for path in _HEATMAP_TILE_CACHE_DIR.glob("*.png"):
-            stat = path.stat()
-            entries.append((stat.st_mtime, stat.st_size, path))
-            total += stat.st_size
-        if total <= _HEATMAP_TILE_CACHE_MAX_BYTES:
-            return
-        target = int(_HEATMAP_TILE_CACHE_MAX_BYTES * 0.8)
-        entries.sort()
-        for _, size, path in entries:
-            if total <= target:
-                break
-            path.unlink(missing_ok=True)
-            total -= size
-    except Exception:
-        pass
-
-
-def _make_tile_cache_key(**kwargs: object) -> str:
-    raw = "&".join(f"{key}={value}" for key, value in sorted(kwargs.items()))
-    return hashlib.md5(raw.encode()).hexdigest()
 
 
 def tile_bounds_mercator(spec: TileSpec) -> tuple[float, float, float, float]:
@@ -168,7 +120,7 @@ def render_heatmap_tile_bytes(
         cancel_check()
 
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
-    cache_key = _make_tile_cache_key(
+    cache_key = make_cache_key(
         namespace=_HEATMAP_CACHE_NAMESPACE,
         species_key=species_key,
         z=z,
@@ -179,7 +131,7 @@ def render_heatmap_tile_bytes(
         score_batch_size=score_batch_size,
         bundle_token=inference.bundle_cache_token(),
     )
-    cached = _read_tile_cache(cache_key)
+    cached = _HEATMAP_TILE_DISK_CACHE.read(cache_key)
     if cached is not None:
         if cancel_check is not None:
             cancel_check()
@@ -212,5 +164,5 @@ def render_heatmap_tile_bytes(
     payload = buffer.getvalue()
     if cancel_check is not None:
         cancel_check()
-    _write_tile_cache(cache_key, payload)
+    _HEATMAP_TILE_DISK_CACHE.write(cache_key, payload)
     return payload

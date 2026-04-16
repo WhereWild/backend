@@ -24,6 +24,7 @@ from rasterio.windows import Window, from_bounds as window_from_bounds, transfor
 from util.config import load_config
 from util import gis_lookup, models, units
 from util.species_heatmap_feature_sources import load_model_feature_layers, render_feature_stack
+from util.tile_disk_cache import DiskTileCache, make_cache_key
 
 from rasterio.errors import NotGeoreferencedWarning
 
@@ -40,8 +41,10 @@ _TILE_CACHE_NAMESPACE = hashlib.md5(str(CONFIG.data_root).encode()).hexdigest()[
 # Size-based eviction: when total exceeds _TILE_CACHE_MAX_BYTES, oldest files
 # (by mtime) are removed until usage drops to 80% of the limit.
 # ---------------------------------------------------------------------------
-_TILE_CACHE_DIR = Path("/workspace/cache/tiles")
-_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB
+_TILE_DISK_CACHE = DiskTileCache(
+    cache_dir=Path("/workspace/cache/tiles"),
+    max_bytes=256 * 1024 * 1024,
+)
 
 CancelCheck = Callable[[], None]
 
@@ -74,57 +77,6 @@ def crop_subtile_png(
     buffer = io.BytesIO()
     subtile_img.save(buffer, format="PNG")
     return buffer.getvalue()
-
-
-def _tile_cache_path(key: str) -> Path:
-    return _TILE_CACHE_DIR / f"{key}.png"
-
-
-def _read_tile_cache(key: str) -> bytes | None:
-    path = _tile_cache_path(key)
-    try:
-        data = path.read_bytes()
-        path.touch()  # bump mtime so LRU eviction keeps hot tiles
-        return data
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
-
-
-def _write_tile_cache(key: str, data: bytes) -> None:
-    try:
-        _TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _tile_cache_path(key).write_bytes(data)
-        _evict_tile_cache_if_needed()
-    except Exception:
-        pass
-
-
-def _evict_tile_cache_if_needed() -> None:
-    try:
-        entries = []
-        total = 0
-        for p in _TILE_CACHE_DIR.glob("*.png"):
-            st = p.stat()
-            entries.append((st.st_mtime, st.st_size, p))
-            total += st.st_size
-        if total <= _TILE_CACHE_MAX_BYTES:
-            return
-        target = int(_TILE_CACHE_MAX_BYTES * 0.8)
-        entries.sort()  # oldest mtime first
-        for _, size, path in entries:
-            if total <= target:
-                break
-            path.unlink(missing_ok=True)
-            total -= size
-    except Exception:
-        pass
-
-
-def _make_tile_cache_key(**kwargs: object) -> str:
-    raw = "&".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
-    return hashlib.md5(raw.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1189,7 +1141,7 @@ def render_model_tile_bytes(
         phenology_only=phenology_only,
     )
     temporal_version = _temporal_layers_version_token(resolved_inputs.render_layers, forecast_hours)
-    cache_key = _make_tile_cache_key(
+    cache_key = make_cache_key(
         namespace=_TILE_CACHE_NAMESPACE,
         taxon_id=taxon_id,
         z=z,
@@ -1206,7 +1158,7 @@ def render_model_tile_bytes(
         overview_bias=overview_bias,
         layers=tuple(layers) if layers is not None else None,
     )
-    cached = _read_tile_cache(cache_key)
+    cached = _TILE_DISK_CACHE.read(cache_key)
     if cached is not None:
         _check_cancel(cancel_check)
         return cached
@@ -1235,7 +1187,7 @@ def render_model_tile_bytes(
     image.save(buffer, format="PNG")
     result = buffer.getvalue()
     _check_cancel(cancel_check)
-    _write_tile_cache(cache_key, result)
+    _TILE_DISK_CACHE.write(cache_key, result)
     return result
 
 

@@ -11,6 +11,7 @@ import pytest
 from util import heatmap_tiles
 from util import species_heatmap_feature_sources as sources
 from util import species_heatmap_scorers as scorers
+from util.tile_disk_cache import DiskTileCache
 from util import tiles
 
 
@@ -161,7 +162,11 @@ def test_render_heatmap_tile_bytes_uses_cache(
         call_count += 1
         return [0.5 for _ in coords], None
 
-    monkeypatch.setattr(heatmap_tiles, "_HEATMAP_TILE_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(
+        heatmap_tiles,
+        "_HEATMAP_TILE_DISK_CACHE",
+        DiskTileCache(cache_dir=tmp_path, max_bytes=256 * 1024 * 1024),
+    )
     monkeypatch.setattr(heatmap_tiles.inference, "bundle_cache_token", lambda: "bundle-a")
     monkeypatch.setattr(heatmap_tiles.inference, "score_species_coords", _fake_score_species_coords)
 
@@ -182,7 +187,11 @@ def test_render_heatmap_tile_bytes_honors_cancel_check(
     def _cancel_check() -> None:
         raise tiles.TileRenderCancelled()
 
-    monkeypatch.setattr(heatmap_tiles, "_HEATMAP_TILE_CACHE_DIR", tmp_path)
+    monkeypatch.setattr(
+        heatmap_tiles,
+        "_HEATMAP_TILE_DISK_CACHE",
+        DiskTileCache(cache_dir=tmp_path, max_bytes=256 * 1024 * 1024),
+    )
     monkeypatch.setattr(heatmap_tiles.inference, "bundle_cache_token", lambda: "bundle-a")
     monkeypatch.setattr(heatmap_tiles.inference, "score_species_coords", _fail_score_species_coords)
 
