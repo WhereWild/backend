@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from scripts.machine_learning.train import data as training_data
 from scripts.machine_learning.train import export
 from scripts.machine_learning.train.model import CombinedSpeciesHead, SharedEncoder, SpeciesHead
 from util import inference
+from util import gis_lookup
 
 
 def _write_parquet(path: Path, columns: dict[str, pa.Array]) -> None:
@@ -1944,13 +1946,12 @@ def test_rank_species_weather_delta_coords_uses_current_temporal(
         combined_species_keys=[101, 202],
     )
 
-    def _fake_batch_sample_raster(
+    def _fail_batch_sample_raster(
         layer_id: str,
         coords: list[tuple[float, float]],
         dataset_cache: dict[tuple[str, str], object] | None = None,
     ) -> list[float | None]:
-        assert layer_id == "bio_1"
-        return [0.5 for _ in coords]
+        raise AssertionError("static raster sampling should be skipped when cell-table features are available")
 
     def _fake_load_temporal_raster_array(
         variable_id: str,
@@ -1971,7 +1972,7 @@ def test_rank_species_weather_delta_coords_uses_current_temporal(
         temporal_values = feature_tensor[:, 1].cpu()
         return [torch.stack([temporal_values, -temporal_values], dim=1)]
 
-    monkeypatch.setattr(inference, "_batch_sample_raster", _fake_batch_sample_raster)
+    monkeypatch.setattr(inference, "_batch_sample_raster", _fail_batch_sample_raster)
     monkeypatch.setattr(inference, "_load_temporal_raster_array", _fake_load_temporal_raster_array)
     monkeypatch.setattr(inference, "_score_combined_logits_tensor", _fake_score_combined_logits_tensor)
 
@@ -1991,6 +1992,69 @@ def test_rank_species_weather_delta_coords_uses_current_temporal(
     assert ranked[0][0]["weather_logit"] > ranked[0][0]["baseline_logit"]
     assert ranked[0][1]["delta_logit"] < 0.0
     assert ranked[0][0]["has_species_head"] is True
+    assert sources == ["cell_table_temporal"]
+
+
+def test_rank_species_weather_delta_coords_falls_back_to_sampled_weather_without_cell_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle_path = tmp_path / "bundle.pt"
+    feature_names = {
+        "bioclimate": ["bio_1"],
+        "landclass": [],
+        "terrain": [],
+        "temporal": ["temperature_2m_avg_24h"],
+        "other": [],
+    }
+
+    combined_head = CombinedSpeciesHead(embed_dim=4, species_count=1)
+
+    _write_inference_bundle(
+        bundle_path,
+        input_dim=4,
+        cell_table={},
+        feature_names=feature_names,
+        species_meta={101: {"name": "Alpha"}},
+        combined_head_state=combined_head.state_dict(),
+        combined_species_keys=[101],
+    )
+
+    def _fake_batch_sample_features(
+        coords: list[tuple[float, float]],
+        *,
+        raster_dataset_cache=None,
+        dem_dataset_cache=None,
+        temporal_mode="missing",
+        temporal_forecast_hours=None,
+        temporal_raster_cache=None,
+        profile=None,
+    ):
+        assert temporal_mode == "current"
+        return [{"features": torch.tensor([0.5, 3.0, 0.0, 0.0], dtype=torch.float32)} for _ in coords]
+
+    def _fake_score_combined_logits_tensor(
+        feature_tensor: torch.Tensor,
+        *,
+        score_batch_size: int,
+    ) -> list[torch.Tensor]:
+        temporal_values = feature_tensor[:, 1].cpu()
+        return [temporal_values.unsqueeze(1)]
+
+    monkeypatch.setattr(inference, "_batch_sample_features", _fake_batch_sample_features)
+    monkeypatch.setattr(inference, "_score_combined_logits_tensor", _fake_score_combined_logits_tensor)
+
+    inference.load_bundle(bundle_path)
+    ranked, sources = inference.rank_species_weather_delta_coords(
+        [(0.125, 0.125)],
+        top_k=1,
+        min_delta=-10.0,
+        score_batch_size=1,
+        include_source=True,
+        backed_species_only=False,
+    )
+
+    assert ranked[0] is not None
+    assert ranked[0][0]["delta_logit"] > 0.0
     assert sources == ["sampled_weather"]
 
 
@@ -2035,3 +2099,59 @@ def test_score_species_coords_accepts_sampled_feature_payloads(tmp_path: Path, m
 
     assert scores == [0.25]
     assert sources == ["sampled"]
+
+
+def test_batch_sample_raster_reads_compact_window_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    raster_path = tmp_path / "fake.tif"
+    raster_path.write_text("stub", encoding="utf-8")
+    observed_windows: list[tuple[int, int, int, int]] = []
+
+    class _FakeWindow:
+        def __init__(self, col_off: int, row_off: int, width: int, height: int) -> None:
+            self.col_off = col_off
+            self.row_off = row_off
+            self.width = width
+            self.height = height
+
+    class _FakeDataset:
+        nodata = None
+        width = 100
+        height = 100
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def index(self, lon: float, lat: float) -> tuple[int, int]:
+            return (int(round(lat * 10)), int(round(lon * 10)))
+
+        def read(self, indexes: int, window: _FakeWindow, boundless: bool = False):
+            observed_windows.append((window.row_off, window.col_off, window.height, window.width))
+            arr = np.empty((window.height, window.width), dtype=np.float32)
+            for row in range(window.height):
+                for col in range(window.width):
+                    arr[row, col] = float((window.row_off + row) * 1000 + (window.col_off + col))
+            return arr
+
+        def sample(self, xy):
+            raise AssertionError("compact window path should avoid ds.sample")
+
+        def close(self) -> None:
+            return None
+
+    fake_rasterio = SimpleNamespace(open=lambda path: _FakeDataset())
+    monkeypatch.setitem(sys.modules, "rasterio", fake_rasterio)
+    monkeypatch.setitem(sys.modules, "rasterio.windows", SimpleNamespace(Window=_FakeWindow))
+    monkeypatch.setattr(gis_lookup, "get_region_name", lambda lat, lon: "region-a")
+    monkeypatch.setattr(gis_lookup, "get_cog_path", lambda layer_id, lat, lon: raster_path)
+
+    values = inference._batch_sample_raster(
+        "bio_1",
+        [(1.0, 2.0), (1.1, 2.1), (1.2, 2.2)],
+        dataset_cache=None,
+    )
+
+    assert values == [10020.0, 11021.0, 12022.0]
+    assert observed_windows == [(10, 20, 3, 3)]

@@ -9,6 +9,7 @@ from PIL import Image
 import pytest
 
 from util import heatmap_tiles
+from util import inference
 from util import species_heatmap_feature_sources as sources
 from util import species_heatmap_scorers as scorers
 from util.tile_disk_cache import DiskTileCache
@@ -120,6 +121,8 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
         tile_size,
         feature_mode,
         cancel_check=None,
+        bypass_cache=False,
+        profile=None,
     ):
         rendered.append((z, x, y, tile_size, feature_mode))
         return _png_bytes(
@@ -142,6 +145,40 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
     assert image.size == (2, 2)
 
 
+def test_darwin_scorer_forwards_bypass_cache(monkeypatch):
+    observed: list[bool] = []
+
+    def _fake_render_heatmap_tile_bytes(
+        taxon_id,
+        z,
+        x,
+        y,
+        *,
+        tile_size,
+        feature_mode,
+        cancel_check=None,
+        bypass_cache=False,
+        profile=None,
+    ):
+        observed.append(bypass_cache)
+        return _png_bytes(
+            tile_size,
+            (
+                (255, 0, 0, 255),
+                (0, 255, 0, 255),
+                (0, 0, 255, 255),
+                (255, 255, 0, 255),
+            ),
+        )
+
+    monkeypatch.setattr("util.heatmap_tiles.render_heatmap_tile_bytes", _fake_render_heatmap_tile_bytes)
+
+    scorer = scorers.DarwinSpeciesHeatmapScorer(feature_mode="prefer_cell_table", max_tile_size=8)
+    scorer.render_runtime_tile_bytes(321, 3, 4, 5, tile_size=2, max_native_zoom=3, bypass_cache=True)
+
+    assert observed == [True]
+
+
 def test_render_heatmap_tile_bytes_uses_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -157,6 +194,7 @@ def test_render_heatmap_tile_bytes_uses_cache(
         score_batch_size: int,
         include_source: bool,
         cancel_check=None,
+        profile=None,
     ) -> tuple[list[float | None], None]:
         nonlocal call_count
         call_count += 1
@@ -204,3 +242,93 @@ def test_render_heatmap_tile_bytes_honors_cancel_check(
             tile_size=4,
             cancel_check=_cancel_check,
         )
+
+
+def test_render_heatmap_tile_bytes_can_bypass_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    call_count = 0
+
+    def _fake_score_species_coords(
+        species_key: int,
+        coords: list[tuple[float, float]],
+        *,
+        resolution_hint: float,
+        feature_mode: str,
+        score_batch_size: int,
+        include_source: bool,
+        cancel_check=None,
+        profile=None,
+    ) -> tuple[list[float | None], None]:
+        nonlocal call_count
+        call_count += 1
+        return [0.5 for _ in coords], None
+
+    monkeypatch.setattr(
+        heatmap_tiles,
+        "_HEATMAP_TILE_DISK_CACHE",
+        DiskTileCache(cache_dir=tmp_path, max_bytes=256 * 1024 * 1024),
+    )
+    monkeypatch.setattr(heatmap_tiles.inference, "bundle_cache_token", lambda: "bundle-a")
+    monkeypatch.setattr(heatmap_tiles.inference, "score_species_coords", _fake_score_species_coords)
+
+    heatmap_tiles.render_heatmap_tile_bytes(101, 3, 4, 5, tile_size=4, bypass_cache=True)
+    heatmap_tiles.render_heatmap_tile_bytes(101, 3, 4, 5, tile_size=4, bypass_cache=True)
+
+    assert call_count == 2
+
+
+def test_batch_sample_features_records_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    coords = [(10.0, 20.0), (11.0, 21.0), (12.0, 22.0)]
+    sampled_layers: list[str] = []
+
+    monkeypatch.setattr(inference, "_raw_feature_names", {"other": []})
+    monkeypatch.setattr(
+        inference, "_sampled_static_feature_names", lambda: ["elevation", "landcover", "bio_1", "slope"]
+    )
+    monkeypatch.setattr(inference, "_raw_temporal_feature_names", lambda: [])
+    monkeypatch.setattr(inference, "_resolve_sampling_workers", lambda: 1)
+    monkeypatch.setattr(inference, "_DEM_DERIVED", {"slope"})
+
+    def _fake_batch_sample_raster(name, target_coords, dataset_cache=None):
+        sampled_layers.append(name)
+        values_by_coord = {
+            "elevation": {(10.0, 20.0): 1.0, (11.0, 21.0): None, (12.0, 22.0): 3.0},
+            "landcover": {(10.0, 20.0): 1.0, (11.0, 21.0): None, (12.0, 22.0): 3.0},
+            "bio_1": {(10.0, 20.0): 1.0, (11.0, 21.0): None, (12.0, 22.0): 3.0},
+        }
+        return [values_by_coord[name][coord] for coord in target_coords]
+
+    monkeypatch.setattr(inference, "_batch_sample_raster", _fake_batch_sample_raster)
+    monkeypatch.setattr(
+        inference,
+        "_batch_compute_dem_derived",
+        lambda target_coords, dem_dataset_cache=None: [{"slope": 4.0} for _ in target_coords],
+    )
+    monkeypatch.setattr(
+        inference,
+        "transform_feature_matrices",
+        lambda raw_feature_template, raw_values, raw_masks, transform_spec: (raw_values, raw_masks, None),
+    )
+    monkeypatch.setattr(inference, "_coerce_model_input_batch", lambda feature_tensor, mask_tensor: feature_tensor)
+
+    profile = inference.SampleFeatureProfile()
+    payloads = inference._batch_sample_features(coords, profile=profile)
+
+    assert len(payloads) == 3
+    assert payloads[0] is not None
+    assert payloads[1] is None
+    assert payloads[2] is not None
+    assert sampled_layers == ["landcover", "elevation", "bio_1"]
+    assert profile.input_coord_count == 3
+    assert profile.prefilter_kept_count == 2
+    assert profile.prefilter_dropped_count == 1
+    assert profile.active_coord_count == 2
+    assert profile.static_layer_count == 3
+    assert profile.dem_layer_count == 1
+    assert profile.temporal_layer_count == 0
+    assert profile.prefilter_seconds >= 0.0
+    assert profile.dem_seconds >= 0.0
+    assert profile.matrix_fill_seconds >= 0.0
+    assert profile.transform_seconds >= 0.0

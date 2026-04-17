@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import logging
 import math
+import time
 
 from PIL import Image
 
 from util import heatmap_tiles, tiles
 from util.request_cancellation import CancelCheck
+
+
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 def _crop_tile_bytes(
@@ -74,6 +79,8 @@ class LegacySpeciesHeatmapScorer:
         tile_size: int,
         max_native_zoom: int,
         cancel_check: CancelCheck | None = None,
+        bypass_cache: bool = False,
+        profile: bool = False,
     ) -> bytes:
         if z <= max_native_zoom:
             return self.render_tile_bytes(
@@ -126,6 +133,8 @@ class DarwinSpeciesHeatmapScorer:
         *,
         tile_size: int,
         cancel_check: CancelCheck | None = None,
+        bypass_cache: bool = False,
+        profile: heatmap_tiles.DarwinHeatmapTileProfile | None = None,
     ) -> bytes:
         return heatmap_tiles.render_heatmap_tile_bytes(
             taxon_id,
@@ -135,6 +144,8 @@ class DarwinSpeciesHeatmapScorer:
             tile_size=tile_size,
             feature_mode=self.feature_mode,
             cancel_check=cancel_check,
+            bypass_cache=bypass_cache,
+            profile=profile,
         )
 
     def render_runtime_tile_bytes(
@@ -147,16 +158,43 @@ class DarwinSpeciesHeatmapScorer:
         tile_size: int,
         max_native_zoom: int,
         cancel_check: CancelCheck | None = None,
+        bypass_cache: bool = False,
+        profile: bool = False,
     ) -> bytes:
+        total_start = time.perf_counter()
+        tile_profile = (
+            heatmap_tiles.DarwinHeatmapTileProfile(
+                species_key=taxon_id,
+                request_z=z,
+                request_x=x,
+                request_y=y,
+                render_z=z,
+                render_x=x,
+                render_y=y,
+                tile_size=tile_size,
+                render_tile_size=tile_size,
+                feature_mode=self.feature_mode,
+                bypass_cache=bypass_cache,
+                max_native_zoom=max_native_zoom,
+            )
+            if profile
+            else None
+        )
         if z <= max_native_zoom:
-            return self.render_tile_bytes(
+            payload = self.render_tile_bytes(
                 taxon_id,
                 z,
                 x,
                 y,
                 tile_size=tile_size,
                 cancel_check=cancel_check,
+                bypass_cache=bypass_cache,
+                profile=tile_profile,
             )
+            if tile_profile is not None:
+                tile_profile.total_seconds = time.perf_counter() - total_start
+                heatmap_tiles.log_heatmap_tile_profile(tile_profile)
+            return payload
 
         max_parent_scale = max(1, self.max_tile_size // tile_size)
         max_parent_zoom_diff = int(math.floor(math.log2(max_parent_scale))) if max_parent_scale > 1 else 0
@@ -168,6 +206,12 @@ class DarwinSpeciesHeatmapScorer:
         subtile_x = x % scale
         subtile_y = y % scale
         parent_tile_size = tile_size * scale
+        if tile_profile is not None:
+            tile_profile.render_z = parent_zoom
+            tile_profile.render_x = parent_x
+            tile_profile.render_y = parent_y
+            tile_profile.render_tile_size = parent_tile_size
+            tile_profile.zoom_diff = zoom_diff
         parent_payload = self.render_tile_bytes(
             taxon_id,
             parent_zoom,
@@ -175,10 +219,13 @@ class DarwinSpeciesHeatmapScorer:
             parent_y,
             tile_size=parent_tile_size,
             cancel_check=cancel_check,
+            bypass_cache=bypass_cache,
+            profile=tile_profile,
         )
         if cancel_check is not None:
             cancel_check()
-        return _crop_tile_bytes(
+        crop_start = time.perf_counter()
+        payload = _crop_tile_bytes(
             parent_payload,
             scale=scale,
             subtile_x=subtile_x,
@@ -186,3 +233,8 @@ class DarwinSpeciesHeatmapScorer:
             parent_tile_size=parent_tile_size,
             tile_size=tile_size,
         )
+        if tile_profile is not None:
+            tile_profile.crop_seconds = time.perf_counter() - crop_start
+            tile_profile.total_seconds = time.perf_counter() - total_start
+            heatmap_tiles.log_heatmap_tile_profile(tile_profile)
+        return payload

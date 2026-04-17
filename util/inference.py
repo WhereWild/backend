@@ -13,6 +13,8 @@ from __future__ import annotations
 import math
 import os
 import logging
+import time
+from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
 from typing import Any, NamedTuple, cast
@@ -23,8 +25,10 @@ from util.request_cancellation import CancelCheck
 
 _feature_contract = import_module("scripts.machine_learning._compat").import_feature_contract()
 _feature_transforms = import_module("scripts.machine_learning.feature_transforms")
+FEATURE_GROUPS = _feature_contract.FEATURE_GROUPS
 _SAMPLED_FEATURE_GROUPS = _feature_contract.SAMPLED_FEATURE_GROUPS
 _UNSAMPLED_FEATURE_GROUPS = _feature_contract.UNSAMPLED_FEATURE_GROUPS
+feature_template_dict = _feature_contract.feature_template_dict
 normalize_feature_transform_spec = _feature_transforms.normalize_feature_transform_spec
 transform_feature_matrices = _feature_transforms.transform_feature_matrices
 
@@ -83,6 +87,50 @@ LOGGER = logging.getLogger(__name__)
 _MISSING_DATASET = object()
 
 
+@dataclass
+class SpeciesScoreProfile:
+    coord_count: int = 0
+    valid_feature_count: int = 0
+    unresolved_count: int = 0
+    cell_table_count: int = 0
+    sampled_count: int = 0
+    sample_chunk_size: int = 0
+    score_batch_size: int = 0
+    chunk_count: int = 0
+    feature_prepare_seconds: float = 0.0
+    model_score_seconds: float = 0.0
+    total_seconds: float = 0.0
+    sample_prefilter_seconds: float = 0.0
+    sample_static_sampling_seconds: float = 0.0
+    sample_dem_seconds: float = 0.0
+    sample_temporal_seconds: float = 0.0
+    sample_matrix_fill_seconds: float = 0.0
+    sample_transform_seconds: float = 0.0
+    sample_prefilter_kept_count: int = 0
+    sample_prefilter_dropped_count: int = 0
+    sample_active_coord_count: int = 0
+    sample_static_layer_count: int = 0
+    sample_dem_layer_count: int = 0
+    sample_temporal_layer_count: int = 0
+
+
+@dataclass
+class SampleFeatureProfile:
+    input_coord_count: int = 0
+    prefilter_kept_count: int = 0
+    prefilter_dropped_count: int = 0
+    active_coord_count: int = 0
+    static_layer_count: int = 0
+    dem_layer_count: int = 0
+    temporal_layer_count: int = 0
+    prefilter_seconds: float = 0.0
+    static_sampling_seconds: float = 0.0
+    dem_seconds: float = 0.0
+    temporal_seconds: float = 0.0
+    matrix_fill_seconds: float = 0.0
+    transform_seconds: float = 0.0
+
+
 def _raw_feature_group_names(group_name: str) -> list[str]:
     """Return ordered raw source feature names for one feature group."""
     if _raw_feature_names is None:
@@ -115,6 +163,34 @@ def _temporal_feature_span() -> tuple[int, int]:
     static_width = sum(len(_model_feature_group_names(group_name)) for group_name in _SAMPLED_FEATURE_GROUPS)
     temporal_width = len(_model_feature_group_names("temporal"))
     return static_width, static_width + temporal_width
+
+
+def _filtered_transform_spec_for_groups(group_names: set[str]) -> dict[str, Any] | None:
+    """Return the fitted transform spec limited to the selected raw feature groups."""
+    if _feature_transforms_spec is None:
+        return None
+
+    raw_template = feature_template_dict(_feature_transforms_spec.get("raw_feature_template", {}))
+    transformed_template = feature_template_dict(_feature_transforms_spec.get("transformed_feature_template", {}))
+    filtered_raw_template = {
+        group: list(raw_template.get(group, [])) if group in group_names else [] for group in FEATURE_GROUPS
+    }
+    filtered_transformed_template = {
+        group: list(transformed_template.get(group, [])) if group in group_names else [] for group in FEATURE_GROUPS
+    }
+    raw_feature_specs = _feature_transforms_spec.get("feature_specs", {})
+    allowed_features = {feature_name for group in group_names for feature_name in filtered_raw_template.get(group, [])}
+    filtered_feature_specs = {
+        feature_name: raw_feature_specs[feature_name]
+        for feature_name in allowed_features
+        if feature_name in raw_feature_specs
+    }
+    return {
+        "version": _feature_transforms_spec.get("version", "v1"),
+        "raw_feature_template": filtered_raw_template,
+        "transformed_feature_template": filtered_transformed_template,
+        "feature_specs": filtered_feature_specs,
+    }
 
 
 def _resolve_inference_device() -> torch.device:
@@ -438,6 +514,7 @@ def _prepare_feature_batch_for_coords(
     raster_dataset_cache: dict[tuple[str, str], Any] | None = None,
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
     cancel_check: CancelCheck | None = None,
+    sample_profile: SampleFeatureProfile | None = None,
 ) -> tuple[list[int], torch.Tensor | None, list[str | None] | None]:
     """Resolve model-ready feature rows for arbitrary coordinates."""
     native = _cell_size_deg
@@ -473,6 +550,7 @@ def _prepare_feature_batch_for_coords(
                 missing_coords,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
+                profile=sample_profile,
             )
             for i, cell in zip(missing_indices, sampled):
                 if cell is not None:
@@ -485,6 +563,7 @@ def _prepare_feature_batch_for_coords(
             coords,
             raster_dataset_cache=raster_dataset_cache,
             dem_dataset_cache=dem_dataset_cache,
+            profile=sample_profile,
         )
         for i, cell in enumerate(sampled):
             _check_cancel(cancel_check)
@@ -554,52 +633,87 @@ def score_species_coords(
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
     include_source: bool = False,
     cancel_check: CancelCheck | None = None,
+    profile: SpeciesScoreProfile | None = None,
 ) -> tuple[list[float | None], list[str | None] | None]:
     """Score one species for arbitrary coordinates.
 
     Returns one score slot per input coordinate. Coordinates that cannot be
     resolved to model-ready features are returned as ``None``.
     """
+    total_start = time.perf_counter()
     sample_chunk_size = _resolve_sample_chunk_size(score_batch_size)
     scores_per_coord: list[float | None] = [None] * len(coords)
-    feature_source_per_coord: list[str | None] | None = (
-        cast(list[str | None], [None] * len(coords)) if include_source else None
-    )
+    track_sources = include_source or profile is not None
+    tracked_sources: list[str | None] | None = cast(list[str | None], [None] * len(coords)) if track_sources else None
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
     dem_dataset_cache: dict[tuple[str, str], Any] = {}
     try:
         for chunk_start in range(0, len(coords), sample_chunk_size):
             _check_cancel(cancel_check)
+            if profile is not None:
+                profile.chunk_count += 1
             chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
+            prepare_start = time.perf_counter()
+            sample_profile = SampleFeatureProfile() if profile is not None else None
             valid_indices, feature_tensor, chunk_sources = _prepare_feature_batch_for_coords(
                 chunk_coords,
                 resolution_hint=resolution_hint,
-                include_source=include_source,
+                include_source=track_sources,
                 feature_mode=feature_mode,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
                 cancel_check=cancel_check,
+                sample_profile=sample_profile,
             )
-            if chunk_sources is not None and feature_source_per_coord is not None:
+            if profile is not None:
+                profile.feature_prepare_seconds += time.perf_counter() - prepare_start
+                if sample_profile is not None:
+                    profile.sample_prefilter_seconds += sample_profile.prefilter_seconds
+                    profile.sample_static_sampling_seconds += sample_profile.static_sampling_seconds
+                    profile.sample_dem_seconds += sample_profile.dem_seconds
+                    profile.sample_temporal_seconds += sample_profile.temporal_seconds
+                    profile.sample_matrix_fill_seconds += sample_profile.matrix_fill_seconds
+                    profile.sample_transform_seconds += sample_profile.transform_seconds
+                    profile.sample_prefilter_kept_count += sample_profile.prefilter_kept_count
+                    profile.sample_prefilter_dropped_count += sample_profile.prefilter_dropped_count
+                    profile.sample_active_coord_count += sample_profile.active_coord_count
+                    profile.sample_static_layer_count += sample_profile.static_layer_count
+                    profile.sample_dem_layer_count += sample_profile.dem_layer_count
+                    profile.sample_temporal_layer_count += sample_profile.temporal_layer_count
+            if chunk_sources is not None and tracked_sources is not None:
                 for local_index, source in enumerate(chunk_sources):
-                    feature_source_per_coord[chunk_start + local_index] = source
+                    tracked_sources[chunk_start + local_index] = source
             if feature_tensor is None or feature_tensor.numel() == 0:
                 continue
 
             _check_cancel(cancel_check)
+            score_start = time.perf_counter()
             chunk_scores = _score_species_feature_tensor(
                 species_key,
                 feature_tensor,
                 score_batch_size=score_batch_size,
                 cancel_check=cancel_check,
             )
+            if profile is not None:
+                profile.model_score_seconds += time.perf_counter() - score_start
             for local_index, score in zip(valid_indices, chunk_scores):
                 scores_per_coord[chunk_start + local_index] = score
     finally:
         _close_dataset_cache(raster_dataset_cache)
         _close_dataset_cache(dem_dataset_cache)
 
-    return scores_per_coord, feature_source_per_coord
+    if profile is not None:
+        profile.coord_count = len(coords)
+        profile.score_batch_size = score_batch_size
+        profile.sample_chunk_size = sample_chunk_size
+        profile.valid_feature_count = sum(score is not None for score in scores_per_coord)
+        profile.unresolved_count = len(coords) - profile.valid_feature_count
+        if tracked_sources is not None:
+            profile.cell_table_count = sum(source == "cell_table" for source in tracked_sources)
+            profile.sampled_count = sum(source == "sampled" for source in tracked_sources)
+        profile.total_seconds = time.perf_counter() - total_start
+
+    return scores_per_coord, tracked_sources if include_source else None
 
 
 def _score_combined_logits_tensor(
@@ -781,27 +895,59 @@ def rank_species_weather_delta_coords(
     try:
         for chunk_start in range(0, len(coords), sample_chunk_size):
             chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
-            sampled_payloads = _batch_sample_features(
-                chunk_coords,
-                raster_dataset_cache=raster_dataset_cache,
-                dem_dataset_cache=dem_dataset_cache,
-                temporal_mode="current",
-                temporal_forecast_hours=forecast_hours,
-                temporal_raster_cache=temporal_raster_cache,
-            )
-
             valid_indices: list[int] = []
             current_inputs: list[torch.Tensor] = []
             baseline_inputs: list[torch.Tensor] = []
-            for local_index, payload in enumerate(sampled_payloads):
-                if payload is None:
+            fallback_indices: list[int] = []
+            fallback_coords: list[tuple[float, float]] = []
+
+            temporal_raw_values, temporal_raw_masks = _sample_temporal_feature_matrices(
+                chunk_coords,
+                forecast_hours=forecast_hours,
+                temporal_raster_cache=temporal_raster_cache,
+            )
+            temporal_values, temporal_masks = _transform_temporal_feature_matrices(
+                temporal_raw_values,
+                temporal_raw_masks,
+            )
+
+            for local_index, (lat, lon) in enumerate(chunk_coords):
+                base_cell = _cell_lookup_by_bin(lat, lon, _cell_size_deg)
+                if base_cell is None:
+                    fallback_indices.append(local_index)
+                    fallback_coords.append((lat, lon))
                     continue
-                model_input = payload["features"]
+                base_input = _payload_model_input(base_cell)
+                current_input = _merge_temporal_into_model_input(
+                    base_input,
+                    temporal_values[local_index],
+                    temporal_masks[local_index],
+                )
                 valid_indices.append(local_index)
-                current_inputs.append(model_input)
-                baseline_inputs.append(_mask_temporal_model_input(model_input))
+                current_inputs.append(current_input)
+                baseline_inputs.append(_mask_temporal_model_input(base_input))
                 if feature_source_per_coord is not None:
-                    feature_source_per_coord[chunk_start + local_index] = "sampled_weather"
+                    feature_source_per_coord[chunk_start + local_index] = "cell_table_temporal"
+
+            if fallback_coords:
+                sampled_payloads = _batch_sample_features(
+                    fallback_coords,
+                    raster_dataset_cache=raster_dataset_cache,
+                    dem_dataset_cache=dem_dataset_cache,
+                    temporal_mode="current",
+                    temporal_forecast_hours=forecast_hours,
+                    temporal_raster_cache=temporal_raster_cache,
+                )
+                for fallback_offset, payload in enumerate(sampled_payloads):
+                    if payload is None:
+                        continue
+                    local_index = fallback_indices[fallback_offset]
+                    model_input = payload["features"]
+                    valid_indices.append(local_index)
+                    current_inputs.append(model_input)
+                    baseline_inputs.append(_mask_temporal_model_input(model_input))
+                    if feature_source_per_coord is not None:
+                        feature_source_per_coord[chunk_start + local_index] = "sampled_weather"
 
             if not current_inputs:
                 continue
@@ -1015,7 +1161,9 @@ def _batch_sample_raster(
     dataset_cache: dict[tuple[str, str], Any] | None = None,
 ) -> list[float | None]:
     """Sample one raster layer at many points, opening each region tile once."""
+    import numpy as np
     import rasterio
+    from rasterio.windows import Window
     from util.gis_lookup import get_cog_path, get_region_name
 
     results: list[float | None] = [None] * len(coords)
@@ -1025,6 +1173,40 @@ def _batch_sample_raster(
 
     def _write_samples_from_dataset(ds: Any, members: list[tuple[int, float, float]]) -> None:
         nodata = ds.nodata
+        indexed_members: list[tuple[int, int, int, float, float]] = []
+        for idx, lat, lon in members:
+            row, col = ds.index(lon, lat)
+            if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+                continue
+            indexed_members.append((idx, int(row), int(col), lat, lon))
+
+        if not indexed_members:
+            return
+
+        row_min = min(row for _, row, _, _, _ in indexed_members)
+        row_max = max(row for _, row, _, _, _ in indexed_members)
+        col_min = min(col for _, _, col, _, _ in indexed_members)
+        col_max = max(col for _, _, col, _, _ in indexed_members)
+        window_height = row_max - row_min + 1
+        window_width = col_max - col_min + 1
+        window_area = window_height * window_width
+
+        # For compact point clouds, one bounded read is substantially cheaper
+        # than many point samples. Fall back when the requested points are too sparse.
+        if window_area <= max(len(indexed_members) * 64, 4096):
+            window = Window(col_min, row_min, window_width, window_height)
+            band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
+            if band.shape != (window_height, window_width):
+                return
+            for idx, row, col, _lat, _lon in indexed_members:
+                val = band[row - row_min, col - col_min]
+                if nodata is not None and val == nodata:
+                    continue
+                if np.isnan(val):
+                    continue
+                results[idx] = float(val)
+            return
+
         xy = [(lon, lat) for _, lat, lon in members]
         idx_list = [i for i, _, _ in members]
         for arr, idx in zip(ds.sample(xy), idx_list):
@@ -1239,6 +1421,75 @@ def _mask_temporal_model_input(model_input: torch.Tensor) -> torch.Tensor:
     return masked
 
 
+def _sample_temporal_feature_matrices(
+    coords: list[tuple[float, float]],
+    *,
+    forecast_hours: int | None = None,
+    temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
+) -> tuple[Any, Any]:
+    """Sample raw temporal features and return aligned raw value and mask matrices."""
+    import numpy as np
+
+    temporal_names = _raw_temporal_feature_names()
+    n_coords = len(coords)
+    if not temporal_names:
+        empty = np.zeros((n_coords, 0), dtype=np.float32)
+        return empty, empty
+
+    values_out = np.zeros((n_coords, len(temporal_names)), dtype=np.float32)
+    masks_out = np.ones((n_coords, len(temporal_names)), dtype=np.float32)
+    for offset, layer_name in enumerate(temporal_names):
+        values = _sample_temporal_layer_points(
+            layer_name,
+            coords,
+            forecast_hours=forecast_hours,
+            temporal_raster_cache=temporal_raster_cache,
+        )
+        for idx, value in enumerate(values):
+            if value is None:
+                continue
+            values_out[idx, offset] = float(value)
+            masks_out[idx, offset] = 0.0
+    return values_out, masks_out
+
+
+def _transform_temporal_feature_matrices(raw_values: Any, raw_masks: Any) -> tuple[Any, Any]:
+    """Transform only temporal raw features into model-space temporal slices."""
+    temporal_template = {group: [] for group in FEATURE_GROUPS}
+    temporal_template["temporal"] = _raw_temporal_feature_names()
+    temporal_spec = _filtered_transform_spec_for_groups({"temporal"})
+    values_out, masks_out, _ = transform_feature_matrices(
+        raw_feature_template=temporal_template,
+        raw_values=raw_values,
+        raw_masks=raw_masks,
+        transform_spec=temporal_spec,
+    )
+    return values_out, masks_out
+
+
+def _merge_temporal_into_model_input(
+    base_model_input: torch.Tensor,
+    temporal_values: Any,
+    temporal_masks: Any,
+) -> torch.Tensor:
+    """Reuse static features from a base model input and overwrite only temporal slices."""
+    temporal_start, temporal_end = _temporal_feature_span()
+    merged = _mask_temporal_model_input(base_model_input)
+    if temporal_start >= temporal_end:
+        return merged
+
+    temporal_tensor = torch.as_tensor(temporal_values, dtype=torch.float32, device=merged.device)
+    temporal_mask_tensor = torch.as_tensor(temporal_masks, dtype=torch.float32, device=merged.device)
+    merged[temporal_start:temporal_end] = temporal_tensor
+    if _model_uses_mask:
+        model_dim = _model_feature_dim_from_names()
+        if model_dim is None:
+            raise ValueError("model feature names unavailable for temporal mask update")
+        mask_offset = model_dim
+        merged[mask_offset + temporal_start : mask_offset + temporal_end] = temporal_mask_tensor
+    return merged
+
+
 def _batch_sample_features(
     coords: list[tuple[float, float]],
     *,
@@ -1247,6 +1498,7 @@ def _batch_sample_features(
     temporal_mode: str = "missing",
     temporal_forecast_hours: int | None = None,
     temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
+    profile: SampleFeatureProfile | None = None,
 ) -> list[dict[str, torch.Tensor] | None]:
     """Batch-sample static features for many coordinates.
 
@@ -1265,6 +1517,8 @@ def _batch_sample_features(
     temporal_dim: int = len(temporal_names)
     other_dim: int = len(_raw_feature_names.get("other", []))
     n_coords = len(coords)
+    if profile is not None:
+        profile.input_coord_count = n_coords
 
     layer_vals: dict[str, np.ndarray] = {}
     sampled_static_names = _sampled_static_feature_names()
@@ -1291,35 +1545,32 @@ def _batch_sample_features(
                     arr[idx] = float(value)
             return arr
 
-        # For a single layer, thread-pool setup/teardown overhead tends to
-        # exceed any benefit, so keep that path serial.
-        if sampling_workers == 1 or len(names) <= 1:
-            for name in names:
-                sampled[name] = _values_to_array(
-                    _batch_sample_raster(name, target_coords, dataset_cache=raster_dataset_cache)
-                )
-            return sampled
-
-        from concurrent.futures import ThreadPoolExecutor
-
         def _sample_layer(layer_name: str) -> tuple[str, np.ndarray]:
             values = _batch_sample_raster(layer_name, target_coords, dataset_cache=raster_dataset_cache)
             return layer_name, _values_to_array(values)
 
+        if sampling_workers == 1 or len(names) <= 1:
+            for layer_name in names:
+                sampled_name, sampled_values = _sample_layer(layer_name)
+                sampled[sampled_name] = sampled_values
+            return sampled
+
+        from concurrent.futures import ThreadPoolExecutor
+
         max_workers = min(sampling_workers, len(names))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for name, values in pool.map(_sample_layer, names):
-                sampled[name] = values
+            for sampled_name, sampled_values in pool.map(_sample_layer, names):
+                sampled[sampled_name] = sampled_values
         return sampled
 
-    # Conservative prefilter to skip expensive full-layer sampling for obvious
-    # no-data points. These anchors are chosen because they are broad-coverage,
-    # static layers with good land/ocean discrimination, so a hit in any one of
-    # them is a strong signal to keep the coordinate for full sampling.
-    prefilter_names = [name for name in ("elevation", "landcover", "bio_1") if name in layer_names]
+    # no-data points. Prefer a single broad land-surface layer here because
+    # prefilter cost is now large enough that probing multiple anchor rasters
+    # outweighs the benefit for Darwin tile requests.
+    prefilter_names = [name for name in ["landcover"] if name in layer_names]
     active_indices = list(range(n_coords))
     active_coords = coords
     if prefilter_names:
+        prefilter_start = time.perf_counter()
         prefilter_vals = _sample_layers(coords, prefilter_names)
         layer_vals.update(prefilter_vals)
         keep_mask = [False] * n_coords
@@ -1329,32 +1580,46 @@ def _batch_sample_features(
                 if not np.isnan(val):
                     keep_mask[i] = True
         active_indices = [i for i, keep in enumerate(keep_mask) if keep]
+        if profile is not None:
+            profile.prefilter_seconds += time.perf_counter() - prefilter_start
+            profile.prefilter_kept_count = len(active_indices)
+            profile.prefilter_dropped_count = n_coords - len(active_indices)
         if not active_indices:
             return [None] * n_coords
         active_coords = [coords[i] for i in active_indices]
+    elif profile is not None:
+        profile.prefilter_kept_count = n_coords
+        profile.prefilter_dropped_count = 0
 
     remaining_layers = [name for name in layer_names if name not in layer_vals]
     if active_indices and remaining_layers:
+        static_start = time.perf_counter()
         sampled_remaining = _sample_layers(active_coords, remaining_layers)
         for name, vals in sampled_remaining.items():
             full_vals = np.full(n_coords, np.nan, dtype=np.float32)
             full_vals[np.asarray(active_indices, dtype=np.int64)] = vals
             layer_vals[name] = full_vals
+        if profile is not None:
+            profile.static_sampling_seconds += time.perf_counter() - static_start
 
     needs_dem = _DEM_DERIVED & set(sampled_static_names)
     dem_layer_vals: dict[str, np.ndarray] = {name: np.full(n_coords, np.nan, dtype=np.float32) for name in needs_dem}
     if needs_dem and active_indices:
+        dem_start = time.perf_counter()
         dem_active = _batch_compute_dem_derived(active_coords, dem_dataset_cache=dem_dataset_cache)
         for pos, global_idx in enumerate(active_indices):
             for name, value in dem_active[pos].items():
                 if name in dem_layer_vals:
                     dem_layer_vals[name][global_idx] = float(value)
+        if profile is not None:
+            profile.dem_seconds += time.perf_counter() - dem_start
 
     temporal_vals: dict[str, np.ndarray] = {}
     normalized_temporal_mode = temporal_mode.strip().lower()
     if normalized_temporal_mode not in {"missing", "current"}:
         raise ValueError("temporal_mode must be one of ['current', 'missing']")
     if normalized_temporal_mode == "current" and temporal_names:
+        temporal_start_time = time.perf_counter()
         for layer_name in temporal_names:
             values = _sample_temporal_layer_points(
                 layer_name,
@@ -1367,7 +1632,10 @@ def _batch_sample_features(
                 if value is not None:
                     arr[idx] = float(value)
             temporal_vals[layer_name] = arr
+        if profile is not None:
+            profile.temporal_seconds += time.perf_counter() - temporal_start_time
 
+    matrix_fill_start = time.perf_counter()
     for name, values in layer_vals.items():
         col_idx = static_feature_index[name]
         observed = ~np.isnan(values)
@@ -1394,6 +1662,10 @@ def _batch_sample_features(
             feature_matrix[observed, col_idx] = values[observed]
             mask_matrix[observed, col_idx] = 0.0
 
+    if profile is not None:
+        profile.matrix_fill_seconds += time.perf_counter() - matrix_fill_start
+
+    transform_start = time.perf_counter()
     transformed_values, transformed_masks, _ = transform_feature_matrices(
         raw_feature_template=_raw_feature_names,
         raw_values=feature_matrix,
@@ -1415,30 +1687,30 @@ def _batch_sample_features(
             out.append(None)
             continue
         out.append({"features": model_input_tensor[i], "mask": mask_tensor[i]})
+    if profile is not None:
+        profile.transform_seconds += time.perf_counter() - transform_start
+        profile.active_coord_count = len(active_indices)
+        profile.static_layer_count = len(layer_vals)
+        profile.dem_layer_count = len(needs_dem)
+        profile.temporal_layer_count = len(temporal_names) if normalized_temporal_mode == "current" else 0
     return out
 
 
-def load_bundle(path: str | Path) -> None:
-    """Load an inference bundle into module-level singletons.
-
-    Safe to call multiple times (reloads the bundle).  Should be called
-    once during application startup.
-    """
+def load_bundle(bundle_path: str | Path) -> None:
+    """Load an exported inference bundle into module-level runtime state."""
     global _bundle, _encoder, _heads, _combined_head, _cell_table, _cell_table_by_bin  # noqa: PLW0603
     global _cell_size_deg, _species_meta, _combined_species_keys, _combined_head_meta  # noqa: PLW0603
-    global _combined_species_head_class_indices, _raw_feature_names, _feature_names, _feature_transforms_spec  # noqa: PLW0603
-    global _input_dim, _model_uses_mask, _device, _bundle_source_path, _bundle_source_mtime_ns  # noqa: PLW0603
+    global _combined_species_head_class_indices, _raw_feature_names, _feature_names  # noqa: PLW0603
+    global _feature_transforms_spec, _input_dim, _model_uses_mask  # noqa: PLW0603
+    global _device, _bundle_source_path, _bundle_source_mtime_ns  # noqa: PLW0603
 
     _lazy_import_models()
+
+    bundle_path = Path(bundle_path).expanduser().resolve()
+    _bundle_source_path = str(bundle_path)
+    _bundle_source_mtime_ns = bundle_path.stat().st_mtime_ns if bundle_path.exists() else None
     _device = _resolve_inference_device()
     cell_table_device = _resolve_cell_table_device(_device)
-    bundle_path = Path(path).resolve()
-    try:
-        _bundle_source_mtime_ns = bundle_path.stat().st_mtime_ns
-    except OSError:
-        _bundle_source_mtime_ns = None
-    _bundle_source_path = str(bundle_path)
-
     # Keep bundle tensors on CPU at load time. The bundle includes a large
     # cell_table; mapping the full payload directly to CUDA can exhaust GPU
     # memory. We move only encoder/heads and runtime batches to _device.

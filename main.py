@@ -515,6 +515,8 @@ async def _render_species_heatmap_tile_response(
     tile_size: int,
     max_native_zoom: int,
     cache_seconds: int,
+    bypass_cache: bool = False,
+    profile: bool = False,
 ) -> Response:
     if await request.is_disconnected():
         return Response(status_code=204)
@@ -529,6 +531,8 @@ async def _render_species_heatmap_tile_response(
             y=y,
             tile_size=tile_size,
             max_native_zoom=max_native_zoom,
+            bypass_cache=bypass_cache,
+            profile=profile,
         )
     except tiles.TileRenderCancelled:
         log_tile_cancellation(
@@ -639,6 +643,14 @@ async def species_inference_heatmap_tile_route(
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
+    bypass_cache: bool = Query(
+        False,
+        description="If true, bypass Darwin tile disk cache for this request.",
+    ),
+    profile: bool = Query(
+        False,
+        description="If true, emit Darwin per-request timing and source counters to the server log.",
+    ),
 ) -> Response:
     """Render a species heatmap tile as PNG."""
     if not inference.is_loaded():
@@ -658,6 +670,8 @@ async def species_inference_heatmap_tile_route(
         tile_size=tile_size,
         max_native_zoom=max_native_zoom,
         cache_seconds=heatmap_tile_cache_seconds,
+        bypass_cache=bypass_cache,
+        profile=profile,
     )
 
 
