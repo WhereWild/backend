@@ -227,6 +227,11 @@ Before starting model training, verify:
 
 Install training dependencies with: `uv sync --extra ml`.
 
+Training architecture defaults:
+
+- encoder embedding dimension: `128`
+- encoder hidden dimension: `256`
+
 ### Stage B: Train shared encoder (self-supervised)
 
 Current Stage B objective is masked reconstruction of observed feature values.
@@ -247,6 +252,18 @@ uv run python -m scripts.machine_learning.train.cli encoder \
     --device cpu \
     --no-amp
 ```
+
+Default Stage B settings:
+
+- epochs: `50`
+- batch size: `32768`
+- learning rate: `1e-3`
+- weight decay: `1e-4`
+- data mode: `chunk-cached`
+- chunk rows: `400000`
+- prefetch chunks: `3`
+- adaptive prefetch: enabled
+- shuffle mode: `block`
 
 ### Stage C: Train per-species PU heads
 
@@ -284,6 +301,23 @@ Notes:
 - `--combined-head-only` requires an existing `species_heads.pt` in the Stage C output directory.
 - That checkpoint must come from a normal Stage C run written by the current codepath so encoder-checkpoint metadata is available for compatibility checks.
 - This mode preserves existing per-species heads and metadata, retrains only the shared combined head, and writes the updated combined-head payload back into the same checkpoint.
+
+Default Stage C settings:
+
+- minimum positives per species: `50`
+- head epochs: `50`
+- head learning rate: `1e-2`
+- head weight decay: `1e-3`
+- combined head: disabled by default
+
+Stage C training materializes frozen encoder embeddings to on-disk memmaps so
+head training does not need to recompute encoder outputs on every pass.
+
+Common cache artifacts:
+
+- `_heads_train_cache/train_embeddings.f16.mmap`
+- `_heads_val_cache/val_embeddings.f16.mmap`
+- `species_heads.pt`
 
 ### Both stages sequentially
 
@@ -349,6 +383,16 @@ If `feature_template.json` is missing (for example older preprocessed datasets),
 to deriving catalog-backed raw feature names from the GIS catalog; uncatalogued `other` names still
 require the saved template. Without `feature_transforms.json`, export can still build a bundle, but
 runtime sampled inference falls back to identity feature handling rather than the fitted transform path.
+
+Preprocessing summary for the exported dataset:
+
+1. Standardize raw observations and required metadata.
+2. Snap observations to `cell_id` and derive split metadata.
+3. Join static GIS context.
+4. Join temporal context by `(cell_id, year_month)`.
+5. Fit train-split feature transforms.
+6. Write transformed vectors, masks, and metadata to split-partitioned parquet.
+7. Generate pooled unlabeled/background rows for PU training when enabled.
 
 ## 6. Run inference / serve the API
 

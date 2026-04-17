@@ -12,11 +12,18 @@ The Darwin species heatmap route renders tiles through:
 3. `util.heatmap_tiles.render_heatmap_tile_bytes(...)`
 4. `util.inference.score_species_coords(...)`
 
-This path already includes chunked inference batching and parent-tile reuse for
-deep zoom, but it does not currently use the shared tile cache or
-cancellation-aware helpers added for the legacy tile stack.
+This path now includes:
 
-## Recommended Port Order
+- disk-backed Darwin tile caching with bundle-aware cache invalidation;
+- request cancellation support through the Darwin tile render path;
+- parent-tile reuse for deep zoom;
+- request-scoped profiling and cache bypass controls for targeted testing.
+
+The main remaining work is no longer basic parity with the legacy tile stack.
+It is reducing raster-read cost, deciding how to handle live temporal inputs on
+the tile route, and adding backpressure for bursty deep-zoom parent renders.
+
+## Port Status And Remaining Work
 
 ### 1. Add Darwin tile caching
 
@@ -123,11 +130,11 @@ We should be able to determine whether Darwin inference is primarily limited by:
 - single-core CPU saturation;
 - multi-core CPU saturation.
 
-The current code already exposes useful runtime controls such as inference
-device selection, sampling worker count, and sampling chunk size, but it does
-not yet emit enough stage-level timing to attribute slowness confidently.
+The current code now exposes both runtime controls and request-level timing,
+which is enough to attribute the dominant Darwin tile bottleneck with much more
+confidence than before.
 
-### Current limitation
+### Implemented instrumentation
 
 Today we can tune:
 
@@ -136,43 +143,52 @@ Today we can tune:
 - `WHEREWILD_INFERENCE_SAMPLE_WORKERS`;
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`.
 
-What we do not yet have is per-request timing for the major phases of the
-Darwin path. Without that, optimization discussions stay speculative.
+And we now have request-scoped Darwin profiling via the tile route:
 
-### Recommended profiling plan
+- `profile=true` to emit structured per-request timing and counters;
+- `bypass_cache=true` to force uncached measurement of one tile request.
 
-#### 1. Add request-level timing inside the Darwin path
+The current profiling output includes:
 
-Instrument the main phases of a heatmap request and log elapsed wall time for
-each phase, along with request shape metadata.
+- cache lookup, coordinate generation, resolution-hint, scoring total,
+  colorization, PNG encode, cache write, crop, and total request time;
+- sampled-feature phase splits for prefilter, static sampling, DEM-derived
+  work, temporal sampling, matrix fill, and feature transform;
+- coordinate and feature-source counters such as cell-table hits, sampled
+  fallbacks, chunk count, sample chunk size, and score batch size;
+- RSS snapshots before score, after score, and after render.
 
-Recommended phases:
+### Profiling result so far
 
-1. tile cache lookup;
-2. coordinate generation and parent-tile reuse;
-3. cell-table resolution versus sampled fallback;
-4. raster sampling;
-5. feature assembly and transform;
-6. encoder forward pass;
-7. per-species head scoring;
-8. PNG encoding;
-9. cache write.
+Profiling on the current hot Darwin tile class shows:
 
-Recommended counters per request:
+- model scoring is small relative to feature preparation;
+- the dominant remaining cost is raster work, especially static sampling and
+  the runtime prefilter;
+- increasing sample chunk size to a single giant chunk raised RSS and did not
+  improve total request time materially;
+- bounded-window raster reads for compact point clouds produced a meaningful
+  win;
+- simplifying the runtime prefilter to a single `landcover` gate produced
+  another meaningful win.
 
-- total coordinates;
-- number of exact cell-table hits;
-- number of sampled coordinates;
-- score batch size;
-- sample chunk size;
-- sampling worker count;
-- feature mode;
-- whether temporal sampling was used.
+In other words, the current Darwin tile bottleneck is no longer speculative.
+It is primarily raster sampling work rather than the model forward path.
 
-Also capture process RSS before and after the expensive phases so we can spot
-memory growth or paging pressure during hot requests.
+### Why this matters
 
-#### 2. Pair application timings with system measurements
+This shifts the priority order of Darwin optimization work.
+
+The next likely wins are things like:
+
+- cheaper serving-time validity masks;
+- fewer static raster reads per uncached tile;
+- better temporal-raster reuse if live temporal tile inference is enabled.
+
+The next likely wins are not larger sampling chunks or broad changes to model
+batching.
+
+### Optional follow-up measurements
 
 When running a representative hot tile and cold tile, collect Linux process and
 system metrics in parallel.
@@ -186,54 +202,84 @@ Recommended tools:
 - `perf stat` when we need stronger evidence about CPU utilization,
   instructions, cache misses, and scaling behavior.
 
-#### 3. Classify the bottleneck from the measurements
+## Next Raster-Work Reduction Candidate
 
-Use the combined app-level and system-level data to distinguish the dominant
-limiter.
+Recent Darwin tile profiling points to raster work, not model scoring, as the
+main remaining latency source. After the compact-window sampling change and the
+landcover-only runtime prefilter, the next candidate optimization is a derived
+serving-validity mask.
 
-Signs of SSD or disk bottleneck:
+### Proposal
 
-- request time is concentrated in cell lookup or raster sampling phases;
-- read I/O or device utilization is high;
-- CPU utilization stays modest while requests stall.
+Build one shared Darwin validity mask raster per GIS region tile and use it as
+the first prefilter before full static feature sampling.
 
-Signs of RAM bottleneck:
+This mask should answer only:
 
-- RSS grows materially during requests;
-- page faults, reclaim, or swap activity appear;
-- latency becomes unstable under repeated requests.
+- can the backend build a usable Darwin static feature vector here?
 
-Signs of single-core CPU bottleneck:
+It should not encode per-species suitability or range assumptions.
 
-- one core is saturated while aggregate CPU usage remains modest;
-- profiling shows one dominant hot stack;
-- raising worker count does not materially improve latency.
+### Recommended first version
 
-Signs of multi-core CPU bottleneck:
+- Build the mask from `landcover` only.
+- Store it with the GIS data under `data/gis/regions/...`, not under
+  `checkpoints`.
+- Use it to replace the current runtime landcover prefilter read, not sit
+  alongside it.
 
-- many cores are busy during inference;
-- throughput improves with worker count or chunk tuning until it plateaus;
-- system CPU is high without corresponding disk saturation.
+Why start there:
 
-### Why this matters
+- the current fastest prefilter already reduced runtime to a single landcover
+  gate;
+- the earlier shadow audit found no rescued points on the profiled tile from
+  the old `elevation|bio_1` fallback path;
+- landcover-only keeps the artifact cheap to build and easy to audit.
 
-This profiling pass is what allows targeted fixes instead of generic ones.
+### Why not build it from all three gate layers first
 
-For example:
+Do not start by baking `landcover`, `elevation`, and `bio_1` into the mask.
 
-- if disk dominates, focus on process-wide raster caches or better serving
-  artifacts;
-- if memory dominates, focus on bundle layout and allocation behavior;
-- if single-core CPU dominates, focus on hot-loop Python and model batching;
-- if multi-core CPU dominates, focus on concurrency limits, worker tuning, and
-  backpressure.
+Reasons:
 
-### Profiling conclusion
+- `dem.tif` dominates the static raster corpus and would make mask generation a
+  much heavier job;
+- adding `bio_1` couples the artifact to broader climate coverage rather than
+  the narrow serving-validity question;
+- a stricter multi-layer rule is harder to reason about if it drops valid
+  cells.
 
-Yes, Darwin inference can be profiled deeply enough to answer whether the main
-limit is SSD, RAM, single-core CPU, or multi-core CPU. The missing piece is a
-small amount of request-level instrumentation in the inference path so that the
-system metrics can be interpreted against concrete application phases.
+If later audits show real false negatives, add `elevation` before considering
+`bio_1`.
+
+### Expected impact
+
+This is a plausible next speed win because the current prefilter still costs on
+the order of `1.4-1.6s` on the profiled Darwin tile class. The expected gain is
+not guaranteed, but a binary validity mask could save a substantial fraction of
+that time if it materially reduces raster bytes read and replaces the runtime
+landcover gate.
+
+### Expected artifact cost
+
+Based on the current regioned GIS layout:
+
+- there are 648 region directories under `data/gis/regions`;
+- compressed `landcover.tif` tiles total about `29.5 GB` across regions;
+- compressed `dem.tif` tiles total about `555.9 GB` across regions.
+
+That suggests a landcover-only binary validity mask should be modest relative
+to the rest of the GIS stack, likely low single-digit GB total, and should be
+possible to generate in tens of minutes rather than hours on local storage.
+
+### Validation plan
+
+Before enabling the mask by default:
+
+1. generate the landcover-only mask;
+2. compare keep/drop decisions against the current runtime gate on a sample of
+   representative tiles;
+3. only widen the mask rule if the audit shows meaningful false negatives.
 
 ## Live Temporal Darwin Support
 
@@ -247,8 +293,10 @@ support into the species heatmap route and cache model.
   and temporal missing masks.
 - `util.inference._batch_sample_features(...)` already supports temporal
   sampling via `temporal_mode` and `temporal_forecast_hours`.
-- `util.inference.rank_species_weather_delta_coords(...)` already uses the
-  live-temporal path for weather-delta ranking.
+- `util.inference.rank_species_weather_delta_coords(...)` now reuses static
+  cell-table inputs when available and overwrites only the temporal feature
+  span with live temporal values, falling back to sampled weather only when the
+  cell table cannot serve the coordinate.
 - The Darwin heatmap path still calls `score_species_coords(...)` without any
   route-level temporal mode or forecast-hour input.
 - The current Darwin heatmap cache key is bundle-aware, but not aware of
@@ -279,7 +327,7 @@ Today Darwin often serves features from the precomputed cell table when
 `feature_mode` prefers it. Those cached rows do not automatically reflect live
 weather raster updates.
 
-There are two viable approaches:
+There are two viable approaches for the tile route:
 
 1. Force sampled features whenever live temporal data is requested.
 2. Keep static features from the cell table, then overwrite only the temporal
@@ -287,12 +335,13 @@ There are two viable approaches:
 
 The first approach is simpler.
 The second approach is likely better for performance because it preserves the
- main benefit of the cell table while still allowing fresh temporal inputs.
+main benefit of the cell table while still allowing fresh temporal inputs.
 
 Recommended direction:
 
-- Prefer the hybrid approach: reuse cell-table static features and replace the
-  temporal slice only.
+- Prefer the hybrid approach on the tile route as well, because it already
+  works in the weather-delta path and is the best fit for Darwin's current
+  serving architecture.
 
 #### 3. Add temporal-aware cache versioning
 
@@ -322,9 +371,10 @@ That increases the value of:
 
 1. Add `temporal_mode` and `forecast_hours` plumbing to the Darwin heatmap
    route and inference entrypoints.
-2. Start with a sampled-only implementation if a fast correctness path is
-   needed.
-3. Add the hybrid cell-table-plus-live-temporal path for performance.
+2. Reuse the existing hybrid static-reuse plus temporal-overwrite pattern from
+  the weather-delta path.
+3. Keep a sampled-only fallback path for coordinates not covered by the cell
+  table.
 4. Extend Darwin tile cache keys with temporal version inputs.
 5. Validate deep-zoom behavior and cache hit rates under rapid pan and zoom.
 
@@ -333,16 +383,19 @@ That increases the value of:
 Feeding live temporal data into Darwin does not require a new model format or
 new temporal sampling system. It mostly requires exposing the existing temporal
 sampling controls on the heatmap route, deciding how they interact with
-cell-table reuse, and making the Darwin tile cache aware of temporal raster
-freshness.
+cell-table reuse on the tile path, and making the Darwin tile cache aware of
+temporal raster freshness.
 
 ## Darwin Prior Calibration Fix
 
-Recent inspection of the live canary-plants inference bundle suggests that the
-current Darwin per-species heads can become badly overconfident for broadly
-distributed or well-supported taxa.
+This work is no longer a proposal. It has been implemented in the Darwin
+training path and documented here as completed calibration work.
 
-For taxon `10818007`, the loaded bundle metadata shows:
+Recent inspection of the pre-fix canary-plants inference bundle had suggested
+that the old Darwin per-species heads could become badly overconfident for
+broadly distributed or well-supported taxa.
+
+For taxon `10818007`, the pre-fix bundle metadata showed:
 
 - `n_positives == n_unlabeled`;
 - `prior_pi == 0.5`;
@@ -359,59 +412,27 @@ This is consistent with the current training setup:
 That makes the sampled training ratio act like species prevalence, which is not
 the intended semantics of the class prior for online suitability scoring.
 
-### Recommended change
+### Implemented change
 
-Drop the old sampled-ratio prior path entirely.
+The old sampled-ratio prior path was dropped.
 
-Instead:
+Stage C head training now uses an explicit fixed prior configuration and stores
+that choice in model metadata.
 
-1. Add an explicit fixed prior configuration for Stage C head training.
-2. Train per-species Darwin heads with a conservative fixed `prior_pi`.
-3. Record the chosen prior directly in head metadata.
+Implemented behavior:
 
-Recommended initial value:
+- CLI support for `--fixed-prior`;
+- fixed-prior Stage C head training;
+- metadata persistence of `prior_pi` and `prior_mode = "fixed"`.
+
+Current default used for the canary workflow:
 
 - `fixed_prior = 0.05`
 
 This is intentionally conservative and should be treated as the first
 calibration pass, not the final answer for every taxon or dataset.
 
-### Concrete implementation
-
-#### 1. Replace sampled-ratio prior estimation in Stage C
-
-Update `scripts/machine_learning/train/train_heads.py` so that Stage C no
-longer computes `prior_pi` from:
-
-- `n_species_positives`
-- `n_species_total_rows`
-- `global_positive_rate`
-
-The current `estimate_prior(...)` path should be removed rather than retained
-behind a flag.
-
-#### 2. Add explicit fixed-prior arguments to the CLI
-
-Extend `scripts/machine_learning/train/cli.py` with arguments such as:
-
-- `--fixed-prior`
-
-The Stage C code should require this value explicitly or use a clear default.
-
-Recommended default for the canary workflow:
-
-- `--fixed-prior 0.05`
-
-#### 3. Persist the prior choice in metadata
-
-When writing `species_meta` in `species_heads.pt`, store at least:
-
-- `prior_pi`
-- `prior_mode = "fixed"`
-
-Do not preserve the old sampled-ratio estimate as a supported alternate mode.
-
-### Why this is the lowest-risk fix
+### Why this was the lowest-risk fix
 
 - It changes only Stage C head training.
 - It does not require rebuilding the preprocessed parquet dataset.
@@ -420,14 +441,11 @@ Do not preserve the old sampled-ratio estimate as a supported alternate mode.
 - It makes Darwin calibration experiments cheap because only heads need to be
   retrained and re-exported.
 
-### Suggested workflow
+### Current status
 
-1. Update Stage C training to use a fixed prior only.
-2. Retrain Darwin heads for `canary_plants`.
-3. Export a fresh `inference_bundle.pt`.
-4. Re-run the same point probes for Great Salt Lake and known observations.
-5. If scores remain implausibly broad, then investigate broader unlabeled or
-   background sampling as the next training change.
+- Implemented in the training and export path.
+- Model documentation has been updated to reflect fixed-prior behavior.
+- Focused regression tests for the fixed-prior path are in place.
 
 ### Open question after this fix
 

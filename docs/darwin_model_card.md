@@ -31,11 +31,6 @@ The encoder implementation is a tabular residual MLP defined in [scripts/machine
 - two residual blocks
 - output projection to a fixed embedding
 
-Default dimensions in the training CLI:
-
-- embedding dimension: `128`
-- hidden dimension: `256`
-
 ### 2.2 Species heads
 
 Per-species binary heads are trained on top of the frozen encoder embedding.
@@ -66,16 +61,6 @@ The training dataset stores transformed vectors and aligned missing masks for ea
 - `terrain_features` and `terrain_missing_mask`
 - `temporal_features` and `temporal_missing_mask`
 - `other_features` and `other_missing_mask`
-
-The preprocessing flow:
-
-1. Standardize raw observations and required metadata.
-2. Snap observations to `cell_id` and derive split metadata.
-3. Join static GIS context.
-4. Join temporal context by `(cell_id, year_month)`.
-5. Fit train-split feature transforms.
-6. Write transformed vectors, masks, and metadata to split-partitioned parquet.
-7. Generate pooled unlabeled/background rows for PU training when enabled.
 
 Missingness is represented explicitly through masks rather than by training on sentinel-filled feature values.
 
@@ -114,47 +99,17 @@ $$
 
 where `f(x) = H_s(E(x))`.
 
-## 5. Training Stages
+## 5. Training Summary
 
-### 5.1 Stage B: encoder training
+Training proceeds in two stages:
 
-Encoder training uses masked reconstruction of observed features.
+- Stage B pretrains the shared encoder with masked reconstruction of observed
+  feature values.
+- Stage C freezes the encoder and trains per-species PU heads on cached
+  embeddings, with an optional combined head for cross-species ranking.
 
-- encoder: [SharedEncoder in model.py](../scripts/machine_learning/train/model.py)
-- auxiliary head: [AuxDecoder in model.py](../scripts/machine_learning/train/model.py)
-- loss: reconstruction over observed feature values using the stored masks
-
-Training entrypoint: [scripts/machine_learning/train/cli.py](../scripts/machine_learning/train/cli.py)
-
-Default encoder training settings:
-
-- epochs: `50`
-- batch size: `32768`
-- learning rate: `1e-3`
-- weight decay: `1e-4`
-- data mode: `chunk-cached`
-- chunk rows: `400000`
-- prefetch chunks: `3`
-- adaptive prefetch: enabled
-- shuffle mode: `block`
-
-### 5.2 Stage C: species head training
-
-Head training freezes the encoder, materializes train and validation embeddings to on-disk memmaps, and trains per-species PU heads over those cached embeddings.
-
-- train embeddings cache: `_heads_train_cache/train_embeddings.f16.mmap`
-- validation embeddings cache: `_heads_val_cache/val_embeddings.f16.mmap`
-- trained species heads: `species_heads.pt`
-
-Default head-training settings:
-
-- minimum positives per species: `50`
-- head epochs: `50`
-- head learning rate: `1e-2`
-- head weight decay: `1e-3`
-- combined head: disabled by default
-
-The memmap caches are performance artifacts used to avoid recomputing encoder outputs for every head-training pass.
+The cached embeddings are a training-time performance detail used to avoid
+recomputing encoder outputs on every head-training pass.
 
 ## 6. Exported Bundle
 
@@ -171,9 +126,14 @@ Bundle contents include:
 - transformed model feature names
 - fitted feature transform metadata
 
-Export entrypoint: [scripts/machine_learning/train/export.py](../scripts/machine_learning/train/export.py)
-
 This allows runtime inference to reconstruct model-ready inputs from sampled raw features using the same fitted transform specification used during preprocessing.
+
+Important serving detail:
+
+- the exported cell table is observation-derived coverage from the training
+  dataset, not a dense global grid;
+- coordinates outside that observed cell coverage still require runtime GIS
+  sampling.
 
 ## 7. Inference
 
@@ -183,6 +143,13 @@ The server loads the exported bundle once and then scores requests by either:
 
 - looking up precomputed cell-table entries for known cells, or
 - sampling raw GIS and temporal features for arbitrary coordinates, transforming them with the saved transform metadata, and then scoring the resulting model input
+
+For heatmap scoring, feature-source selection is resolution-dependent:
+
+- at native-or-coarser resolution, inference prefers the exported cell table
+  and falls back to sampled GIS features when allowed;
+- at finer-than-native resolution, inference prefers sampled GIS features when
+  the bundle and runtime support them, with cell-table fallback when needed.
 
 Static sampled feature groups:
 
@@ -200,6 +167,21 @@ Temporal inference supports two modes:
 - `missing`: temporal channels remain masked
 - `current`: temporal rasters are sampled, transformed, and inserted into the model input
 
+Current route-level behavior is more limited than the inference layer:
+
+- the general inference helpers support both temporal modes;
+- the normal Darwin tile heatmap route still serves the static path and does
+  not yet expose route-level temporal controls;
+- the weather-delta ranking path already uses live temporal inference.
+
+The weather-delta path uses a hybrid serving strategy when possible:
+
+- reuse static features from the exported cell table;
+- sample and transform only the temporal slice;
+- overwrite the temporal span in the model input;
+- fall back to fully sampled weather features only when the coordinate is not
+  covered by the cell table.
+
 Inference defaults to CUDA when available and otherwise falls back to CPU. Device placement can be overridden through runtime environment variables.
 
 ## 8. Data Splits and Validation
@@ -212,10 +194,15 @@ Schema validation is performed with the training-schema validation script agains
 
 ## 9. Operational Notes
 
-- Preprocessing writes `_meta/feature_template.json`, `_meta/feature_transforms.json`, and `_meta/uncatalogued_columns.json`.
-- Resume-from-staging preserves these metadata files so interrupted large preprocess runs can be published safely.
-- Background generation uses pooled same-split donor rows and a configurable `--background-ratio`.
-- The default background ratio is `1.0`, which yields one unlabeled/background row per positive row.
+- Runtime inference can score from either cell-table features or sampled GIS
+  features depending on request resolution and bundle support.
+- The exported bundle is self-contained for serving, but sampled fallback still
+  depends on runtime access to GIS rasters and temporal rasters.
+- Device placement can be controlled with runtime environment variables for the
+  main inference path and cell-table placement.
+
+Detailed preprocessing, training, export, and CLI defaults are documented in
+[docs/ml_scripts.md](ml_scripts.md).
 
 ## 10. Future Work
 
@@ -224,3 +211,4 @@ Schema validation is performed with the training-schema validation script agains
 - broader blocked validation protocols
 - hierarchical or taxonomically structured heads
 - smaller distilled deployment variants when needed
+- route-level live temporal Darwin tiles with temporal-aware cache versioning
