@@ -99,13 +99,12 @@ For species `s`:
 - unlabeled rows are sampled from other-species positive rows within the same split
 - candidate unlabeled rows are excluded when their `(cell_id, year_month)` collides with a positive row for `s`
 
-The per-species prior is estimated with empirical-Bayes smoothing:
+The per-species prior uses a fixed positive prior:
 
-`raw_s = n_pos_s / n_rows_s`
+`π_s = 0.05`
 
-`π_s = (n_pos_s + α * p_global) / (n_rows_s + α)`
-
-with `α = 50` and `p_global` equal to the train-split global positive rate.
+This fixed prior is applied to every per-species head during Stage C training and
+is recorded in checkpoint metadata as `prior_pi` with `prior_mode = "fixed"`.
 
 The PU objective is:
 

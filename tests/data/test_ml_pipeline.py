@@ -324,6 +324,29 @@ def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.Monk
     assert args.combined_head_only is True
 
 
+def test_train_cli_heads_parse_fixed_prior(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train-cli",
+            "heads",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--encoder-checkpoint",
+            str(tmp_path / "encoder_best.pt"),
+            "--fixed-prior",
+            "0.02",
+        ],
+    )
+
+    args = train_cli.parse_args()
+
+    assert args.stage == "heads"
+    assert args.fixed_prior == pytest.approx(0.02)
+
+
 def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     forwarded: dict[str, object] = {}
 
@@ -354,12 +377,15 @@ def test_train_cli_main_forwards_distinct_stage_c_batch_sizes(monkeypatch: pytes
             "8192",
             "--combined-head-batch-size",
             "256",
+            "--fixed-prior",
+            "0.02",
         ],
     )
 
     assert train_cli.main() == 0
     assert forwarded["batch_size"] == 8192
     assert forwarded["combined_head_batch_size"] == 256
+    assert forwarded["fixed_prior"] == pytest.approx(0.02)
     assert forwarded["train_combined_head"] is True
     assert forwarded["combined_head_only"] is True
 
@@ -434,6 +460,58 @@ def test_train_species_heads_combined_head_only_requires_existing_checkpoint(tmp
             device="cpu",
             train_combined_head=True,
             combined_head_only=True,
+        )
+
+
+def test_train_species_heads_rejects_non_positive_fixed_prior(tmp_path: Path) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+    _write_split_part(
+        data_root,
+        split="train",
+        part_name="train.parquet",
+        cell_id="train_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+    _write_split_part(
+        data_root,
+        split="val",
+        part_name="val.parquet",
+        cell_id="val_cell",
+        feature_values=[0.0] * n_groups,
+        mask_values=zero_mask,
+        species_key=101,
+        presence_label=1,
+    )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="fixed_prior must be > 0"):
+        train_heads.train_species_heads(
+            data_root=data_root,
+            encoder_checkpoint=encoder_checkpoint,
+            output_dir=output_dir,
+            fixed_prior=0.0,
+            device="cpu",
         )
 
 
@@ -598,6 +676,7 @@ def test_train_species_heads_combined_head_only_preserves_existing_species_heads
         encoder_checkpoint=encoder_checkpoint,
         output_dir=output_dir,
         min_positives=2,
+        fixed_prior=0.02,
         head_epochs=1,
         head_lr=1e-2,
         head_weight_decay=1e-3,
@@ -803,6 +882,7 @@ def test_train_species_heads_end_to_end_writes_combined_head_payload(tmp_path: P
         encoder_checkpoint=encoder_checkpoint,
         output_dir=output_dir,
         min_positives=2,
+        fixed_prior=0.02,
         head_epochs=1,
         head_lr=1e-2,
         head_weight_decay=1e-3,
@@ -827,6 +907,8 @@ def test_train_species_heads_end_to_end_writes_combined_head_payload(tmp_path: P
     assert checkpoint["combined_head_meta"]["val_loss"] is not None
     assert set(checkpoint["head_states"]) == {101, 202}
     assert set(checkpoint["species_meta"]) == {101, 202}
+    assert checkpoint["species_meta"][101]["prior_pi"] == pytest.approx(0.02)
+    assert checkpoint["species_meta"][101]["prior_mode"] == "fixed"
 
 
 def test_iter_combined_positive_batches_skips_positive_species_outside_eligible_set() -> None:

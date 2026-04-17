@@ -209,33 +209,18 @@ def _materialize_split_embeddings_memmap(
     return embeddings, species, labels, weights
 
 
-def estimate_prior(
-    n_species_positives: int,
-    n_species_total_rows: int,
-    global_positive_rate: float,
-    smoothing_strength: float = 50.0,
+def _resolve_fixed_prior(
+    fixed_prior: float,
+    *,
     min_prior: float = 1e-4,
     max_prior: float = 0.5,
 ) -> float:
-    """Estimate class prior pi_s for one species.
-
-    Uses an empirical-Bayes shrinkage estimate:
-
-        raw_s = n_pos_s / n_total_s
-        pi_s = (n_pos_s + smoothing_strength * global_positive_rate)
-               / (n_total_s + smoothing_strength)
-
-    This keeps species-specific signal while stabilizing rare-species priors.
-    The estimate is computed once per species from train-split counts, so
-    runtime overhead is negligible relative to head optimization.
-
-    Clamped to [min_prior, max_prior] for numerical stability.
-    """
-    if n_species_total_rows <= 0:
-        return min_prior
-    numerator = n_species_positives + smoothing_strength * global_positive_rate
-    denominator = n_species_total_rows + smoothing_strength
-    return float(np.clip(numerator / max(denominator, 1e-12), min_prior, max_prior))
+    """Validate and clamp the fixed positive prior used for Stage C head training."""
+    if not np.isfinite(fixed_prior):
+        raise ValueError("fixed_prior must be finite")
+    if fixed_prior <= 0.0:
+        raise ValueError("fixed_prior must be > 0")
+    return float(np.clip(fixed_prior, min_prior, max_prior))
 
 
 def _iter_combined_positive_batches(
@@ -333,6 +318,7 @@ def train_species_heads(
     output_dir: str | Path,
     *,
     min_positives: int = 50,
+    fixed_prior: float = 0.05,
     head_epochs: int = 50,
     head_lr: float = 1e-2,
     head_weight_decay: float = 1e-3,
@@ -353,6 +339,7 @@ def train_species_heads(
         encoder_checkpoint: path to saved encoder_best.pt from Stage B.
         output_dir: directory for saved species head weights.
         min_positives: skip species with fewer than this many positive samples.
+        fixed_prior: fixed positive prior pi used for every per-species PU head.
         head_epochs: epochs per species head.
         head_lr: learning rate for head optimizer.
         head_weight_decay: weight decay for head optimizer.
@@ -368,6 +355,7 @@ def train_species_heads(
     """
     if min_positives < 1:
         raise ValueError("min_positives must be >= 1")
+    fixed_prior = _resolve_fixed_prior(fixed_prior)
     if combined_head_min_positives < 1:
         raise ValueError("combined_head_min_positives must be >= 1")
     if combined_head_batch_size < 1:
@@ -458,9 +446,6 @@ def train_species_heads(
         embed_dim=embed_dim,
         cache_dir=train_cache_dir,
     )
-    n_total_positive_train = int(np.count_nonzero(train_labels == 1))
-    n_total_rows_train = int(train_labels.shape[0])
-    global_positive_rate = float(n_total_positive_train / n_total_rows_train) if n_total_rows_train > 0 else 0.0
 
     print("Computing validation embeddings...")
     val_cache_dir = output_dir / "_heads_val_cache"
@@ -550,11 +535,7 @@ def train_species_heads(
                 continue
 
             n_species_rows = n_pos + n_unl
-            prior_pi = estimate_prior(
-                n_pos,
-                n_species_rows,
-                global_positive_rate,
-            )
+            prior_pi = fixed_prior
 
             head = SpeciesHead(embed_dim=embed_dim).to(dev)
             optimizer = torch.optim.AdamW(head.parameters(), lr=head_lr, weight_decay=head_weight_decay)
@@ -612,8 +593,7 @@ def train_species_heads(
                 "n_unlabeled": n_unl,
                 "n_rows": n_species_rows,
                 "prior_pi": prior_pi,
-                "prior_global_positive_rate": global_positive_rate,
-                "prior_smoothing_strength": 50.0,
+                "prior_mode": "fixed",
                 "val_loss": best_val_loss if best_val_loss < float("inf") else None,
             }
 

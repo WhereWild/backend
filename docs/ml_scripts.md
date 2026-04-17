@@ -254,7 +254,8 @@ uv run python -m scripts.machine_learning.train.cli encoder \
 uv run python -m scripts.machine_learning.train.cli heads \
     --data-root ./data_ml/species_observation_canary_plants \
     --encoder-checkpoint ./checkpoints/canary_plants/encoder/encoder_best.pt \
-    --output-dir ./checkpoints/canary_plants/heads
+    --output-dir ./checkpoints/canary_plants/heads \
+    --fixed-prior 0.05
 ```
 
 Train Stage C with the shared combined species-ranking head enabled:
@@ -298,6 +299,7 @@ uv run python -m scripts.machine_learning.train.cli all \
 - `--hidden-dim`: encoder hidden layer dimension (default 256).
 - `--epochs`: encoder training epochs (default 50).
 - `--head-epochs`: epochs per species head (default 50).
+- `--fixed-prior`: fixed positive prior `pi` used for every per-species PU head (default 0.05).
 - `--combined-head-epochs`: epochs for the shared multiclass combined head (default 50).
 - `--batch-size`: shared batch-size flag.
     - Stage B (`encoder`): encoder training mini-batch size (default 32768).
@@ -336,6 +338,7 @@ The bundle contains:
 
 - Encoder architecture config and weights.
 - Per-species head weights and metadata (prior, val_loss, counts).
+- Per-species head metadata records `prior_pi` and `prior_mode="fixed"`.
 - Optional shared combined-head weights, species ordering, and metadata when trained with `--train-combined-head`.
 - Pre-computed geocell feature table (mean features per 0.25 deg cell from training data).
 - `raw_feature_names` for GIS/context sampling, `feature_names` for model input layout, and `feature_transforms` for reconstructing transformed runtime inputs. GIS sampling reconstructs catalog-backed static groups, while runtime paths can also fill temporal features from current rasters under `data/gis/temporal` when using the combined-head weather-delta helpers.

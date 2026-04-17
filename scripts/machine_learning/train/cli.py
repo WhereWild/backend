@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     heads_args.add_argument("--head-lr", type=float, default=1e-2, help="Species head learning rate.")
     heads_args.add_argument("--head-weight-decay", type=float, default=1e-3, help="Species head weight decay.")
     heads_args.add_argument(
+        "--fixed-prior",
+        type=float,
+        default=0.05,
+        help="Fixed positive prior pi used for every per-species PU head (default 0.05).",
+    )
+    heads_args.add_argument(
         "--train-combined-head",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -216,6 +222,7 @@ def main() -> int:
             encoder_checkpoint=checkpoint,
             output_dir=heads_dir,
             min_positives=args.min_positives,
+            fixed_prior=args.fixed_prior,
             head_epochs=args.head_epochs,
             head_lr=args.head_lr,
             head_weight_decay=args.head_weight_decay,
