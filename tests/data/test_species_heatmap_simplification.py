@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -10,6 +12,7 @@ import pytest
 
 from util import heatmap_tiles
 from util import inference
+from util import gis_lookup
 from util import species_heatmap_feature_sources as sources
 from util import species_heatmap_scorers as scorers
 from util.tile_disk_cache import DiskTileCache
@@ -290,6 +293,7 @@ def test_batch_sample_features_records_profile(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(inference, "_raw_temporal_feature_names", lambda: [])
     monkeypatch.setattr(inference, "_resolve_sampling_workers", lambda: 1)
     monkeypatch.setattr(inference, "_DEM_DERIVED", {"slope"})
+    monkeypatch.setattr(inference, "_sample_darwin_prefilter_keep_mask", lambda coords: ([True, False, True], 1))
 
     def _fake_batch_sample_raster(name, target_coords, dataset_cache=None):
         sampled_layers.append(name)
@@ -320,15 +324,94 @@ def test_batch_sample_features_records_profile(monkeypatch: pytest.MonkeyPatch) 
     assert payloads[0] is not None
     assert payloads[1] is None
     assert payloads[2] is not None
-    assert sampled_layers == ["landcover", "elevation", "bio_1"]
+    assert sampled_layers == ["elevation", "landcover", "bio_1"]
     assert profile.input_coord_count == 3
     assert profile.prefilter_kept_count == 2
     assert profile.prefilter_dropped_count == 1
     assert profile.active_coord_count == 2
-    assert profile.static_layer_count == 3
+    assert profile.static_layer_count == 4
     assert profile.dem_layer_count == 1
     assert profile.temporal_layer_count == 0
     assert profile.prefilter_seconds >= 0.0
     assert profile.dem_seconds >= 0.0
     assert profile.matrix_fill_seconds >= 0.0
     assert profile.transform_seconds >= 0.0
+
+
+def test_sample_darwin_prefilter_keep_mask_falls_back_to_landcover(monkeypatch: pytest.MonkeyPatch) -> None:
+    coords = [(10.0, 20.0), (11.0, 21.0), (12.0, 22.0)]
+
+    monkeypatch.setattr(
+        inference,
+        "_batch_sample_region_raster_filename",
+        lambda filename, target_coords, regions_root=inference._GIS_REGIONS_DIR: [1.0, None, 0.0],
+    )
+    monkeypatch.setattr(
+        inference,
+        "_batch_sample_raster",
+        lambda layer_id, target_coords, dataset_cache=None: [7.0] if target_coords == [coords[1]] else [],
+    )
+
+    keep_mask, prefilter_layer_count = inference._sample_darwin_prefilter_keep_mask(coords)
+
+    assert keep_mask == [True, True, False]
+    assert prefilter_layer_count == 2
+
+
+def test_batch_sample_region_raster_filename_uses_compact_window_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raster_path = tmp_path / "region-a" / "darwin_validity_mask.tif"
+    raster_path.parent.mkdir(parents=True, exist_ok=True)
+    raster_path.write_bytes(b"stub")
+
+    observed_windows: list[tuple[int, int, int, int]] = []
+
+    class _FakeWindow:
+        def __init__(self, col_off: int, row_off: int, width: int, height: int) -> None:
+            self.col_off = col_off
+            self.row_off = row_off
+            self.width = width
+            self.height = height
+
+    class _FakeDataset:
+        nodata = None
+        width = 512
+        height = 512
+
+        def index(self, lon: float, lat: float) -> tuple[int, int]:
+            return int(round(lat * 10)), int(round(lon * 10))
+
+        def read(self, indexes: int, window: _FakeWindow, boundless: bool = False):
+            observed_windows.append(
+                (window.row_off, window.col_off, window.height, window.width),
+            )
+            arr = np.empty((window.height, window.width), dtype=np.float32)
+            for row in range(window.height):
+                for col in range(window.width):
+                    arr[row, col] = float((window.row_off + row) * 1000 + (window.col_off + col))
+            return arr
+
+        def sample(self, xy):
+            raise AssertionError("compact window path should avoid ds.sample")
+
+        def __enter__(self) -> "_FakeDataset":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    fake_rasterio = SimpleNamespace(open=lambda path: _FakeDataset())
+    monkeypatch.setitem(sys.modules, "rasterio", fake_rasterio)
+    monkeypatch.setitem(sys.modules, "rasterio.windows", SimpleNamespace(Window=_FakeWindow))
+    monkeypatch.setattr(gis_lookup, "get_region_name", lambda lat, lon: "region-a")
+
+    values = inference._batch_sample_region_raster_filename(
+        "darwin_validity_mask.tif",
+        [(1.0, 2.0), (1.1, 2.1), (1.2, 2.2)],
+        regions_root=tmp_path,
+    )
+
+    assert values == [10020.0, 11021.0, 12022.0]
+    assert observed_windows == [(10, 20, 3, 3)]

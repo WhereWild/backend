@@ -394,7 +394,36 @@ Preprocessing summary for the exported dataset:
 6. Write transformed vectors, masks, and metadata to split-partitioned parquet.
 7. Generate pooled unlabeled/background rows for PU training when enabled.
 
-## 6. Run inference / serve the API
+## 6. Build Darwin validity masks
+
+Build regional Darwin serving-validity masks from `landcover.tif` tiles:
+
+```bash
+uv run python -m scripts.build_darwin_validity_mask
+```
+
+This writes one `darwin_validity_mask.tif` beside each region's
+`landcover.tif` under `data/gis/regions/<region>/`.
+
+Useful flags:
+
+- `--overwrite`: rewrite existing mask outputs.
+- `--regions-root /path/to/regions`: use a different region tree.
+
+Current semantics:
+
+- the first version is landcover-only;
+- a pixel is marked valid when the regional landcover raster has a usable
+    value there;
+- the Darwin runtime prefilter prefers the mask when present and falls back to
+    the landcover gate otherwise.
+
+If you want to audit the mask before relying on it broadly, compare its
+keep/drop decisions against the existing landcover gate on representative
+coordinates using `audit_mask_against_landcover(...)` in
+`scripts/build_darwin_validity_mask.py`.
+
+## 7. Run inference / serve the API
 
 ### Load the bundle in Python
 

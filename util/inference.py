@@ -62,6 +62,8 @@ _bundle_source_path: str | None = None
 _bundle_source_mtime_ns: int | None = None
 
 _TEMPORAL_RASTER_DIR = Path(__file__).parent.parent / "data" / "gis" / "temporal" / "rasters"
+_GIS_REGIONS_DIR = Path(__file__).parent.parent / "data" / "gis" / "regions"
+_DARWIN_VALIDITY_MASK_FILENAME = "darwin_validity_mask.tif"
 _TEMPORAL_WINDOW_LABELS: dict[int, str] = {
     1: "1h",
     8: "8h",
@@ -1163,59 +1165,12 @@ def _batch_sample_raster(
     """Sample one raster layer at many points, opening each region tile once."""
     import numpy as np
     import rasterio
-    from rasterio.windows import Window
     from util.gis_lookup import get_cog_path, get_region_name
 
     results: list[float | None] = [None] * len(coords)
     groups: dict[str, list[tuple[int, float, float]]] = {}
     for i, (lat, lon) in enumerate(coords):
         groups.setdefault(get_region_name(lat, lon), []).append((i, lat, lon))
-
-    def _write_samples_from_dataset(ds: Any, members: list[tuple[int, float, float]]) -> None:
-        nodata = ds.nodata
-        indexed_members: list[tuple[int, int, int, float, float]] = []
-        for idx, lat, lon in members:
-            row, col = ds.index(lon, lat)
-            if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
-                continue
-            indexed_members.append((idx, int(row), int(col), lat, lon))
-
-        if not indexed_members:
-            return
-
-        row_min = min(row for _, row, _, _, _ in indexed_members)
-        row_max = max(row for _, row, _, _, _ in indexed_members)
-        col_min = min(col for _, _, col, _, _ in indexed_members)
-        col_max = max(col for _, _, col, _, _ in indexed_members)
-        window_height = row_max - row_min + 1
-        window_width = col_max - col_min + 1
-        window_area = window_height * window_width
-
-        # For compact point clouds, one bounded read is substantially cheaper
-        # than many point samples. Fall back when the requested points are too sparse.
-        if window_area <= max(len(indexed_members) * 64, 4096):
-            window = Window(col_min, row_min, window_width, window_height)
-            band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
-            if band.shape != (window_height, window_width):
-                return
-            for idx, row, col, _lat, _lon in indexed_members:
-                val = band[row - row_min, col - col_min]
-                if nodata is not None and val == nodata:
-                    continue
-                if np.isnan(val):
-                    continue
-                results[idx] = float(val)
-            return
-
-        xy = [(lon, lat) for _, lat, lon in members]
-        idx_list = [i for i, _, _ in members]
-        for arr, idx in zip(ds.sample(xy), idx_list):
-            val = arr[0]
-            if nodata is not None and val == nodata:
-                continue
-            if isinstance(val, float) and val != val:
-                continue
-            results[idx] = float(val)
 
     for _region, members in groups.items():
         if dataset_cache is not None:
@@ -1231,15 +1186,133 @@ def _batch_sample_raster(
                     continue
                 cached = rasterio.open(cog_path)
                 dataset_cache[cache_key] = cached
-            _write_samples_from_dataset(cached, members)
+            _write_samples_from_dataset(cached, members, results)
         else:
             _, ref_lat, ref_lon = members[0]
             cog_path = get_cog_path(layer_id, ref_lat, ref_lon)
             if cog_path is None or not cog_path.exists():
                 continue
             with rasterio.open(cog_path) as ds:
-                _write_samples_from_dataset(ds, members)
+                _write_samples_from_dataset(ds, members, results)
     return results
+
+
+def _batch_sample_region_raster_filename(
+    filename: str,
+    coords: list[tuple[float, float]],
+    *,
+    regions_root: Path = _GIS_REGIONS_DIR,
+) -> list[float | None]:
+    """Sample one region-local raster filename at many points.
+
+    Unlike catalog-backed layers, these rasters are discovered by fixed
+    filename within each region directory.
+    """
+    import rasterio
+
+    from util import gis_lookup
+
+    results: list[float | None] = [None] * len(coords)
+    groups: dict[str, list[tuple[int, float, float]]] = {}
+    for i, (lat, lon) in enumerate(coords):
+        groups.setdefault(gis_lookup.get_region_name(lat, lon), []).append((i, lat, lon))
+
+    for region_name, members in groups.items():
+        raster_path = regions_root / region_name / filename
+        if not raster_path.exists():
+            continue
+        with rasterio.open(raster_path) as ds:
+            _write_samples_from_dataset(ds, members, results)
+    return results
+
+
+def _write_samples_from_dataset(
+    ds: Any,
+    members: list[tuple[int, float, float]],
+    results: list[float | None],
+) -> None:
+    import numpy as np
+    from rasterio.windows import Window
+
+    nodata = ds.nodata
+    indexed_members: list[tuple[int, int, int, float, float]] = []
+    for idx, lat, lon in members:
+        row, col = ds.index(lon, lat)
+        if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+            continue
+        indexed_members.append((idx, int(row), int(col), lat, lon))
+
+    if not indexed_members:
+        return
+
+    row_min = min(row for _, row, _, _, _ in indexed_members)
+    row_max = max(row for _, row, _, _, _ in indexed_members)
+    col_min = min(col for _, _, col, _, _ in indexed_members)
+    col_max = max(col for _, _, col, _, _ in indexed_members)
+    window_height = row_max - row_min + 1
+    window_width = col_max - col_min + 1
+    window_area = window_height * window_width
+
+    # For compact point clouds, one bounded read is substantially cheaper
+    # than many point samples. Fall back when the requested points are too sparse.
+    if window_area <= max(len(indexed_members) * 64, 4096):
+        window = Window(col_min, row_min, window_width, window_height)
+        band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
+        if band.shape != (window_height, window_width):
+            return
+        for idx, row, col, _lat, _lon in indexed_members:
+            value = band[row - row_min, col - col_min]
+            if nodata is not None and value == nodata:
+                continue
+            if np.isnan(value):
+                continue
+            results[idx] = float(value)
+        return
+
+    xy = [(lon, lat) for _, lat, lon in members]
+    idx_list = [i for i, _, _ in members]
+    for arr, idx in zip(ds.sample(xy), idx_list, strict=True):
+        value = arr[0]
+        if nodata is not None and value == nodata:
+            continue
+
+        if np.isnan(value):
+            continue
+        results[idx] = float(value)
+
+
+def _sample_darwin_prefilter_keep_mask(coords: list[tuple[float, float]]) -> tuple[list[bool], int]:
+    """Return per-coordinate Darwin prefilter decisions.
+
+    Prefers the derived validity mask when present and falls back to the
+    landcover gate otherwise. The second return value counts how many distinct
+    prefilter rasters were touched.
+    """
+    import numpy as np
+
+    mask_values = _batch_sample_region_raster_filename(_DARWIN_VALIDITY_MASK_FILENAME, coords)
+    keep_mask: list[bool] = [False] * len(coords)
+    missing_indices: list[int] = []
+    prefilter_layer_count = 0
+
+    for idx, value in enumerate(mask_values):
+        if value is None:
+            missing_indices.append(idx)
+            continue
+        keep_mask[idx] = value > 0.0
+    if any(value is not None for value in mask_values):
+        prefilter_layer_count += 1
+
+    if missing_indices:
+        fallback_values = _batch_sample_raster(
+            "landcover",
+            [coords[idx] for idx in missing_indices],
+        )
+        prefilter_layer_count += 1
+        for idx, value in zip(missing_indices, fallback_values, strict=True):
+            keep_mask[idx] = value is not None and not np.isnan(value)
+
+    return keep_mask, prefilter_layer_count
 
 
 def _batch_compute_dem_derived(
@@ -1563,22 +1636,12 @@ def _batch_sample_features(
                 sampled[sampled_name] = sampled_values
         return sampled
 
-    # no-data points. Prefer a single broad land-surface layer here because
-    # prefilter cost is now large enough that probing multiple anchor rasters
-    # outweighs the benefit for Darwin tile requests.
-    prefilter_names = [name for name in ["landcover"] if name in layer_names]
     active_indices = list(range(n_coords))
     active_coords = coords
-    if prefilter_names:
+    prefilter_layer_count = 0
+    if layer_names:
         prefilter_start = time.perf_counter()
-        prefilter_vals = _sample_layers(coords, prefilter_names)
-        layer_vals.update(prefilter_vals)
-        keep_mask = [False] * n_coords
-        for name in prefilter_names:
-            values = prefilter_vals[name]
-            for i, val in enumerate(values):
-                if not np.isnan(val):
-                    keep_mask[i] = True
+        keep_mask, prefilter_layer_count = _sample_darwin_prefilter_keep_mask(coords)
         active_indices = [i for i, keep in enumerate(keep_mask) if keep]
         if profile is not None:
             profile.prefilter_seconds += time.perf_counter() - prefilter_start
@@ -1690,7 +1753,7 @@ def _batch_sample_features(
     if profile is not None:
         profile.transform_seconds += time.perf_counter() - transform_start
         profile.active_coord_count = len(active_indices)
-        profile.static_layer_count = len(layer_vals)
+        profile.static_layer_count = len(layer_vals) + prefilter_layer_count
         profile.dem_layer_count = len(needs_dem)
         profile.temporal_layer_count = len(temporal_names) if normalized_temporal_mode == "current" else 0
     return out
