@@ -478,6 +478,9 @@ Runtime device env vars:
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
     Controls sampling chunk size for heatmap tile rendering.
     Independent from model scoring batch size.
+- `WHEREWILD_INFERENCE_USE_DARWIN_VALIDITY_MASK`: boolean-ish flag (default: `0`).
+    Set to `1` to opt into `darwin_validity_mask.tif` serving prefilter checks.
+    Leave unset or set to `0` to use the current landcover-only prefilter path.
 
 Example forcing both inference compute and cell table to CUDA:
 

@@ -170,6 +170,9 @@ Runtime device env vars:
 - `WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE`: integer `>=1` (default: `8192`).
   Controls sampling chunk size for heatmap tile rendering.
   This is independent from model scoring batch size.
+- `WHEREWILD_INFERENCE_USE_DARWIN_VALIDITY_MASK`: boolean-ish flag (default: `0`).
+  Set to `1` to opt into `darwin_validity_mask.tif` serving prefilter checks.
+  Leave unset or set to `0` to use the current landcover-only prefilter path.
 
 ### `GET /api/species/{taxon_id}/heatmap`
 
@@ -182,6 +185,7 @@ Response fields:
 | `available` | bool | Whether the loaded bundle includes that species key. |
 | `species_key` | int | Echoed species key. |
 | `native_resolution` | float | Native model resolution in degrees. |
+| `max_native_zoom` | int | Backend default native zoom policy for Darwin heatmap tile rendering. |
 | `tile_url` | string\|null | URL template for PNG tiles when available. |
 
 ### `GET /api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png`
@@ -195,7 +199,7 @@ Render a Web Mercator PNG tile for one species.
 | `y` | int | required | Tile y coordinate. |
 | `tile_size` | int | `256` | Output PNG size in pixels. |
 | `feature_mode` | string | `prefer_cell_table` | Feature source strategy: `prefer_cell_table` or `cell_table_only`. |
-| `max_native_zoom` | int | `8` | Render parent tiles above this zoom, then crop subtiles. |
+| `max_native_zoom` | int | backend default from metadata | Render parent tiles above this zoom, then crop subtiles. |
 
 Tiles are rendered from the current bundle-backed per-species heatmap scorer and
 returned as `image/png`.
@@ -203,9 +207,11 @@ returned as `image/png`.
 Notes:
 
 - Tile requests are request-scoped, not background jobs.
-- The response advertises `Cache-Control`, but the backend does not currently
-  persist a rendered-tile cache. Repeated requests may be recomputed unless a
-  browser, proxy, or CDN serves them from cache.
-- Tile renders are not currently mid-flight cancellable once scoring starts.
+- Darwin tiles use a backend disk cache keyed by species, tile coords,
+  `tile_size`, `feature_mode`, scorer batch size, and bundle token.
+- Tile renders are request-cancellable through the Darwin tile render path.
 - High zoom requests may render the closest reusable parent tile that still
   fits under the configured tile-size cap, then crop the requested subtile.
+- The backend default for `max_native_zoom` is exposed in the heatmap metadata
+  response and comes from a single backend constant derived from
+  `CONFIG.sdm_tile_max_native_zoom`.
