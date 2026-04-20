@@ -222,7 +222,7 @@ def _colorize_heatmap(values: np.ndarray) -> np.ndarray:
     rgba[finite, 0] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 0]).astype(np.uint8)
     rgba[finite, 1] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 1]).astype(np.uint8)
     rgba[finite, 2] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 2]).astype(np.uint8)
-    rgba[finite, 3] = np.clip(40.0 + (finite_norm * 215.0), 0.0, 255.0).astype(np.uint8)
+    rgba[finite, 3] = np.clip(finite_norm * 128.0, 0.0, 128.0).astype(np.uint8)
     return rgba
 
 
