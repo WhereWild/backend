@@ -197,9 +197,9 @@ def _tile_pixel_center_coords(spec: TileSpec) -> list[tuple[float, float]]:
 
 
 def _tile_resolution_hint(spec: TileSpec) -> float:
-    coords = _tile_pixel_center_coords(TileSpec(spec.z, spec.x, spec.y, 2))
+    coords = _tile_pixel_center_coords(spec)
     lat0, lon0 = coords[0]
-    lat_row, lon_row = coords[2]
+    lat_row, lon_row = coords[spec.tile_size]
     lat_col, lon_col = coords[1]
     return max(
         abs(lat_row - lat0),

@@ -255,6 +255,9 @@ def test_score_species_coords_honors_cancel_check_between_chunks(
         raster_dataset_cache=None,
         dem_dataset_cache=None,
         cancel_check=None,
+        sample_profile=None,
+        cell_table_features=None,
+        sampled_prefilter_keep_mask=None,
     ):
         nonlocal prepare_calls
         prepare_calls += 1
@@ -294,6 +297,71 @@ def test_score_species_coords_honors_cancel_check_between_chunks(
 
     assert prepare_calls == 1
     assert score_calls == 1
+
+
+def test_score_species_coords_prefilters_once_across_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prefilter_calls = 0
+    received_masks: list[list[bool] | None] = []
+
+    def _fake_prepare_feature_batch_for_coords(
+        coords: list[tuple[float, float]],
+        *,
+        resolution_hint: float,
+        include_source: bool,
+        feature_mode: str,
+        raster_dataset_cache=None,
+        dem_dataset_cache=None,
+        cancel_check=None,
+        sample_profile=None,
+        cell_table_features=None,
+        sampled_prefilter_keep_mask=None,
+    ):
+        received_masks.append(
+            list(sampled_prefilter_keep_mask) if sampled_prefilter_keep_mask is not None else None,
+        )
+        return list(range(len(coords))), torch.zeros((len(coords), 1), dtype=torch.float32), None
+
+    def _fake_sample_darwin_prefilter_keep_mask(coords, dataset_cache=None):
+        nonlocal prefilter_calls
+        prefilter_calls += 1
+        return [True for _ in coords], 1
+
+    monkeypatch.setattr(inference, "_resolve_sample_chunk_size", lambda score_batch_size: 2)
+    monkeypatch.setattr(
+        inference,
+        "_resolve_heatmap_feature_mode",
+        lambda feature_mode, resolution_hint, native_resolution: inference._HeatmapFeatureConfig("sampled", False),
+    )
+    monkeypatch.setattr(
+        inference,
+        "_prepare_feature_batch_for_coords",
+        _fake_prepare_feature_batch_for_coords,
+    )
+    monkeypatch.setattr(
+        inference,
+        "_sample_darwin_prefilter_keep_mask",
+        _fake_sample_darwin_prefilter_keep_mask,
+    )
+    monkeypatch.setattr(
+        inference,
+        "_score_species_feature_tensor",
+        lambda species_key, feature_tensor, *, score_batch_size, cancel_check=None: [
+            0.5 for _ in range(int(feature_tensor.shape[0]))
+        ],
+    )
+
+    scores, _ = inference.score_species_coords(
+        101,
+        [(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)],
+        resolution_hint=0.01,
+        feature_mode="prefer_cell_table",
+    )
+
+    assert scores == [0.5, 0.5, 0.5, 0.5]
+    assert prefilter_calls == 1
+    assert received_masks == [[True, True], [True, True]]
 
 
 def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

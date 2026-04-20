@@ -41,7 +41,7 @@ from util import (
     tiles,
     weather_tiles,
 )
-from util.tile_request import log_tile_cancellation, run_tile_render_with_cancellation
+from util.tile_request import acquire_tile_render_slot, log_tile_cancellation, run_tile_render_with_cancellation
 from util import inference
 from util.species_heatmap_scorers import DarwinSpeciesHeatmapScorer, LegacySpeciesHeatmapScorer
 from util.storage import get_parquet_storage
@@ -86,7 +86,7 @@ heatmap_tile_max_size = int(getattr(CONFIG, "sdm_tile_max_size", 2048))
 
 heatmap_tile_cache_seconds = int(getattr(CONFIG, "sdm_tile_cache_seconds", 60))
 
-heatmap_tile_default_max_native_zoom = int(getattr(CONFIG, "sdm_tile_max_native_zoom", 8))
+DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM = int(getattr(CONFIG, "sdm_tile_max_native_zoom", 8))
 
 INFERENCE_BUNDLE_PATH = Path(os.environ.get("WHEREWILD_INFERENCE_BUNDLE", "checkpoints/inference_bundle.pt"))
 
@@ -479,6 +479,7 @@ def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
             "available": False,
             "species_key": taxon_id,
             "native_resolution": 0.0,
+            "max_native_zoom": DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM,
             "tile_url": None,
         }
 
@@ -487,6 +488,7 @@ def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
         "available": available,
         "species_key": taxon_id,
         "native_resolution": inference.native_resolution(),
+        "max_native_zoom": DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM,
         "tile_url": f"/api/species/{taxon_id}/heatmap/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
     }
 
@@ -521,27 +523,51 @@ async def _render_species_heatmap_tile_response(
     if await request.is_disconnected():
         return Response(status_code=204)
 
+    render_fields = {
+        "taxon_id": taxon_id,
+        "z": z,
+        "x": x,
+        "y": y,
+    }
+
     try:
-        payload = await run_tile_render_with_cancellation(
-            request,
-            scorer.render_runtime_tile_bytes,
-            taxon_id=taxon_id,
-            z=z,
-            x=x,
-            y=y,
-            tile_size=tile_size,
-            max_native_zoom=max_native_zoom,
-            bypass_cache=bypass_cache,
-            profile=profile,
-        )
+        if z > max_native_zoom:
+            async with acquire_tile_render_slot(
+                _SPECIES_DEEP_ZOOM_RENDER_SEMAPHORE,
+                request,
+                route="species",
+                **render_fields,
+            ):
+                payload = await run_tile_render_with_cancellation(
+                    request,
+                    scorer.render_runtime_tile_bytes,
+                    taxon_id=taxon_id,
+                    z=z,
+                    x=x,
+                    y=y,
+                    tile_size=tile_size,
+                    max_native_zoom=max_native_zoom,
+                    bypass_cache=bypass_cache,
+                    profile=profile,
+                )
+        else:
+            payload = await run_tile_render_with_cancellation(
+                request,
+                scorer.render_runtime_tile_bytes,
+                taxon_id=taxon_id,
+                z=z,
+                x=x,
+                y=y,
+                tile_size=tile_size,
+                max_native_zoom=max_native_zoom,
+                bypass_cache=bypass_cache,
+                profile=profile,
+            )
     except tiles.TileRenderCancelled:
         log_tile_cancellation(
             "species",
             "during_render",
-            taxon_id=taxon_id,
-            z=z,
-            x=x,
-            y=y,
+            **render_fields,
         )
         return Response(status_code=204)
     except KeyError as exc:
@@ -638,7 +664,7 @@ async def species_inference_heatmap_tile_route(
         description="Feature source strategy: prefer_cell_table or cell_table_only.",
     ),
     max_native_zoom: int = Query(
-        heatmap_tile_default_max_native_zoom,
+        DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM,
         ge=1,
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",

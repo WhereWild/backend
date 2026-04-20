@@ -195,6 +195,60 @@ def _filtered_transform_spec_for_groups(group_names: set[str]) -> dict[str, Any]
     }
 
 
+def _raw_feature_template_for_groups(group_names: set[str]) -> dict[str, list[str]]:
+    """Return the raw feature template limited to the selected groups."""
+    return {
+        group_name: _raw_feature_group_names(group_name) if group_name in group_names else []
+        for group_name in FEATURE_GROUPS
+    }
+
+
+def _transform_selected_raw_feature_matrices(
+    *,
+    group_names: set[str],
+    raw_feature_template: dict[str, list[str]],
+    raw_values: Any,
+    raw_masks: Any,
+) -> tuple[Any, Any]:
+    """Transform selected raw groups and expand them back to full model width."""
+    selected_values, selected_masks, selected_template = transform_feature_matrices(
+        raw_feature_template=raw_feature_template,
+        raw_values=raw_values,
+        raw_masks=raw_masks,
+        transform_spec=_filtered_transform_spec_for_groups(group_names),
+    )
+
+    full_template = {group_name: _model_feature_group_names(group_name) for group_name in FEATURE_GROUPS}
+    full_dim = sum(len(full_template[group_name]) for group_name in FEATURE_GROUPS)
+    if full_dim <= 0 or selected_values.shape[1] == full_dim:
+        return selected_values, selected_masks
+
+    import numpy as np
+
+    values_out = np.zeros((selected_values.shape[0], full_dim), dtype=np.float32)
+    masks_out = np.ones((selected_masks.shape[0], full_dim), dtype=np.float32)
+    selected_offset = 0
+    full_offset = 0
+    for group_name in FEATURE_GROUPS:
+        full_width = len(full_template[group_name])
+        selected_width = len(selected_template.get(group_name, []))
+        if selected_width:
+            if selected_width != full_width:
+                raise ValueError(
+                    f"selected transformed width for group {group_name!r} does not align with model template "
+                    f"({selected_width} != {full_width})"
+                )
+            values_out[:, full_offset : full_offset + full_width] = selected_values[
+                :, selected_offset : selected_offset + selected_width
+            ]
+            masks_out[:, full_offset : full_offset + full_width] = selected_masks[
+                :, selected_offset : selected_offset + selected_width
+            ]
+            selected_offset += selected_width
+        full_offset += full_width
+    return values_out, masks_out
+
+
 def _resolve_inference_device() -> torch.device:
     """Resolve runtime device from env config with safe CPU fallback."""
     requested = os.environ.get("WHEREWILD_INFERENCE_DEVICE", "auto").strip().lower()
@@ -254,6 +308,89 @@ def _resolve_sample_chunk_size(score_batch_size: int) -> int:
     if requested < 1:
         raise ValueError("WHEREWILD_INFERENCE_SAMPLE_CHUNK_SIZE must be >= 1")
     return max(score_batch_size, requested)
+
+
+def _resolve_darwin_validity_mask_enabled() -> bool:
+    """Resolve whether Darwin serving should use the validity mask prefilter."""
+    raw = os.environ.get("WHEREWILD_INFERENCE_USE_DARWIN_VALIDITY_MASK", "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError("WHEREWILD_INFERENCE_USE_DARWIN_VALIDITY_MASK must be one of: 1, 0, true, false, yes, no, on, off")
+
+
+def _record_prefilter_profile(
+    profile: SpeciesScoreProfile | None,
+    *,
+    elapsed_seconds: float,
+    keep_mask: list[bool],
+) -> None:
+    """Accumulate one prefilter pass into the species score profile."""
+    if profile is None:
+        return
+
+    kept_count = sum(keep_mask)
+    profile.feature_prepare_seconds += elapsed_seconds
+    profile.sample_prefilter_seconds += elapsed_seconds
+    profile.sample_prefilter_kept_count += kept_count
+    profile.sample_prefilter_dropped_count += len(keep_mask) - kept_count
+
+
+def _precompute_feature_batch_inputs(
+    coords: list[tuple[float, float]],
+    *,
+    feature_config: _HeatmapFeatureConfig,
+    raster_dataset_cache: dict[tuple[str, str], Any],
+    profile: SpeciesScoreProfile | None,
+) -> tuple[list[torch.Tensor | None] | None, list[bool] | None]:
+    """Precompute reusable cell-table hits and sampled prefilter masks for a score request."""
+    precomputed_cell_table_features: list[torch.Tensor | None] | None = None
+    precomputed_sampled_prefilter_keep_mask: list[bool] | None = None
+
+    if feature_config.primary_source == "sampled":
+        prefilter_start = time.perf_counter()
+        precomputed_sampled_prefilter_keep_mask, _ = _sample_darwin_prefilter_keep_mask(
+            coords,
+            dataset_cache=raster_dataset_cache,
+        )
+        _record_prefilter_profile(
+            profile,
+            elapsed_seconds=time.perf_counter() - prefilter_start,
+            keep_mask=precomputed_sampled_prefilter_keep_mask,
+        )
+        return None, precomputed_sampled_prefilter_keep_mask
+
+    if feature_config.primary_source != "cell_table" or not feature_config.allow_fallback:
+        return None, None
+
+    precomputed_cell_table_features = []
+    missing_indices: list[int] = []
+    missing_coords: list[tuple[float, float]] = []
+    for index, (lat, lon) in enumerate(coords):
+        cell = _cell_lookup_by_bin(lat, lon, _cell_size_deg)
+        precomputed_cell_table_features.append(cell)
+        if cell is None:
+            missing_indices.append(index)
+            missing_coords.append((lat, lon))
+
+    if not missing_coords:
+        return precomputed_cell_table_features, None
+
+    prefilter_start = time.perf_counter()
+    missing_keep_mask, _ = _sample_darwin_prefilter_keep_mask(
+        missing_coords,
+        dataset_cache=raster_dataset_cache,
+    )
+    precomputed_sampled_prefilter_keep_mask = [True] * len(coords)
+    for index, keep in zip(missing_indices, missing_keep_mask, strict=True):
+        precomputed_sampled_prefilter_keep_mask[index] = keep
+    _record_prefilter_profile(
+        profile,
+        elapsed_seconds=time.perf_counter() - prefilter_start,
+        keep_mask=missing_keep_mask,
+    )
+    return precomputed_cell_table_features, precomputed_sampled_prefilter_keep_mask
 
 
 def _close_dataset_cache(cache: dict[tuple[str, str], Any]) -> None:
@@ -517,6 +654,8 @@ def _prepare_feature_batch_for_coords(
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
     cancel_check: CancelCheck | None = None,
     sample_profile: SampleFeatureProfile | None = None,
+    cell_table_features: list[torch.Tensor | None] | None = None,
+    sampled_prefilter_keep_mask: list[bool] | None = None,
 ) -> tuple[list[int], torch.Tensor | None, list[str | None] | None]:
     """Resolve model-ready feature rows for arbitrary coordinates."""
     native = _cell_size_deg
@@ -537,7 +676,7 @@ def _prepare_feature_batch_for_coords(
     if primary_source == "cell_table":
         for i, (lat, lon) in enumerate(coords):
             _check_cancel(cancel_check)
-            cell = _cell_lookup_by_bin(lat, lon, native)
+            cell = cell_table_features[i] if cell_table_features is not None else _cell_lookup_by_bin(lat, lon, native)
             if cell is not None:
                 features_per_coord[i] = cell
                 if feature_source_per_coord is not None:
@@ -548,11 +687,15 @@ def _prepare_feature_batch_for_coords(
 
         if allow_fallback and missing_coords:
             _check_cancel(cancel_check)
+            missing_prefilter_keep_mask = None
+            if sampled_prefilter_keep_mask is not None:
+                missing_prefilter_keep_mask = [sampled_prefilter_keep_mask[i] for i in missing_indices]
             sampled = _batch_sample_features(
                 missing_coords,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
                 profile=sample_profile,
+                prefilter_keep_mask=missing_prefilter_keep_mask,
             )
             for i, cell in zip(missing_indices, sampled):
                 if cell is not None:
@@ -566,6 +709,7 @@ def _prepare_feature_batch_for_coords(
             raster_dataset_cache=raster_dataset_cache,
             dem_dataset_cache=dem_dataset_cache,
             profile=sample_profile,
+            prefilter_keep_mask=sampled_prefilter_keep_mask,
         )
         for i, cell in enumerate(sampled):
             _check_cancel(cancel_check)
@@ -650,11 +794,24 @@ def score_species_coords(
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
     dem_dataset_cache: dict[tuple[str, str], Any] = {}
     try:
+        feature_config = _resolve_heatmap_feature_mode(
+            feature_mode,
+            resolution_hint,
+            _cell_size_deg,
+        )
+        precomputed_cell_table_features, precomputed_sampled_prefilter_keep_mask = _precompute_feature_batch_inputs(
+            coords,
+            feature_config=feature_config,
+            raster_dataset_cache=raster_dataset_cache,
+            profile=profile,
+        )
+
         for chunk_start in range(0, len(coords), sample_chunk_size):
             _check_cancel(cancel_check)
             if profile is not None:
                 profile.chunk_count += 1
             chunk_coords = coords[chunk_start : chunk_start + sample_chunk_size]
+            chunk_end = chunk_start + len(chunk_coords)
             prepare_start = time.perf_counter()
             sample_profile = SampleFeatureProfile() if profile is not None else None
             valid_indices, feature_tensor, chunk_sources = _prepare_feature_batch_for_coords(
@@ -666,6 +823,16 @@ def score_species_coords(
                 dem_dataset_cache=dem_dataset_cache,
                 cancel_check=cancel_check,
                 sample_profile=sample_profile,
+                cell_table_features=(
+                    precomputed_cell_table_features[chunk_start:chunk_end]
+                    if precomputed_cell_table_features is not None
+                    else None
+                ),
+                sampled_prefilter_keep_mask=(
+                    precomputed_sampled_prefilter_keep_mask[chunk_start:chunk_end]
+                    if precomputed_sampled_prefilter_keep_mask is not None
+                    else None
+                ),
             )
             if profile is not None:
                 profile.feature_prepare_seconds += time.perf_counter() - prepare_start
@@ -1163,7 +1330,6 @@ def _batch_sample_raster(
     dataset_cache: dict[tuple[str, str], Any] | None = None,
 ) -> list[float | None]:
     """Sample one raster layer at many points, opening each region tile once."""
-    import numpy as np
     import rasterio
     from util.gis_lookup import get_cog_path, get_region_name
 
@@ -1202,6 +1368,7 @@ def _batch_sample_region_raster_filename(
     coords: list[tuple[float, float]],
     *,
     regions_root: Path = _GIS_REGIONS_DIR,
+    dataset_cache: dict[tuple[str, str], Any] | None = None,
 ) -> list[float | None]:
     """Sample one region-local raster filename at many points.
 
@@ -1217,8 +1384,23 @@ def _batch_sample_region_raster_filename(
     for i, (lat, lon) in enumerate(coords):
         groups.setdefault(gis_lookup.get_region_name(lat, lon), []).append((i, lat, lon))
 
+    cache_prefix = f"region-file:{filename}"
     for region_name, members in groups.items():
         raster_path = regions_root / region_name / filename
+        if dataset_cache is not None:
+            cache_key = (cache_prefix, region_name)
+            cached = dataset_cache.get(cache_key)
+            if cached is _MISSING_DATASET:
+                continue
+            if cached is None:
+                if not raster_path.exists():
+                    dataset_cache[cache_key] = _MISSING_DATASET
+                    continue
+                cached = rasterio.open(raster_path)
+                dataset_cache[cache_key] = cached
+            _write_samples_from_dataset(cached, members, results)
+            continue
+
         if not raster_path.exists():
             continue
         with rasterio.open(raster_path) as ds:
@@ -1232,42 +1414,92 @@ def _write_samples_from_dataset(
     results: list[float | None],
 ) -> None:
     import numpy as np
+    from rasterio.transform import rowcol
     from rasterio.windows import Window
 
     nodata = ds.nodata
-    indexed_members: list[tuple[int, int, int, float, float]] = []
-    for idx, lat, lon in members:
-        row, col = ds.index(lon, lat)
-        if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
-            continue
-        indexed_members.append((idx, int(row), int(col), lat, lon))
+    indexed_indices: np.ndarray
+    rows: np.ndarray
+    cols: np.ndarray
 
-    if not indexed_members:
+    if getattr(ds, "transform", None) is not None:
+        xs = np.asarray([lon for _, _lat, lon in members], dtype=np.float64)
+        ys = np.asarray([lat for _, lat, _lon in members], dtype=np.float64)
+        row_values, col_values = rowcol(ds.transform, xs, ys)
+        indexed_indices = np.asarray([idx for idx, _lat, _lon in members], dtype=np.int64)
+        rows = np.asarray(row_values, dtype=np.int64)
+        cols = np.asarray(col_values, dtype=np.int64)
+        in_bounds = (rows >= 0) & (cols >= 0) & (rows < ds.height) & (cols < ds.width)
+        indexed_indices = indexed_indices[in_bounds]
+        rows = rows[in_bounds]
+        cols = cols[in_bounds]
+    else:
+        indexed_members: list[tuple[int, int, int]] = []
+        for idx, lat, lon in members:
+            row, col = ds.index(lon, lat)
+            if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+                continue
+            indexed_members.append((idx, int(row), int(col)))
+        if not indexed_members:
+            return
+        indexed_indices = np.asarray([idx for idx, _row, _col in indexed_members], dtype=np.int64)
+        rows = np.asarray([row for _idx, row, _col in indexed_members], dtype=np.int64)
+        cols = np.asarray([col for _idx, _row, col in indexed_members], dtype=np.int64)
+
+    if indexed_indices.size == 0:
         return
 
-    row_min = min(row for _, row, _, _, _ in indexed_members)
-    row_max = max(row for _, row, _, _, _ in indexed_members)
-    col_min = min(col for _, _, col, _, _ in indexed_members)
-    col_max = max(col for _, _, col, _, _ in indexed_members)
+    row_min = int(rows.min())
+    row_max = int(rows.max())
+    col_min = int(cols.min())
+    col_max = int(cols.max())
     window_height = row_max - row_min + 1
     window_width = col_max - col_min + 1
     window_area = window_height * window_width
 
     # For compact point clouds, one bounded read is substantially cheaper
     # than many point samples. Fall back when the requested points are too sparse.
-    if window_area <= max(len(indexed_members) * 64, 4096):
+    if window_area <= max(int(indexed_indices.size) * 64, 4096):
         window = Window(col_min, row_min, window_width, window_height)
         band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
         if band.shape != (window_height, window_width):
             return
-        for idx, row, col, _lat, _lon in indexed_members:
-            value = band[row - row_min, col - col_min]
-            if nodata is not None and value == nodata:
-                continue
-            if np.isnan(value):
-                continue
-            results[idx] = float(value)
+        values = band[rows - row_min, cols - col_min]
+        valid = ~np.isnan(values)
+        if nodata is not None:
+            valid &= values != nodata
+        for idx, value in zip(indexed_indices[valid], values[valid], strict=True):
+            results[int(idx)] = float(value)
         return
+
+    block_shapes = getattr(ds, "block_shapes", None)
+    if block_shapes:
+        block_height, block_width = block_shapes[0]
+        if block_height > 0 and block_width > 0:
+            block_groups: dict[tuple[int, int], list[int]] = {}
+            for pos, (row, col) in enumerate(zip(rows.tolist(), cols.tolist(), strict=True)):
+                block_key = (int(row) // int(block_height), int(col) // int(block_width))
+                block_groups.setdefault(block_key, []).append(pos)
+
+            for (block_row, block_col), positions in block_groups.items():
+                row_off = block_row * int(block_height)
+                col_off = block_col * int(block_width)
+                height = min(int(block_height), int(ds.height) - row_off)
+                width = min(int(block_width), int(ds.width) - col_off)
+                if height <= 0 or width <= 0:
+                    continue
+                window = Window(col_off, row_off, width, height)
+                band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
+                if band.shape != (height, width):
+                    continue
+                pos_arr = np.asarray(positions, dtype=np.int64)
+                values = band[rows[pos_arr] - row_off, cols[pos_arr] - col_off]
+                valid = ~np.isnan(values)
+                if nodata is not None:
+                    valid &= values != nodata
+                for idx, value in zip(indexed_indices[pos_arr][valid], values[valid], strict=True):
+                    results[int(idx)] = float(value)
+            return
 
     xy = [(lon, lat) for _, lat, lon in members]
     idx_list = [i for i, _, _ in members]
@@ -1281,7 +1513,10 @@ def _write_samples_from_dataset(
         results[idx] = float(value)
 
 
-def _sample_darwin_prefilter_keep_mask(coords: list[tuple[float, float]]) -> tuple[list[bool], int]:
+def _sample_darwin_prefilter_keep_mask(
+    coords: list[tuple[float, float]],
+    dataset_cache: dict[tuple[str, str], Any] | None = None,
+) -> tuple[list[bool], int]:
     """Return per-coordinate Darwin prefilter decisions.
 
     Prefers the derived validity mask when present and falls back to the
@@ -1290,7 +1525,20 @@ def _sample_darwin_prefilter_keep_mask(coords: list[tuple[float, float]]) -> tup
     """
     import numpy as np
 
-    mask_values = _batch_sample_region_raster_filename(_DARWIN_VALIDITY_MASK_FILENAME, coords)
+    if not _resolve_darwin_validity_mask_enabled():
+        fallback_values = _batch_sample_raster(
+            "landcover",
+            coords,
+            dataset_cache=dataset_cache,
+        )
+        keep_mask = [value is not None and not np.isnan(value) for value in fallback_values]
+        return keep_mask, 1 if coords else 0
+
+    mask_values = _batch_sample_region_raster_filename(
+        _DARWIN_VALIDITY_MASK_FILENAME,
+        coords,
+        dataset_cache=dataset_cache,
+    )
     keep_mask: list[bool] = [False] * len(coords)
     missing_indices: list[int] = []
     prefilter_layer_count = 0
@@ -1319,9 +1567,10 @@ def _batch_compute_dem_derived(
     coords: list[tuple[float, float]],
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
 ) -> list[dict[str, float]]:
-    """Batch DEM-derived features, opening each region COG once."""
+    """Batch DEM-backed terrain features, opening each region COG once."""
     import numpy as np
     import rasterio
+    from rasterio.transform import rowcol
     from rasterio.windows import Window
     from util.gis_lookup import get_cog_path, get_region_name
 
@@ -1334,35 +1583,181 @@ def _batch_compute_dem_derived(
         nodata = ds.nodata
         pw = abs(float(ds.transform.a))
         ph = abs(float(ds.transform.e))
-        for idx, lat, lon in members:
-            row, col = ds.index(lon, lat)
-            if row - 1 < 0 or col - 1 < 0 or row + 1 >= ds.height or col + 1 >= ds.width:
-                continue
-            win = ds.read(indexes=1, window=Window(col - 1, row - 1, 3, 3), boundless=False)  # type: ignore[call-arg]
+
+        if getattr(ds, "transform", None) is not None:
+            xs = np.asarray([lon for _idx, _lat, lon in members], dtype=np.float64)
+            ys = np.asarray([lat for _idx, lat, _lon in members], dtype=np.float64)
+            row_values, col_values = rowcol(ds.transform, xs, ys)
+            indexed_indices = np.asarray([idx for idx, _lat, _lon in members], dtype=np.int64)
+            indexed_lats = np.asarray([lat for _idx, lat, _lon in members], dtype=np.float64)
+            rows = np.asarray(row_values, dtype=np.int64)
+            cols = np.asarray(col_values, dtype=np.int64)
+            in_bounds = (rows > 0) & (cols > 0) & (rows + 1 < ds.height) & (cols + 1 < ds.width)
+            indexed_indices = indexed_indices[in_bounds]
+            indexed_lats = indexed_lats[in_bounds]
+            rows = rows[in_bounds]
+            cols = cols[in_bounds]
+        else:
+            indexed_members: list[tuple[int, float, int, int]] = []
+            for idx, lat, lon in members:
+                row, col = ds.index(lon, lat)
+                if row <= 0 or col <= 0 or row + 1 >= ds.height or col + 1 >= ds.width:
+                    continue
+                indexed_members.append((idx, lat, int(row), int(col)))
+            if not indexed_members:
+                return
+            indexed_indices = np.asarray([idx for idx, _lat, _row, _col in indexed_members], dtype=np.int64)
+            indexed_lats = np.asarray([lat for _idx, lat, _row, _col in indexed_members], dtype=np.float64)
+            rows = np.asarray([row for _idx, _lat, row, _col in indexed_members], dtype=np.int64)
+            cols = np.asarray([col for _idx, _lat, _row, col in indexed_members], dtype=np.int64)
+
+        if indexed_indices.size == 0:
+            return
+
+        def _write_from_band(
+            band: Any,
+            pos_arr: np.ndarray,
+            *,
+            row_off: int,
+            col_off: int,
+        ) -> None:
+            if band.shape[0] < 3 or band.shape[1] < 3:
+                return
+
+            local_rows = rows[pos_arr] - row_off
+            local_cols = cols[pos_arr] - col_off
+            z1 = band[local_rows - 1, local_cols - 1]
+            z2 = band[local_rows - 1, local_cols]
+            z3 = band[local_rows - 1, local_cols + 1]
+            z4 = band[local_rows, local_cols - 1]
+            z5 = band[local_rows, local_cols]
+            z6 = band[local_rows, local_cols + 1]
+            z7 = band[local_rows + 1, local_cols - 1]
+            z8 = band[local_rows + 1, local_cols]
+            z9 = band[local_rows + 1, local_cols + 1]
+
+            valid = ~(
+                np.isnan(z1)
+                | np.isnan(z2)
+                | np.isnan(z3)
+                | np.isnan(z4)
+                | np.isnan(z5)
+                | np.isnan(z6)
+                | np.isnan(z7)
+                | np.isnan(z8)
+                | np.isnan(z9)
+            )
+            if nodata is not None:
+                valid &= ~(
+                    (z1 == nodata)
+                    | (z2 == nodata)
+                    | (z3 == nodata)
+                    | (z4 == nodata)
+                    | (z5 == nodata)
+                    | (z6 == nodata)
+                    | (z7 == nodata)
+                    | (z8 == nodata)
+                    | (z9 == nodata)
+                )
+            if not np.any(valid):
+                return
+
+            valid_positions = pos_arr[valid]
+            valid_lats = indexed_lats[valid_positions]
+            meters = np.asarray([_meters_per_degree(float(lat)) for lat in valid_lats], dtype=np.float64)
+            dy = ph * meters[:, 0]
+            dx = pw * meters[:, 1]
+            spacing_valid = (dx != 0.0) & (dy != 0.0)
+            if not np.any(spacing_valid):
+                return
+
+            valid_positions = valid_positions[spacing_valid]
+            dx = dx[spacing_valid]
+            dy = dy[spacing_valid]
+            z1 = z1[valid][spacing_valid]
+            z2 = z2[valid][spacing_valid]
+            z3 = z3[valid][spacing_valid]
+            z4 = z4[valid][spacing_valid]
+            z5 = z5[valid][spacing_valid]
+            z6 = z6[valid][spacing_valid]
+            z7 = z7[valid][spacing_valid]
+            z8 = z8[valid][spacing_valid]
+            z9 = z9[valid][spacing_valid]
+
+            dzdx = ((z3 + 2.0 * z6 + z9) - (z1 + 2.0 * z4 + z7)) / (8.0 * dx)
+            dzdy = ((z7 + 2.0 * z8 + z9) - (z1 + 2.0 * z2 + z3)) / (8.0 * dy)
+            slope_deg = np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2)))
+            asp_deg = 90.0 - np.degrees(np.arctan2(dzdy, -dzdx))
+            flat = (dzdx == 0.0) & (dzdy == 0.0)
+            asp_deg = np.where(flat, 0.0, asp_deg)
+            asp_deg = np.where(asp_deg < 0.0, asp_deg + 360.0, asp_deg)
+            aspect_bins = (((asp_deg + 22.5) % 360.0) // 45.0 + 1.0).astype(np.float64)
+
+            for pos, elevation_value, slope_value, aspect_bin, aspect_value in zip(
+                valid_positions,
+                z5,
+                slope_deg,
+                aspect_bins,
+                asp_deg,
+                strict=True,
+            ):
+                idx = int(indexed_indices[pos])
+                results[idx] = {
+                    "elevation": float(elevation_value),
+                    "slope": float(slope_value),
+                    "aspect": float(aspect_bin),
+                    "aspect_deg": float(aspect_value),
+                }
+
+        row_min = int(rows.min())
+        row_max = int(rows.max())
+        col_min = int(cols.min())
+        col_max = int(cols.max())
+        window_height = row_max - row_min + 3
+        window_width = col_max - col_min + 3
+        window_area = window_height * window_width
+
+        if window_area <= max(int(indexed_indices.size) * 81, 4096):
+            row_off = row_min - 1
+            col_off = col_min - 1
+            window = Window(col_off, row_off, window_width, window_height)
+            band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
+            if band.shape == (window_height, window_width):
+                _write_from_band(
+                    band, np.arange(indexed_indices.size, dtype=np.int64), row_off=row_off, col_off=col_off
+                )
+                return
+
+        block_shapes = getattr(ds, "block_shapes", None)
+        if block_shapes:
+            block_height, block_width = block_shapes[0]
+            if block_height > 0 and block_width > 0:
+                block_groups: dict[tuple[int, int], list[int]] = {}
+                for pos, (row, col) in enumerate(zip(rows.tolist(), cols.tolist(), strict=True)):
+                    block_key = (int(row) // int(block_height), int(col) // int(block_width))
+                    block_groups.setdefault(block_key, []).append(pos)
+
+                for (block_row, block_col), positions in block_groups.items():
+                    row_off = max(block_row * int(block_height) - 1, 0)
+                    col_off = max(block_col * int(block_width) - 1, 0)
+                    row_end = min((block_row + 1) * int(block_height) + 1, int(ds.height))
+                    col_end = min((block_col + 1) * int(block_width) + 1, int(ds.width))
+                    height = row_end - row_off
+                    width = col_end - col_off
+                    if height < 3 or width < 3:
+                        continue
+                    window = Window(col_off, row_off, width, height)
+                    band = ds.read(indexes=1, window=window, boundless=False)  # type: ignore[call-arg]
+                    if band.shape != (height, width):
+                        continue
+                    _write_from_band(band, np.asarray(positions, dtype=np.int64), row_off=row_off, col_off=col_off)
+                return
+
+        for pos, (idx, lat, row, col) in enumerate(zip(indexed_indices, indexed_lats, rows, cols, strict=True)):
+            win = ds.read(indexes=1, window=Window(int(col) - 1, int(row) - 1, 3, 3), boundless=False)  # type: ignore[call-arg]
             if win.shape != (3, 3):
                 continue
-            if nodata is not None and np.any(win == nodata):
-                continue
-            if np.any(np.isnan(win)):
-                continue
-            m_lat, m_lon = _meters_per_degree(lat)
-            dx = pw * m_lon
-            dy = ph * m_lat
-            if dx == 0 or dy == 0:
-                continue
-            z1, z2, z3 = win[0, 0], win[0, 1], win[0, 2]
-            z4, _, z6 = win[1, 0], win[1, 1], win[1, 2]
-            z7, z8, z9 = win[2, 0], win[2, 1], win[2, 2]
-            dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dx)
-            dzdy = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8.0 * dy)
-            slope_deg = float(np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))))
-            if dzdx == 0 and dzdy == 0:
-                asp_deg = 0.0
-            else:
-                asp_deg = float(90.0 - np.degrees(np.arctan2(dzdy, -dzdx)))
-                if asp_deg < 0:
-                    asp_deg += 360.0
-            results[idx] = {"slope": slope_deg, "aspect": float(_aspect_bin(asp_deg)), "aspect_deg": asp_deg}
+            _write_from_band(win, np.asarray([pos], dtype=np.int64), row_off=int(row) - 1, col_off=int(col) - 1)
 
     for _region, members in groups.items():
         if dem_dataset_cache is not None:
@@ -1572,6 +1967,7 @@ def _batch_sample_features(
     temporal_forecast_hours: int | None = None,
     temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
     profile: SampleFeatureProfile | None = None,
+    prefilter_keep_mask: list[bool] | None = None,
 ) -> list[dict[str, torch.Tensor] | None]:
     """Batch-sample static features for many coordinates.
 
@@ -1587,18 +1983,25 @@ def _batch_sample_features(
         return [None] * len(coords)
 
     temporal_names = _raw_temporal_feature_names()
-    temporal_dim: int = len(temporal_names)
-    other_dim: int = len(_raw_feature_names.get("other", []))
+    selected_group_names: set[str] = set(_SAMPLED_FEATURE_GROUPS)
     n_coords = len(coords)
     if profile is not None:
         profile.input_coord_count = n_coords
 
     layer_vals: dict[str, np.ndarray] = {}
     sampled_static_names = _sampled_static_feature_names()
-    layer_names = [name for name in sampled_static_names if name not in _DEM_DERIVED]
+    dem_backed_names = ({"elevation"} | set(_DEM_DERIVED)) & set(sampled_static_names)
+    layer_names = [name for name in sampled_static_names if name not in dem_backed_names]
     sampling_workers = _resolve_sampling_workers()
-    static_width = len(sampled_static_names)
-    raw_width = static_width + temporal_dim + other_dim
+    normalized_temporal_mode = temporal_mode.strip().lower()
+    if normalized_temporal_mode not in {"missing", "current"}:
+        raise ValueError("temporal_mode must be one of ['current', 'missing']")
+    if normalized_temporal_mode == "current" and temporal_names:
+        selected_group_names.add("temporal")
+
+    raw_feature_template = _raw_feature_template_for_groups(selected_group_names)
+    static_width = sum(len(raw_feature_template[group_name]) for group_name in _SAMPLED_FEATURE_GROUPS)
+    raw_width = sum(len(raw_feature_template[group_name]) for group_name in FEATURE_GROUPS)
 
     feature_matrix = np.zeros((n_coords, raw_width), dtype=np.float32)
     mask_matrix = np.ones((n_coords, raw_width), dtype=np.float32)
@@ -1639,11 +2042,20 @@ def _batch_sample_features(
     active_indices = list(range(n_coords))
     active_coords = coords
     prefilter_layer_count = 0
+    prefilter_start: float | None = None
     if layer_names:
-        prefilter_start = time.perf_counter()
-        keep_mask, prefilter_layer_count = _sample_darwin_prefilter_keep_mask(coords)
+        if prefilter_keep_mask is not None:
+            if len(prefilter_keep_mask) != n_coords:
+                raise ValueError("prefilter_keep_mask must align 1:1 with coords")
+            keep_mask = prefilter_keep_mask
+        else:
+            prefilter_start = time.perf_counter()
+            keep_mask, prefilter_layer_count = _sample_darwin_prefilter_keep_mask(
+                coords,
+                dataset_cache=raster_dataset_cache,
+            )
         active_indices = [i for i, keep in enumerate(keep_mask) if keep]
-        if profile is not None:
+        if profile is not None and prefilter_start is not None:
             profile.prefilter_seconds += time.perf_counter() - prefilter_start
             profile.prefilter_kept_count = len(active_indices)
             profile.prefilter_dropped_count = n_coords - len(active_indices)
@@ -1665,9 +2077,11 @@ def _batch_sample_features(
         if profile is not None:
             profile.static_sampling_seconds += time.perf_counter() - static_start
 
-    needs_dem = _DEM_DERIVED & set(sampled_static_names)
-    dem_layer_vals: dict[str, np.ndarray] = {name: np.full(n_coords, np.nan, dtype=np.float32) for name in needs_dem}
-    if needs_dem and active_indices:
+    needs_dem_derived = _DEM_DERIVED & set(sampled_static_names)
+    dem_layer_vals: dict[str, np.ndarray] = {
+        name: np.full(n_coords, np.nan, dtype=np.float32) for name in dem_backed_names
+    }
+    if dem_backed_names and active_indices:
         dem_start = time.perf_counter()
         dem_active = _batch_compute_dem_derived(active_coords, dem_dataset_cache=dem_dataset_cache)
         for pos, global_idx in enumerate(active_indices):
@@ -1678,9 +2092,6 @@ def _batch_sample_features(
             profile.dem_seconds += time.perf_counter() - dem_start
 
     temporal_vals: dict[str, np.ndarray] = {}
-    normalized_temporal_mode = temporal_mode.strip().lower()
-    if normalized_temporal_mode not in {"missing", "current"}:
-        raise ValueError("temporal_mode must be one of ['current', 'missing']")
     if normalized_temporal_mode == "current" and temporal_names:
         temporal_start_time = time.perf_counter()
         for layer_name in temporal_names:
@@ -1729,11 +2140,11 @@ def _batch_sample_features(
         profile.matrix_fill_seconds += time.perf_counter() - matrix_fill_start
 
     transform_start = time.perf_counter()
-    transformed_values, transformed_masks, _ = transform_feature_matrices(
-        raw_feature_template=_raw_feature_names,
+    transformed_values, transformed_masks = _transform_selected_raw_feature_matrices(
+        group_names=selected_group_names,
+        raw_feature_template=raw_feature_template,
         raw_values=feature_matrix,
         raw_masks=mask_matrix,
-        transform_spec=_feature_transforms_spec,
     )
 
     feature_tensor = torch.from_numpy(transformed_values)
@@ -1753,8 +2164,10 @@ def _batch_sample_features(
     if profile is not None:
         profile.transform_seconds += time.perf_counter() - transform_start
         profile.active_coord_count = len(active_indices)
-        profile.static_layer_count = len(layer_vals) + prefilter_layer_count
-        profile.dem_layer_count = len(needs_dem)
+        profile.static_layer_count = (
+            len(layer_names) + (1 if "elevation" in dem_backed_names else 0) + prefilter_layer_count
+        )
+        profile.dem_layer_count = len(needs_dem_derived)
         profile.temporal_layer_count = len(temporal_names) if normalized_temporal_mode == "current" else 0
     return out
 
