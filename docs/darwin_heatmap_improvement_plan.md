@@ -20,8 +20,25 @@ This path now includes:
 - request-scoped profiling and cache bypass controls for targeted testing.
 
 The main remaining work is no longer basic parity with the legacy tile stack.
-It is reducing raster-read cost, deciding how to handle live temporal inputs on
-the tile route, and adding backpressure for bursty deep-zoom parent renders.
+It is reducing raster-read cost further, deciding how to handle live temporal
+inputs on the tile route, and adding backpressure for bursty deep-zoom parent
+renders.
+
+Accepted Darwin raster-path wins to date:
+
+- actual tile-pixel resolution hinting instead of the old fixed-size estimate;
+- sampled non-weather inference that skips temporal and `other` transforms
+  while preserving full model width at the final tensor;
+- request-scoped raster dataset reuse for both catalog-backed and region-local
+  rasters;
+- compact bounded-window reads and block-window sparse reads for static raster
+  sampling;
+- shared DEM reads for `elevation`, `slope`, `aspect`, and `aspect_deg`;
+- vectorized DEM point-neighborhood math within those shared windows;
+- chunk-level prefilter reuse so Darwin sampled fallback does not resample the
+  same prefilter mask for every chunk;
+- Darwin validity-mask serving support kept opt-in, with landcover-only
+  prefiltering still the default runtime path.
 
 ## Port Status And Remaining Work
 
@@ -88,7 +105,7 @@ Implementation notes:
 
 Status:
 
-- Not yet implemented.
+- Implemented.
 
 ### 4. Add richer cache-versioning inputs where needed
 
@@ -163,14 +180,28 @@ The current profiling output includes:
 Profiling on the current hot Darwin tile class shows:
 
 - model scoring is small relative to feature preparation;
-- the dominant remaining cost is raster work, especially static sampling and
-  the runtime prefilter;
+- the dominant remaining cost is raster work rather than model execution;
+- DEM work is still the largest single feature-prep bucket, but the gap versus
+  static sampling is now much smaller than before;
 - increasing sample chunk size to a single giant chunk raised RSS and did not
   improve total request time materially;
 - bounded-window raster reads for compact point clouds produced a meaningful
   win;
 - simplifying the runtime prefilter to a single `landcover` gate produced
-  another meaningful win.
+  another meaningful win;
+- sharing DEM reads across elevation and terrain derivatives produced another
+  meaningful win;
+- vectorized point-neighborhood DEM math beat the old per-point loop in direct
+  A/B profiling and is the current kept implementation.
+
+Representative current hot-tile profile after the accepted DEM work:
+
+- `total_ms ~= 4791`;
+- `feature_prepare_ms ~= 4662`;
+- `sample_static_ms ~= 1782`;
+- `sample_dem_ms ~= 2384`;
+- `sample_transform_ms ~= 181`;
+- `model_score_ms ~= 73`.
 
 In other words, the current Darwin tile bottleneck is no longer speculative.
 It is primarily raster sampling work rather than the model forward path.
@@ -181,8 +212,8 @@ This shifts the priority order of Darwin optimization work.
 
 The next likely wins are things like:
 
-- cheaper serving-time validity masks;
 - fewer static raster reads per uncached tile;
+- batching static sampling more aggressively by shared source dataset;
 - better temporal-raster reuse if live temporal tile inference is enabled.
 
 The next likely wins are not larger sampling chunks or broad changes to model
@@ -204,82 +235,47 @@ Recommended tools:
 
 ## Next Raster-Work Reduction Candidate
 
-Recent Darwin tile profiling points to raster work, not model scoring, as the
-main remaining latency source. After the compact-window sampling change and the
-landcover-only runtime prefilter, the next candidate optimization is a derived
-serving-validity mask.
+Recent Darwin tile profiling still points to raster work, not model scoring, as
+the main remaining latency source. But after the accepted DEM changes, the next
+default optimization target is no longer the DEM path. It is the static raster
+path.
 
-### Proposal
+### Current priority
 
-Build one shared Darwin validity mask raster per GIS region tile and use it as
-the first prefilter before full static feature sampling.
+The next candidate optimization should reduce `sample_static_ms`, not chase
+incremental DEM math changes first.
 
-This mask should answer only:
+Why this is now the right target:
 
-- can the backend build a usable Darwin static feature vector here?
+- the current hot-tile profile shows `sample_static_ms ~= 1782` and
+  `sample_dem_ms ~= 2384`, so static sampling is now close enough to DEM cost
+  that it is the better next lever;
+- the largest structural DEM wins are already in place;
+- further DEM work is now more likely to yield modest wins than step changes.
 
-It should not encode per-species suitability or range assumptions.
+### Recommended next experiment
 
-### Recommended first version
+Batch static sampling more aggressively by shared source dataset and identify
+which layer families dominate `sample_static_ms` on representative hot tiles.
 
-- Build the mask from `landcover` only.
-- Store it with the GIS data under `data/gis/regions/...`, not under
-  `checkpoints`.
-- Use it to replace the current runtime landcover prefilter read, not sit
-  alongside it.
+The immediate questions are:
 
-Why start there:
+- which static layer groups dominate the current `sample_static_ms` bucket;
+- how many repeated opens or repeated reads still occur across those layers;
+- whether multiple static layers can be sampled together from the same backing
+  raster or raster family.
 
-- the current fastest prefilter already reduced runtime to a single landcover
-  gate;
-- the earlier shadow audit found no rescued points on the profiled tile from
-  the old `elevation|bio_1` fallback path;
-- landcover-only keeps the artifact cheap to build and easy to audit.
+### Status of the Darwin validity mask work
 
-### Why not build it from all three gate layers first
+The landcover-derived Darwin validity mask is now implemented as an optional
+artifact and optional runtime prefilter. It is not the default serving path.
 
-Do not start by baking `landcover`, `elevation`, and `bio_1` into the mask.
+Current policy:
 
-Reasons:
-
-- `dem.tif` dominates the static raster corpus and would make mask generation a
-  much heavier job;
-- adding `bio_1` couples the artifact to broader climate coverage rather than
-  the narrow serving-validity question;
-- a stricter multi-layer rule is harder to reason about if it drops valid
-  cells.
-
-If later audits show real false negatives, add `elevation` before considering
-`bio_1`.
-
-### Expected impact
-
-This is a plausible next speed win because the current prefilter still costs on
-the order of `1.4-1.6s` on the profiled Darwin tile class. The expected gain is
-not guaranteed, but a binary validity mask could save a substantial fraction of
-that time if it materially reduces raster bytes read and replaces the runtime
-landcover gate.
-
-### Expected artifact cost
-
-Based on the current regioned GIS layout:
-
-- there are 648 region directories under `data/gis/regions`;
-- compressed `landcover.tif` tiles total about `29.5 GB` across regions;
-- compressed `dem.tif` tiles total about `555.9 GB` across regions.
-
-That suggests a landcover-only binary validity mask should be modest relative
-to the rest of the GIS stack, likely low single-digit GB total, and should be
-possible to generate in tens of minutes rather than hours on local storage.
-
-### Validation plan
-
-Before enabling the mask by default:
-
-1. generate the landcover-only mask;
-2. compare keep/drop decisions against the current runtime gate on a sample of
-   representative tiles;
-3. only widen the mask rule if the audit shows meaningful false negatives.
+- leave `WHEREWILD_INFERENCE_USE_DARWIN_VALIDITY_MASK=0` by default;
+- treat the mask as an opt-in experiment and audit tool;
+- only consider enabling it by default after representative profiling shows a
+  repeatable win without correctness regressions.
 
 ## Live Temporal Darwin Support
 
