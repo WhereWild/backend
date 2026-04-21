@@ -21,7 +21,7 @@ CONFIG = load_config("global")
 _HEATMAP_CACHE_NAMESPACE = hashlib.md5(str(CONFIG.data_root).encode()).hexdigest()[:12]
 _HEATMAP_TILE_DISK_CACHE = DiskTileCache(
     cache_dir=Path("/workspace/cache/darwin-heatmap-tiles"),
-    max_bytes=256 * 1024 * 1024,
+    max_bytes=CONFIG.darwin_heatmap_tile_cache_max_bytes,
 )
 LOGGER = logging.getLogger("uvicorn.error")
 

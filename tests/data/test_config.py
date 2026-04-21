@@ -100,3 +100,17 @@ def test_load_config_unknown_name_raises_and_global_is_cached(monkeypatch):
 def test_global_config_includes_expected_phenology_positive_defaults(tmp_path):
     cfg = config_module.GlobalConfig(project_root=tmp_path)
     assert cfg.ml_phenology_rcs_positive_values == ("flowers", "buds", "fruits")
+
+
+def test_env_int_uses_default_for_invalid_or_too_small_values(monkeypatch):
+    monkeypatch.setenv("WW_TEST_INT", "0")
+    assert config_module._env_int("WW_TEST_INT", 123, minimum=1) == 123
+
+    monkeypatch.setenv("WW_TEST_INT", "-5")
+    assert config_module._env_int("WW_TEST_INT", 123, minimum=1) == 123
+
+    monkeypatch.setenv("WW_TEST_INT", "not-an-int")
+    assert config_module._env_int("WW_TEST_INT", 123, minimum=1) == 123
+
+    monkeypatch.setenv("WW_TEST_INT", "456")
+    assert config_module._env_int("WW_TEST_INT", 123, minimum=1) == 456

@@ -26,6 +26,20 @@ def _env_bool(var: str, default: bool) -> bool:
     return val.strip().lower() in ("1", "true", "yes")
 
 
+def _env_int(var: str, default: int, *, minimum: int | None = None) -> int:
+    """Read an env var as an integer, falling back to the provided default."""
+    val = os.environ.get(var)
+    if val is None:
+        return default
+    try:
+        parsed = int(val.strip())
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    return parsed
+
+
 def register_config(name: str):
     """Decorator that records dataclasses for auto-loading."""
 
@@ -123,6 +137,16 @@ class GlobalConfig:
     # on species page load. Disabled for performance; descriptions use direct summaries.
     skip_description_outliers: bool = True
     sdm_tile_size: int = 256
+    tile_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int("WHEREWILD_TILE_CACHE_MAX_BYTES", 4 * 1024 * 1024 * 1024, minimum=1)
+    )
+    darwin_heatmap_tile_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "WHEREWILD_DARWIN_TILE_CACHE_MAX_BYTES",
+            4 * 1024 * 1024 * 1024,
+            minimum=1,
+        )
+    )
     sdm_parent_tile_max_size: int = 512
     sdm_deep_zoom_render_limit: int = 1
 

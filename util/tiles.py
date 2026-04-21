@@ -43,7 +43,7 @@ _TILE_CACHE_NAMESPACE = hashlib.md5(str(CONFIG.data_root).encode()).hexdigest()[
 # ---------------------------------------------------------------------------
 _TILE_DISK_CACHE = DiskTileCache(
     cache_dir=Path("/workspace/cache/tiles"),
-    max_bytes=256 * 1024 * 1024,
+    max_bytes=CONFIG.tile_cache_max_bytes,
 )
 
 CancelCheck = Callable[[], None]

@@ -16,6 +16,8 @@ services:
       - "${WHEREWILD_DOCS_PORT:-9101}:9101"
     environment:
       - RCLONE_CONFIG=/workspace/docker/rclone.conf
+      - WHEREWILD_TILE_CACHE_MAX_BYTES=${WHEREWILD_TILE_CACHE_MAX_BYTES:-4294967296}
+      - WHEREWILD_DARWIN_TILE_CACHE_MAX_BYTES=${WHEREWILD_DARWIN_TILE_CACHE_MAX_BYTES:-4294967296}
     devices:
       - /dev/fuse
     cap_add:

@@ -60,6 +60,8 @@ The local `gdal` service now supports these optional Compose variables:
 - `WHEREWILD_HOST_DATA_DIR` for the host path mounted at `/workspace/data`
 - `WHEREWILD_API_PORT` for the host port mapped to container port `8000`
 - `WHEREWILD_DOCS_PORT` for the host port mapped to container port `9101`
+- `WHEREWILD_TILE_CACHE_MAX_BYTES` for the classic tile cache size limit at `/workspace/cache/tiles`
+- `WHEREWILD_DARWIN_TILE_CACHE_MAX_BYTES` for the Darwin tile cache size limit at `/workspace/cache/darwin-heatmap-tiles`
 
 If these are unset, Compose falls back to the historical defaults.
 
@@ -92,6 +94,7 @@ docker run --rm -it \
 
 - This image expects a mounted `/workspace/data` folder. You will need to mount a **host directory**. It works like this: `-v /absolute/host/path:/container/path` mounts the absolute directory path on your machine (the host) to the directory path within the container. Remove the angle brackets and replace them with your actual host paths.
 - If you want API log files to survive container replacement, also mount a host directory at `/workspace/logs` as shown above. Without that mount, `/workspace/logs/api.log` and `/workspace/logs/api.previous.log` exist only in the container filesystem.
+- If you want tile caches to survive container replacement, mount a host directory or persistent volume at `/workspace/cache`. The classic and Darwin tile caches default to `4294967296` bytes each (4 GiB each) and can be overridden with `WHEREWILD_TILE_CACHE_MAX_BYTES` and `WHEREWILD_DARWIN_TILE_CACHE_MAX_BYTES`.
 - If you want the container to use a different local data directory than `/workspace/data`, set `WHEREWILD_LOCAL_DATA_ROOT`.
 - When `WHEREWILD_MODE=api`, the entrypoint runs the API as the foreground container process for deployment. On startup it rotates `/workspace/logs/api.log` to `/workspace/logs/api.previous.log`, then mirrors fresh API logs to both container stdout/stderr and `/workspace/logs/api.log` using `tee`, so `docker logs` and the file stay in sync.
 - When `WHEREWILD_MODE=api` **and** the image includes `/etc/wherewild_aliases.sh` **and** `ww_data_root` resolves to the local data root, the entrypoint also runs `b2-pull-all` in the background on startup and starts an in-container scheduler that triggers `b2-pull-all` again at `03:00`, `09:00`, `15:00`, and `21:00` using the container timezone. If those conditions are not met (for example, aliases are not baked into the image), those automatic pulls will not be invoked, and you must run them manually inside the container if you want data to sync from B2. For any of these uses to work, you must provide an rclone config file and point `RCLONE_CONFIG` at it (as shown above). The second `-v` flag in the example is a **file-to-file bind mount**: the left-hand side must be the path to a single rclone config file on the host (for example `/home/me/.config/rclone/rclone.conf`), and the right-hand side is the file path `/workspace/docker/rclone.conf` inside the container. Do not mount a directory there, or rclone will not read the config.
