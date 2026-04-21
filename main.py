@@ -43,7 +43,7 @@ from util import (
 )
 from util.tile_request import acquire_tile_render_slot, log_tile_cancellation, run_tile_render_with_cancellation
 from util import inference
-from util.species_heatmap_scorers import DarwinSpeciesHeatmapScorer, LegacySpeciesHeatmapScorer
+from util.species_heatmap_scorers import DarwinSpeciesHeatmapScorer, ClassicSpeciesHeatmapScorer
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -509,7 +509,7 @@ def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
 async def _render_species_heatmap_tile_response(
     request: Request,
     *,
-    scorer: LegacySpeciesHeatmapScorer | DarwinSpeciesHeatmapScorer,
+    scorer: ClassicSpeciesHeatmapScorer | DarwinSpeciesHeatmapScorer,
     taxon_id: int,
     z: int,
     x: int,
@@ -624,7 +624,7 @@ async def species_legacy_heatmap_tile_route(
             detail=f"No heatmap model found for taxon_id {taxon_id}.",
         )
 
-    scorer = LegacySpeciesHeatmapScorer(
+    scorer = ClassicSpeciesHeatmapScorer(
         model_id=model_id,
         reproject=reproject,
         forecast_hours=forecast_hours,
@@ -669,6 +669,7 @@ async def species_inference_heatmap_tile_route(
         le=18,
         description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
     ),
+    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
     bypass_cache: bool = Query(
         False,
         description="If true, bypass Darwin tile disk cache for this request.",
@@ -684,6 +685,7 @@ async def species_inference_heatmap_tile_route(
 
     scorer = DarwinSpeciesHeatmapScorer(
         feature_mode=feature_mode,
+        forecast_hours=forecast_hours,
         max_tile_size=heatmap_tile_max_size,
     )
     return await _render_species_heatmap_tile_response(

@@ -37,7 +37,7 @@ def _crop_tile_bytes(
 
 
 @dataclass(frozen=True)
-class LegacySpeciesHeatmapScorer:
+class ClassicSpeciesHeatmapScorer:
     model_id: str
     reproject: bool
     forecast_hours: int
@@ -122,6 +122,7 @@ class LegacySpeciesHeatmapScorer:
 @dataclass(frozen=True)
 class DarwinSpeciesHeatmapScorer:
     feature_mode: str
+    forecast_hours: int
     max_tile_size: int
 
     def render_tile_bytes(
@@ -143,6 +144,7 @@ class DarwinSpeciesHeatmapScorer:
             y,
             tile_size=tile_size,
             feature_mode=self.feature_mode,
+            forecast_hours=self.forecast_hours,
             cancel_check=cancel_check,
             bypass_cache=bypass_cache,
             profile=profile,

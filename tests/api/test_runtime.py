@@ -175,3 +175,53 @@ def test_species_heatmap_native_zoom_skips_deep_zoom_slot(monkeypatch):
     asyncio.run(_run())
 
     assert observed == {"acquired": 0, "rendered": 1}
+
+
+def test_species_inference_heatmap_route_forwards_forecast_hours(monkeypatch):
+    class _FakeRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(main.inference, "is_loaded", lambda: True)
+
+    async def _fake_render_species_heatmap_tile_response(
+        request,
+        *,
+        scorer,
+        taxon_id,
+        z,
+        x,
+        y,
+        tile_size,
+        max_native_zoom,
+        cache_seconds,
+        bypass_cache=False,
+        profile=False,
+    ):
+        captured["forecast_hours"] = scorer.forecast_hours
+        captured["taxon_id"] = taxon_id
+        captured["xyz"] = (z, x, y)
+        return main.Response(content=b"png", media_type="image/png")
+
+    monkeypatch.setattr(main, "_render_species_heatmap_tile_response", _fake_render_species_heatmap_tile_response)
+
+    async def _run() -> None:
+        response = await main.species_inference_heatmap_tile_route(
+            _FakeRequest(),
+            taxon_id=123,
+            z=8,
+            x=120,
+            y=95,
+            forecast_hours=24,
+        )
+        assert response.status_code == 200
+
+    asyncio.run(_run())
+
+    assert captured == {
+        "forecast_hours": 24,
+        "taxon_id": 123,
+        "xyz": (8, 120, 95),
+    }

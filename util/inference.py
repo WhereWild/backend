@@ -650,6 +650,9 @@ def _prepare_feature_batch_for_coords(
     resolution_hint: float,
     include_source: bool,
     feature_mode: str,
+    temporal_mode: str = "missing",
+    temporal_forecast_hours: int | None = None,
+    temporal_raster_cache: dict[tuple[str, int, int], Any] | None = None,
     raster_dataset_cache: dict[tuple[str, str], Any] | None = None,
     dem_dataset_cache: dict[tuple[str, str], Any] | None = None,
     cancel_check: CancelCheck | None = None,
@@ -672,15 +675,44 @@ def _prepare_feature_batch_for_coords(
     )
     missing_indices: list[int] = []
     missing_coords: list[tuple[float, float]] = []
+    temporal_names = _raw_temporal_feature_names()
+    normalized_temporal_mode = temporal_mode.strip().lower()
+    if normalized_temporal_mode not in {"missing", "current"}:
+        raise ValueError("temporal_mode must be one of ['current', 'missing']")
+
+    temporal_values = None
+    temporal_masks = None
+    needs_cell_table_temporal_merge = (
+        normalized_temporal_mode == "current"
+        and bool(temporal_names)
+        and (primary_source == "cell_table" or allow_fallback)
+    )
+    if needs_cell_table_temporal_merge:
+        raw_temporal_values, raw_temporal_masks = _sample_temporal_feature_matrices(
+            coords,
+            forecast_hours=temporal_forecast_hours,
+            temporal_raster_cache=temporal_raster_cache,
+        )
+        temporal_values, temporal_masks = _transform_temporal_feature_matrices(
+            raw_temporal_values,
+            raw_temporal_masks,
+        )
 
     if primary_source == "cell_table":
         for i, (lat, lon) in enumerate(coords):
             _check_cancel(cancel_check)
             cell = cell_table_features[i] if cell_table_features is not None else _cell_lookup_by_bin(lat, lon, native)
             if cell is not None:
-                features_per_coord[i] = cell
+                model_input = _payload_model_input(cell)
+                if temporal_values is not None and temporal_masks is not None:
+                    model_input = _merge_temporal_into_model_input(
+                        model_input,
+                        temporal_values[i],
+                        temporal_masks[i],
+                    )
+                features_per_coord[i] = model_input
                 if feature_source_per_coord is not None:
-                    feature_source_per_coord[i] = "cell_table"
+                    feature_source_per_coord[i] = "cell_table_temporal" if temporal_values is not None else "cell_table"
                 continue
             missing_indices.append(i)
             missing_coords.append((lat, lon))
@@ -694,6 +726,9 @@ def _prepare_feature_batch_for_coords(
                 missing_coords,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
+                temporal_mode=normalized_temporal_mode,
+                temporal_forecast_hours=temporal_forecast_hours,
+                temporal_raster_cache=temporal_raster_cache,
                 profile=sample_profile,
                 prefilter_keep_mask=missing_prefilter_keep_mask,
             )
@@ -708,6 +743,9 @@ def _prepare_feature_batch_for_coords(
             coords,
             raster_dataset_cache=raster_dataset_cache,
             dem_dataset_cache=dem_dataset_cache,
+            temporal_mode=normalized_temporal_mode,
+            temporal_forecast_hours=temporal_forecast_hours,
+            temporal_raster_cache=temporal_raster_cache,
             profile=sample_profile,
             prefilter_keep_mask=sampled_prefilter_keep_mask,
         )
@@ -726,9 +764,18 @@ def _prepare_feature_batch_for_coords(
                 _check_cancel(cancel_check)
                 cell = _cell_lookup_by_bin(lat, lon, native)
                 if cell is not None:
-                    features_per_coord[i] = cell
+                    model_input = _payload_model_input(cell)
+                    if temporal_values is not None and temporal_masks is not None:
+                        model_input = _merge_temporal_into_model_input(
+                            model_input,
+                            temporal_values[i],
+                            temporal_masks[i],
+                        )
+                    features_per_coord[i] = model_input
                     if feature_source_per_coord is not None:
-                        feature_source_per_coord[i] = "cell_table"
+                        feature_source_per_coord[i] = (
+                            "cell_table_temporal" if temporal_values is not None else "cell_table"
+                        )
 
     valid_indices: list[int] = []
     valid_features: list[torch.Tensor] = []
@@ -776,6 +823,8 @@ def score_species_coords(
     *,
     resolution_hint: float,
     feature_mode: str = "prefer_cell_table",
+    temporal_mode: str = "missing",
+    temporal_forecast_hours: int | None = None,
     score_batch_size: int = HEATMAP_DEFAULT_SCORE_BATCH_SIZE,
     include_source: bool = False,
     cancel_check: CancelCheck | None = None,
@@ -793,6 +842,7 @@ def score_species_coords(
     tracked_sources: list[str | None] | None = cast(list[str | None], [None] * len(coords)) if track_sources else None
     raster_dataset_cache: dict[tuple[str, str], Any] = {}
     dem_dataset_cache: dict[tuple[str, str], Any] = {}
+    temporal_raster_cache: dict[tuple[str, int, int], Any] = {}
     try:
         feature_config = _resolve_heatmap_feature_mode(
             feature_mode,
@@ -819,6 +869,9 @@ def score_species_coords(
                 resolution_hint=resolution_hint,
                 include_source=track_sources,
                 feature_mode=feature_mode,
+                temporal_mode=temporal_mode,
+                temporal_forecast_hours=temporal_forecast_hours,
+                temporal_raster_cache=temporal_raster_cache,
                 raster_dataset_cache=raster_dataset_cache,
                 dem_dataset_cache=dem_dataset_cache,
                 cancel_check=cancel_check,

@@ -252,6 +252,9 @@ def test_score_species_coords_honors_cancel_check_between_chunks(
         resolution_hint: float,
         include_source: bool,
         feature_mode: str,
+        temporal_mode: str = "missing",
+        temporal_forecast_hours: int | None = None,
+        temporal_raster_cache=None,
         raster_dataset_cache=None,
         dem_dataset_cache=None,
         cancel_check=None,
@@ -311,6 +314,9 @@ def test_score_species_coords_prefilters_once_across_chunks(
         resolution_hint: float,
         include_source: bool,
         feature_mode: str,
+        temporal_mode: str = "missing",
+        temporal_forecast_hours: int | None = None,
+        temporal_raster_cache=None,
         raster_dataset_cache=None,
         dem_dataset_cache=None,
         cancel_check=None,
@@ -362,6 +368,53 @@ def test_score_species_coords_prefilters_once_across_chunks(
     assert scores == [0.5, 0.5, 0.5, 0.5]
     assert prefilter_calls == 1
     assert received_masks == [[True, True], [True, True]]
+
+
+def test_prepare_feature_batch_for_coords_merges_current_temporal_into_cell_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coords = [(0.125, 0.125)]
+    base_input = torch.tensor([0.5, 0.0, 0.0, 1.0], dtype=torch.float32)
+
+    monkeypatch.setattr(inference, "_cell_size_deg", 0.25)
+    monkeypatch.setattr(inference, "_input_dim", 4)
+    monkeypatch.setattr(inference, "_model_uses_mask", False)
+    monkeypatch.setattr(inference, "_temporal_feature_span", lambda: (1, 2))
+    monkeypatch.setattr(
+        inference,
+        "_resolve_heatmap_feature_mode",
+        lambda feature_mode, resolution_hint, native_resolution: inference._HeatmapFeatureConfig("cell_table", False),
+    )
+    monkeypatch.setattr(inference, "_raw_temporal_feature_names", lambda: ["temperature_2m_avg_24h"])
+    monkeypatch.setattr(
+        inference,
+        "_sample_temporal_feature_matrices",
+        lambda coords, *, forecast_hours=None, temporal_raster_cache=None: (
+            np.asarray([[3.0]], dtype=np.float32),
+            np.asarray([[0.0]], dtype=np.float32),
+        ),
+    )
+    monkeypatch.setattr(
+        inference,
+        "_transform_temporal_feature_matrices",
+        lambda raw_values, raw_masks: (raw_values, raw_masks),
+    )
+
+    valid_indices, feature_tensor, sources = inference._prepare_feature_batch_for_coords(
+        coords,
+        resolution_hint=0.25,
+        include_source=True,
+        feature_mode="prefer_cell_table",
+        temporal_mode="current",
+        temporal_forecast_hours=24,
+        cell_table_features=[base_input],
+    )
+
+    assert valid_indices == [0]
+    assert feature_tensor is not None
+    assert feature_tensor.shape == (1, 4)
+    assert float(feature_tensor[0, 1]) == pytest.approx(3.0)
+    assert sources == ["cell_table_temporal"]
 
 
 def test_train_cli_heads_parse_combined_head_batch_size(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
