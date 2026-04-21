@@ -19,7 +19,7 @@ This path now includes:
 - parent-tile reuse for deep zoom;
 - request-scoped profiling and cache bypass controls for targeted testing.
 
-The main remaining work is no longer basic parity with the legacy tile stack.
+The main remaining work is no longer basic parity with the classic tile stack.
 It is reducing raster-read cost further, deciding how to handle live temporal
 inputs on the tile route, and adding backpressure for bursty deep-zoom parent
 renders.
@@ -50,7 +50,7 @@ Expected gain:
 
 Why first:
 
-- It is the clearest missing optimization relative to the legacy tile path.
+- It is the clearest missing optimization relative to the classic tile path.
 - It reduces repeated coordinate generation, feature resolution, model scoring,
   colorization, and PNG encoding for identical requests.
 - It can be implemented without changing model outputs or bundle format.
@@ -101,7 +101,7 @@ Why third:
 Implementation notes:
 
 - Port the semaphore-based deep-zoom slot acquisition pattern used by the
-  legacy route.
+  classic route.
 
 Status:
 
@@ -348,7 +348,7 @@ The Darwin cache key should then include:
 
 - `temporal_mode`;
 - `forecast_hours`;
-- a temporal-raster version token analogous to the legacy tile stack.
+- a temporal-raster version token analogous to the classic tile stack.
 
 Without that change, Darwin can serve stale PNGs after weather refreshes.
 

@@ -460,7 +460,7 @@ async def variable_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
-def _build_species_legacy_heatmap_metadata(
+def _build_species_classic_heatmap_metadata(
     taxon_id: int,
     *,
     model_id: str | None = None,
@@ -469,7 +469,7 @@ def _build_species_legacy_heatmap_metadata(
     available = bool(metadata.get("available"))
     return {
         **metadata,
-        "tile_url": f"/api/species/{taxon_id}/heatmap/legacy/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
+        "tile_url": f"/api/species/{taxon_id}/heatmap/classic/tiles/{{z}}/{{x}}/{{y}}.png" if available else None,
     }
 
 
@@ -494,14 +494,14 @@ def _build_species_inference_heatmap_metadata(taxon_id: int) -> dict[str, Any]:
 
 
 def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
-    legacy = _build_species_legacy_heatmap_metadata(taxon_id)
+    classic = _build_species_classic_heatmap_metadata(taxon_id)
     inference_metadata = _build_species_inference_heatmap_metadata(taxon_id)
     return {
-        "available": bool(legacy.get("available") or inference_metadata.get("available")),
-        "resolved_model_id": legacy.get("resolved_model_id"),
-        "phenology_available": legacy.get("phenology_available"),
-        "full_available": legacy.get("full_available"),
-        "legacy": legacy,
+        "available": bool(classic.get("available") or inference_metadata.get("available")),
+        "resolved_model_id": classic.get("resolved_model_id"),
+        "phenology_available": classic.get("phenology_available"),
+        "full_available": classic.get("full_available"),
+        "classic": classic,
         "inference": inference_metadata,
     }
 
@@ -584,17 +584,17 @@ async def _render_species_heatmap_tile_response(
     )
 
 
-@app.get("/api/species/{taxon_id}/heatmap/legacy")
-def species_legacy_heatmap_metadata_route(
+@app.get("/api/species/{taxon_id}/heatmap/classic")
+def species_classic_heatmap_metadata_route(
     taxon_id: int,
     model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
 ) -> dict[str, Any]:
-    """Return metadata for the legacy forecast-aware species heatmap system."""
-    return _build_species_legacy_heatmap_metadata(taxon_id, model_id=model_id)
+    """Return metadata for the classic forecast-aware species heatmap system."""
+    return _build_species_classic_heatmap_metadata(taxon_id, model_id=model_id)
 
 
-@app.get("/api/species/{taxon_id}/heatmap/legacy/tiles/{z}/{x}/{y}.png")
-async def species_legacy_heatmap_tile_route(
+@app.get("/api/species/{taxon_id}/heatmap/classic/tiles/{z}/{x}/{y}.png")
+async def species_classic_heatmap_tile_route(
     request: Request,
     taxon_id: int,
     z: int,
@@ -616,7 +616,7 @@ async def species_legacy_heatmap_tile_route(
     apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
     phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
 ) -> Response:
-    """Render a legacy model-backed species heatmap tile as PNG."""
+    """Render a classic model-backed species heatmap tile as PNG."""
     resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
     if not resolved_model.get("available"):
         raise HTTPException(

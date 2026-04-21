@@ -79,7 +79,7 @@ def test_render_feature_stack_uses_static_temporal_and_cache(monkeypatch):
     assert sorted(cache) == ["bio_1", "temperature_2m_avg_24h"]
 
 
-def test_legacy_scorer_crops_from_fixed_parent_zoom(monkeypatch):
+def test_classic_scorer_crops_from_fixed_parent_zoom(monkeypatch):
     rendered: list[tuple[int, int, int, int]] = []
 
     def _fake_render_model_tile_bytes(*, taxon_id, z, x, y, model_id, tile_size, **_kwargs):
