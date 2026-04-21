@@ -706,6 +706,21 @@ def test_train_species_heads_combined_head_only_rejects_legacy_checkpoint_withou
         )
 
 
+def test_clone_state_dict_to_cpu_returns_detached_cpu_copies() -> None:
+    from scripts.machine_learning.train import train_heads
+
+    head = SpeciesHead(embed_dim=4)
+    original_state = head.state_dict()
+
+    cloned_state = train_heads._clone_state_dict_to_cpu(original_state)
+
+    assert cloned_state.keys() == original_state.keys()
+    for key, cloned_tensor in cloned_state.items():
+        assert cloned_tensor.device.type == "cpu"
+        assert cloned_tensor.data_ptr() != original_state[key].data_ptr()
+        assert torch.equal(cloned_tensor, original_state[key])
+
+
 def test_train_species_heads_combined_head_only_preserves_existing_species_heads(tmp_path: Path) -> None:
     from scripts.machine_learning.train import train_heads
 
@@ -830,6 +845,102 @@ def test_train_species_heads_combined_head_only_preserves_existing_species_heads
         checkpoint["head_states"][202]["linear.bias"],
         existing_head_202.state_dict()["linear.bias"],
     )
+
+
+def test_train_species_heads_saves_species_heads_before_combined_head_training(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scripts.machine_learning.train import train_heads
+
+    data_root = tmp_path / "training_data"
+    output_dir = tmp_path / "outputs"
+    encoder_checkpoint = tmp_path / "encoder_best.pt"
+
+    n_groups = len(training_data.FEATURE_COLUMNS)
+    zero_mask = [0.0] * n_groups
+
+    def _group_values(first: float, second: float) -> list[float]:
+        values = [0.0] * n_groups
+        if n_groups > 0:
+            values[0] = first
+        if n_groups > 1:
+            values[1] = second
+        return values
+
+    row_specs = [
+        ("train", "train_sp101_pos_a.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("train", "train_sp101_pos_b.parquet", 101, 1, _group_values(0.9, 0.0)),
+        ("train", "train_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("train", "train_sp202_pos_a.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("train", "train_sp202_pos_b.parquet", 202, 1, _group_values(0.0, 0.9)),
+        ("train", "train_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+        ("val", "val_sp101_pos.parquet", 101, 1, _group_values(1.0, 0.0)),
+        ("val", "val_sp101_unl.parquet", 101, 0, _group_values(0.2, 0.1)),
+        ("val", "val_sp202_pos.parquet", 202, 1, _group_values(0.0, 1.0)),
+        ("val", "val_sp202_unl.parquet", 202, 0, _group_values(0.1, 0.2)),
+    ]
+
+    for split, part_name, species_key, presence_label, feature_values in row_specs:
+        _write_split_part(
+            data_root,
+            split=split,
+            part_name=part_name,
+            cell_id=f"{split}_{species_key}_{presence_label}_{part_name}",
+            feature_values=feature_values,
+            mask_values=zero_mask,
+            species_key=species_key,
+            presence_label=presence_label,
+        )
+
+    input_dim = n_groups * 2
+    encoder = SharedEncoder(input_dim=input_dim, embed_dim=4, hidden_dim=8)
+    torch.save(
+        {
+            "input_dim": input_dim,
+            "embed_dim": 4,
+            "hidden_dim": 8,
+            "encoder_state_dict": encoder.state_dict(),
+        },
+        encoder_checkpoint,
+    )
+
+    real_torch_save = torch.save
+    saved_payloads: list[dict[str, object]] = []
+
+    def _tracking_save(obj, path, *args, **kwargs):
+        if path == output_dir / "species_heads.pt":
+            saved_payloads.append(obj)
+        return real_torch_save(obj, path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "save", _tracking_save)
+
+    train_heads.train_species_heads(
+        data_root=data_root,
+        encoder_checkpoint=encoder_checkpoint,
+        output_dir=output_dir,
+        min_positives=2,
+        fixed_prior=0.02,
+        head_epochs=1,
+        head_lr=1e-2,
+        head_weight_decay=1e-3,
+        batch_size=4,
+        device="cpu",
+        train_combined_head=True,
+        combined_head_min_positives=2,
+        combined_head_epochs=1,
+        combined_head_lr=1e-2,
+        combined_head_batch_size=2,
+        combined_head_weight_decay=1e-4,
+    )
+
+    assert len(saved_payloads) == 2
+    assert set(saved_payloads[0]["head_states"]) == {101, 202}
+    assert saved_payloads[0]["combined_head_state"] is None
+    assert saved_payloads[0]["combined_species_keys"] == []
+    assert saved_payloads[0]["combined_head_meta"] is None
+    assert saved_payloads[1]["combined_head_state"] is not None
+    assert saved_payloads[1]["combined_species_keys"] == [101, 202]
 
 
 def test_train_species_heads_combined_head_only_clears_stale_combined_head_when_no_species_are_eligible(

@@ -223,6 +223,11 @@ def _resolve_fixed_prior(
     return float(np.clip(fixed_prior, min_prior, max_prior))
 
 
+def _clone_state_dict_to_cpu(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Clone a module state dict onto CPU for lightweight checkpoint retention."""
+    return {key: value.detach().to("cpu").clone() for key, value in state_dict.items()}
+
+
 def _iter_combined_positive_batches(
     embeddings: np.ndarray,
     species: np.ndarray,
@@ -259,9 +264,8 @@ def _iter_combined_positive_batches(
         positive_targets = class_indices[valid_mask].astype(np.int64, copy=False)
 
         if shuffle and positive_targets.shape[0] > 1:
-            if rng is None:
-                rng = np.random.default_rng(0)
-            order = rng.permutation(positive_targets.shape[0])
+            batch_rng = rng if rng is not None else np.random.default_rng(0)
+            order = batch_rng.permutation(positive_targets.shape[0])
             positive_embeddings = positive_embeddings[order]
             positive_targets = positive_targets[order]
 
@@ -582,10 +586,10 @@ def train_species_heads(
                                 ).item()
                                 if v_loss < best_val_loss:
                                     best_val_loss = v_loss
-                                    best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                                    best_state = _clone_state_dict_to_cpu(head.state_dict())
 
             if best_state is None:
-                best_state = {k: v.clone() for k, v in head.state_dict().items()}
+                best_state = _clone_state_dict_to_cpu(head.state_dict())
 
             head_states[sp_key] = best_state
             species_meta[sp_key] = {
@@ -601,11 +605,39 @@ def train_species_heads(
                 elapsed = time.perf_counter() - total_start
                 print(f"  Heads trained: {idx + 1:,}/{len(eligible):,} | elapsed: {elapsed:.1f}s")
 
+    def _save_heads_checkpoint(
+        *,
+        combined_head_state: dict[str, torch.Tensor] | None,
+        combined_species_keys: list[int],
+        combined_head_meta: dict[str, int | float | None] | None,
+    ) -> None:
+        serialized_combined_head_state = (
+            _clone_state_dict_to_cpu(combined_head_state) if combined_head_state is not None else None
+        )
+        torch.save(
+            {
+                "embed_dim": embed_dim,
+                "encoder_checkpoint": encoder_metadata,
+                "head_states": head_states,
+                "species_meta": species_meta,
+                "combined_head_state": serialized_combined_head_state,
+                "combined_species_keys": combined_species_keys if serialized_combined_head_state is not None else [],
+                "combined_head_meta": combined_head_meta if serialized_combined_head_state is not None else None,
+            },
+            heads_path,
+        )
+
     combined_head_state: dict[str, torch.Tensor] | None = existing_combined_head_state
     combined_head_meta: dict[str, int | float | None] | None = existing_combined_head_meta
     combined_species_keys_out: list[int] = list(existing_combined_species_keys)
 
     if train_combined_head and combined_species.shape[0] > 0:
+        if not combined_head_only:
+            _save_heads_checkpoint(
+                combined_head_state=combined_head_state,
+                combined_species_keys=combined_species_keys_out,
+                combined_head_meta=combined_head_meta,
+            )
         print(f"Training combined species head for {combined_species.shape[0]:,} species...")
         combined_head = CombinedSpeciesHead(embed_dim=embed_dim, species_count=int(combined_species.shape[0])).to(dev)
         combined_optimizer = torch.optim.AdamW(
@@ -668,7 +700,7 @@ def train_species_heads(
                 )
                 if val_loss is not None and val_loss < best_combined_val_loss:
                     best_combined_val_loss = val_loss
-                    best_combined_state = {k: v.clone() for k, v in combined_head.state_dict().items()}
+                    best_combined_state = _clone_state_dict_to_cpu(combined_head.state_dict())
 
             mean_train_loss = epoch_loss / epoch_rows
             print(
@@ -677,7 +709,7 @@ def train_species_heads(
             )
 
         if best_combined_state is None:
-            best_combined_state = {k: v.clone() for k, v in combined_head.state_dict().items()}
+            best_combined_state = _clone_state_dict_to_cpu(combined_head.state_dict())
 
         combined_head_state = best_combined_state
         combined_species_keys_out = combined_species.tolist()
@@ -694,17 +726,10 @@ def train_species_heads(
         print("Skipping combined head training; no species met the combined-head eligibility criteria.")
 
     total_seconds = time.perf_counter() - total_start
-    torch.save(
-        {
-            "embed_dim": embed_dim,
-            "encoder_checkpoint": encoder_metadata,
-            "head_states": head_states,
-            "species_meta": species_meta,
-            "combined_head_state": combined_head_state,
-            "combined_species_keys": combined_species_keys_out if combined_head_state is not None else [],
-            "combined_head_meta": combined_head_meta,
-        },
-        heads_path,
+    _save_heads_checkpoint(
+        combined_head_state=combined_head_state,
+        combined_species_keys=combined_species_keys_out,
+        combined_head_meta=combined_head_meta,
     )
     if combined_head_only:
         print(f"Preserved {len(head_states):,} species heads while updating the combined head in {total_seconds:.1f}s")
