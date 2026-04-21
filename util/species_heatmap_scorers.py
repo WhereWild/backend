@@ -5,6 +5,7 @@ from io import BytesIO
 import logging
 import math
 import time
+from typing import Literal
 
 from PIL import Image
 
@@ -121,6 +122,8 @@ class ClassicSpeciesHeatmapScorer:
 
 @dataclass(frozen=True)
 class DarwinSpeciesHeatmapScorer:
+    head_variant: Literal["original", "reinforced"]
+    client_key: str | None
     feature_mode: str
     temporal_mode: str
     forecast_hours: int
@@ -144,6 +147,8 @@ class DarwinSpeciesHeatmapScorer:
             x,
             y,
             tile_size=tile_size,
+            head_variant=self.head_variant,
+            client_key=self.client_key,
             feature_mode=self.feature_mode,
             temporal_mode=self.temporal_mode,
             forecast_hours=self.forecast_hours,

@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -270,6 +271,8 @@ def test_score_species_coords_honors_cancel_check_between_chunks(
         species_key: int,
         feature_tensor: torch.Tensor,
         *,
+        head_variant: Literal["original", "reinforced"] = "original",
+        client_key: str | None = None,
         score_batch_size: int,
         cancel_check=None,
     ) -> list[float]:
@@ -353,7 +356,7 @@ def test_score_species_coords_prefilters_once_across_chunks(
     monkeypatch.setattr(
         inference,
         "_score_species_feature_tensor",
-        lambda species_key, feature_tensor, *, score_batch_size, cancel_check=None: [
+        lambda species_key, feature_tensor, *, head_variant="original", client_key=None, score_batch_size, cancel_check=None: [
             0.5 for _ in range(int(feature_tensor.shape[0]))
         ],
     )
@@ -2318,7 +2321,9 @@ def test_score_species_coords_accepts_sampled_feature_payloads(tmp_path: Path, m
     monkeypatch.setattr(
         inference,
         "_score_species_feature_tensor",
-        lambda species_key, feature_tensor, *, score_batch_size, cancel_check=None: feature_tensor[:, 0].cpu().tolist(),
+        lambda species_key, feature_tensor, *, head_variant="original", client_key=None, score_batch_size, cancel_check=None: (
+            feature_tensor[:, 0].cpu().tolist()
+        ),
     )
 
     inference.load_bundle(bundle_path)

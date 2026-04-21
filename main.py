@@ -35,6 +35,7 @@ from util import (
     gis_lookup,
     indexing,
     models,
+    reinforcement,
     summary_stats,
     taxa_navigation,
     units,
@@ -506,6 +507,41 @@ def _build_species_heatmap_summary(taxon_id: int) -> dict[str, Any]:
     }
 
 
+class ReinforceFeedbackRequest(BaseModel):
+    client_key: str = Field(min_length=1)
+    species_key: int
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    present: bool
+    lr: float = Field(default=reinforcement.DEFAULT_LR, gt=0)
+    steps: int = Field(default=reinforcement.DEFAULT_STEPS, ge=1)
+    activation_threshold: int | None = Field(default=None, ge=1)
+
+
+class ReinforceFeedbackResponse(BaseModel):
+    species_key: int
+    feedback_count: int
+    point: dict[str, Any]
+    original_score: float
+    reinforced_score: float
+    active: bool
+    activation_threshold: int
+
+
+class ReinforcedSpeciesInfo(BaseModel):
+    species_key: int
+    feedback_count: int
+    active: bool
+    activation_threshold: int
+
+
+def _require_client_key(client_key: str | None) -> str:
+    normalized = (client_key or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="client_key is required for reinforced operations.")
+    return normalized
+
+
 async def _render_species_heatmap_tile_response(
     request: Request,
     *,
@@ -667,6 +703,14 @@ async def species_inference_heatmap_tile_route(
         "current",
         description="Temporal feature strategy: current weather or missing to mask temporal inputs.",
     ),
+    head_variant: Literal["original", "reinforced"] = Query(
+        "original",
+        description="Head variant to score with: original or reinforced.",
+    ),
+    client_key: str | None = Query(
+        None,
+        description="Client key for private personalized-head selection.",
+    ),
     max_native_zoom: int = Query(
         DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM,
         ge=1,
@@ -686,6 +730,18 @@ async def species_inference_heatmap_tile_route(
     """Render a species heatmap tile as PNG."""
     if not inference.is_loaded():
         raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    if head_variant == "reinforced":
+        client_key = _require_client_key(client_key)
+
+    temporal_mode_value = (
+        temporal_mode if isinstance(temporal_mode, str) else getattr(temporal_mode, "default", temporal_mode)
+    )
+    normalized_temporal_mode = str(temporal_mode_value).strip().lower()
+    if normalized_temporal_mode not in {"current", "missing"}:
+        raise HTTPException(
+            status_code=422,
+            detail="temporal_mode must be one of ['current', 'missing']",
+        )
 
     temporal_mode_value = (
         temporal_mode if isinstance(temporal_mode, str) else getattr(temporal_mode, "default", temporal_mode)
@@ -698,6 +754,8 @@ async def species_inference_heatmap_tile_route(
         )
 
     scorer = DarwinSpeciesHeatmapScorer(
+        head_variant=head_variant,
+        client_key=client_key,
         feature_mode=feature_mode,
         temporal_mode=normalized_temporal_mode,
         forecast_hours=forecast_hours,
@@ -716,6 +774,64 @@ async def species_inference_heatmap_tile_route(
         bypass_cache=bypass_cache,
         profile=profile,
     )
+
+
+@app.post("/api/predict/reinforce", response_model=ReinforceFeedbackResponse)
+def submit_reinforcement_feedback(payload: ReinforceFeedbackRequest) -> ReinforceFeedbackResponse:
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    try:
+        result = reinforcement.reinforce_head(
+            payload.client_key,
+            payload.species_key,
+            payload.lat,
+            payload.lon,
+            payload.present,
+            lr=payload.lr,
+            steps=payload.steps,
+            activation_threshold=payload.activation_threshold,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ReinforceFeedbackResponse(**result)
+
+
+@app.get("/api/predict/reinforced", response_model=list[ReinforcedSpeciesInfo])
+def list_reinforced_heads(client_key: str = Query(..., min_length=1)) -> list[ReinforcedSpeciesInfo]:
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    client_key = _require_client_key(client_key)
+    return [ReinforcedSpeciesInfo(**entry) for entry in reinforcement.list_reinforced_species_for_client(client_key)]
+
+
+@app.get("/api/predict/reinforced/{species_key}/feedback")
+def get_reinforcement_feedback(species_key: int, client_key: str = Query(..., min_length=1)) -> dict[str, Any]:
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    client_key = _require_client_key(client_key)
+    if not inference.has_species(species_key):
+        raise HTTPException(status_code=404, detail=f"Species {species_key} not in loaded bundle.")
+    feedback = reinforcement.get_reinforcement_feedback(species_key, client_key=client_key)
+    return {
+        "species_key": species_key,
+        "feedback_count": len(feedback),
+        "active": reinforcement.is_reinforced_head_active(species_key, client_key=client_key),
+        "activation_threshold": reinforcement.get_activation_threshold(species_key, client_key=client_key),
+        "feedback": feedback,
+    }
+
+
+@app.delete("/api/predict/reinforced/{species_key}")
+def delete_reinforced_head(species_key: int, client_key: str = Query(..., min_length=1)) -> dict[str, Any]:
+    if not inference.is_loaded():
+        raise HTTPException(status_code=503, detail="Inference model not loaded.")
+    client_key = _require_client_key(client_key)
+    existed = reinforcement.clear_reinforced_head(species_key, client_key=client_key)
+    if not existed:
+        raise HTTPException(status_code=404, detail=f"No reinforced head for species {species_key}.")
+    return {"species_key": species_key, "status": "cleared"}
 
 
 @app.get("/api/heatmap/aggregate/tiles/{z}/{x}/{y}.png")

@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import torch
 
@@ -793,6 +793,8 @@ def _score_species_feature_tensor(
     species_key: int,
     feature_tensor: torch.Tensor,
     *,
+    head_variant: Literal["original", "reinforced"] = "original",
+    client_key: str | None = None,
     score_batch_size: int,
     cancel_check: CancelCheck | None = None,
 ) -> list[float]:
@@ -803,7 +805,13 @@ def _score_species_feature_tensor(
         raise KeyError(f"Species {species_key} not in loaded bundle.")
 
     encoder = _encoder
-    head = _heads[species_key]
+    head = get_species_head(species_key, head_variant=head_variant, client_key=client_key)
+    original_head = _heads[species_key] if head_variant == "reinforced" else None
+    normalize_reinforced_logit = None
+    if original_head is not None:
+        from util import reinforcement as reinforcement_module
+
+        normalize_reinforced_logit = reinforcement_module.normalize_reinforced_logit
     scores_list: list[float] = []
     with torch.no_grad():
         for start in range(0, int(feature_tensor.shape[0]), score_batch_size):
@@ -813,6 +821,9 @@ def _score_species_feature_tensor(
                 batch_features = batch_features.to(_device)
             embeddings = encoder(batch_features)
             logits = head(embeddings)
+            if original_head is not None and normalize_reinforced_logit is not None:
+                original_logits = original_head(embeddings)
+                logits = normalize_reinforced_logit(original_logits, logits)
             scores_list.extend(torch.sigmoid(logits).cpu().tolist())
     return scores_list
 
@@ -822,6 +833,8 @@ def score_species_coords(
     coords: list[tuple[float, float]],
     *,
     resolution_hint: float,
+    head_variant: Literal["original", "reinforced"] = "original",
+    client_key: str | None = None,
     feature_mode: str = "prefer_cell_table",
     temporal_mode: str = "missing",
     temporal_forecast_hours: int | None = None,
@@ -913,6 +926,8 @@ def score_species_coords(
             chunk_scores = _score_species_feature_tensor(
                 species_key,
                 feature_tensor,
+                head_variant=head_variant,
+                client_key=client_key,
                 score_batch_size=score_batch_size,
                 cancel_check=cancel_check,
             )
@@ -2345,6 +2360,27 @@ def load_bundle(bundle_path: str | Path) -> None:
 def is_loaded() -> bool:
     """True when a bundle has been successfully loaded."""
     return _encoder is not None
+
+
+def _sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def get_species_head(
+    species_key: int,
+    *,
+    head_variant: Literal["original", "reinforced"] = "original",
+    client_key: str | None = None,
+) -> torch.nn.Module:
+    if species_key not in _heads:
+        raise KeyError(f"Species {species_key} not in loaded bundle.")
+    if head_variant == "original":
+        return _heads[species_key]
+
+    from util import reinforcement
+
+    reinforced_head = reinforcement.get_reinforced_head(species_key, client_key=client_key)
+    return reinforced_head if reinforced_head is not None else _heads[species_key]
 
 
 def known_species() -> list[int]:

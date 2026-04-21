@@ -122,6 +122,8 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
         y,
         *,
         tile_size,
+        head_variant="original",
+        client_key=None,
         feature_mode,
         temporal_mode="current",
         forecast_hours=0,
@@ -143,6 +145,8 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
     monkeypatch.setattr("util.heatmap_tiles.render_heatmap_tile_bytes", _fake_render_heatmap_tile_bytes)
 
     scorer = scorers.DarwinSpeciesHeatmapScorer(
+        head_variant="original",
+        client_key=None,
         feature_mode="prefer_cell_table",
         temporal_mode="current",
         forecast_hours=24,
@@ -165,6 +169,8 @@ def test_darwin_scorer_forwards_bypass_cache(monkeypatch):
         y,
         *,
         tile_size,
+        head_variant="original",
+        client_key=None,
         feature_mode,
         temporal_mode="current",
         forecast_hours=0,
@@ -186,6 +192,8 @@ def test_darwin_scorer_forwards_bypass_cache(monkeypatch):
     monkeypatch.setattr("util.heatmap_tiles.render_heatmap_tile_bytes", _fake_render_heatmap_tile_bytes)
 
     scorer = scorers.DarwinSpeciesHeatmapScorer(
+        head_variant="original",
+        client_key=None,
         feature_mode="prefer_cell_table",
         temporal_mode="current",
         forecast_hours=0,
@@ -227,6 +235,8 @@ def test_render_heatmap_tile_bytes_uses_cache(
         coords: list[tuple[float, float]],
         *,
         resolution_hint: float,
+        head_variant: str = "original",
+        client_key: str | None = None,
         feature_mode: str,
         temporal_mode: str,
         temporal_forecast_hours: int | None,
@@ -296,6 +306,8 @@ def test_render_heatmap_tile_bytes_can_bypass_cache(
         coords: list[tuple[float, float]],
         *,
         resolution_hint: float,
+        head_variant: str = "original",
+        client_key: str | None = None,
         feature_mode: str,
         temporal_mode: str,
         temporal_forecast_hours: int | None,
@@ -335,6 +347,8 @@ def test_render_heatmap_tile_bytes_separates_cache_by_forecast_hours(
         coords: list[tuple[float, float]],
         *,
         resolution_hint: float,
+        head_variant: str = "original",
+        client_key: str | None = None,
         feature_mode: str,
         temporal_mode: str,
         temporal_forecast_hours: int | None,
@@ -371,6 +385,8 @@ def test_render_heatmap_tile_bytes_separates_cache_by_temporal_mode(
         coords: list[tuple[float, float]],
         *,
         resolution_hint: float,
+        head_variant: str = "original",
+        client_key: str | None = None,
         feature_mode: str,
         temporal_mode: str,
         temporal_forecast_hours: int | None,

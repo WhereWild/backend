@@ -7,12 +7,14 @@ import logging
 import math
 from pathlib import Path
 import time
+from typing import Literal
 
 import numpy as np
 from PIL import Image
 
 from util.config import load_config
 from util import inference
+from util import reinforcement
 from util.request_cancellation import CancelCheck
 from util.tile_disk_cache import DiskTileCache, make_cache_key
 
@@ -226,6 +228,19 @@ def _colorize_heatmap(values: np.ndarray) -> np.ndarray:
     return rgba
 
 
+def _build_heatmap_bundle_token(
+    species_key: int,
+    *,
+    head_variant: Literal["original", "reinforced"],
+    client_key: str | None,
+) -> str:
+    bundle_token = f"{inference.bundle_cache_token()}:{head_variant}"
+    if head_variant != "reinforced":
+        return bundle_token
+    reinforced_token = reinforcement.reinforced_cache_token(species_key, client_key)
+    return f"{bundle_token}:{reinforced_token}"
+
+
 def render_heatmap_tile_bytes(
     species_key: int,
     z: int,
@@ -233,6 +248,8 @@ def render_heatmap_tile_bytes(
     y: int,
     *,
     tile_size: int = 256,
+    head_variant: Literal["original", "reinforced"] = "original",
+    client_key: str | None = None,
     feature_mode: str = "prefer_cell_table",
     temporal_mode: str = "current",
     forecast_hours: int = 0,
@@ -255,11 +272,16 @@ def render_heatmap_tile_bytes(
         x=x,
         y=y,
         tile_size=tile_size,
+        head_variant=head_variant,
         feature_mode=feature_mode,
         temporal_mode=temporal_mode,
         forecast_hours=forecast_hours,
         score_batch_size=score_batch_size,
-        bundle_token=inference.bundle_cache_token(),
+        bundle_token=_build_heatmap_bundle_token(
+            species_key,
+            head_variant=head_variant,
+            client_key=client_key,
+        ),
     )
     cache_lookup_start = time.perf_counter()
     cached = None if bypass_cache else _HEATMAP_TILE_DISK_CACHE.read(cache_key)
@@ -291,6 +313,8 @@ def render_heatmap_tile_bytes(
         species_key,
         coords,
         resolution_hint=resolution_hint,
+        head_variant=head_variant,
+        client_key=client_key,
         feature_mode=feature_mode,
         temporal_mode=temporal_mode,
         temporal_forecast_hours=forecast_hours,
