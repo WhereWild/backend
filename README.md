@@ -42,7 +42,7 @@ docker compose up -d gdal
 
 The downside to this is that using Docker can require lots of typing to use simple commands. A great way around this is to use bash aliases. Inside `gt`, these helpers are already available via the container image, so there is nothing to copy into your `~/.bashrc`.
 
-`gt` stands for "GDAL Terminal" and simply opens a terminal within the GDAL docker. `pd` stands for "Python Docker" and can simply be run as `pd build_locations` for example; it automatically looks for Python files within the `/scripts` directory and runs them through Docker. `pdb` runs the same way in the background and writes logs to `logs/scripts/<script_name>`. `pdbs` stops a background `pdb` script by name. `pdbc` chains multiple scripts in the background, running each after the previous completes, and writes per-script logs to the same folder.
+`gt` stands for "GDAL Terminal" and simply opens a terminal within the GDAL docker. `pd` stands for "Python Docker" and can simply be run as `pd build_locations` for example; it automatically looks for Python files within the `/scripts` directory and runs them through Docker. `pdb` runs the same way in the background and writes logs to `logs/scripts/<script_name>`. `pdbs` stops a background `pdb` script by name. `pdbc` chains multiple scripts in the background, running each after the previous completes, and writes per-script logs to the same folder. `pd warm_species_heatmap_tiles` now defaults to warming CONUS tiles at zooms 5 through 10 for current weather conditions, with `--region`, `--zoom`, and `--forecast-hours` available to override that focus.
 
 ### Build Image
 
@@ -158,6 +158,7 @@ You can also run `api-fg` to have the api run in the foreground so you can get l
 In the gdal terminal, you also have:
 
 - `pd <script>` to run a Python script/module (defaults to `/scripts`).
+- `pd warm_species_heatmap_tiles [options]` to prewarm classic and Darwin species heatmap caches for the current recommendation species set using occurrence-derived tile envelopes. For defaults, logging behavior, and usage details, see the generated docs site's Scripts section after starting `docs`.
 - `pt [options] [pytest args...]` to run tests with repo defaults (supports changed-only mode, coverage toggles, and local/remote data roots).
 - `pdb <script>` to run a script in the background and log to `logs/scripts/<script_name>.log`.
 - `pdbs <script>` to stop a background `pdb` script by name.
