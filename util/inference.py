@@ -2248,7 +2248,7 @@ def load_bundle(bundle_path: str | Path) -> None:
         raise ValueError("Invalid inference bundle: expected dict payload.")
     if loaded.get("bundle_version") != 2:
         raise ValueError("Invalid inference bundle: expected bundle_version=2.")
-    _bundle = loaded
+    _bundle = None
 
     model_payload = loaded.get("model")
     heads_payload = loaded.get("heads")

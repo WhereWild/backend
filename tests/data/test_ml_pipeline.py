@@ -1591,6 +1591,7 @@ def test_load_bundle_exposes_species_metadata_and_cell_table(tmp_path: Path) -> 
     assert inference.has_species(101) is True
     assert inference.cell_count() == 1
     assert inference.native_resolution() == 0.25
+    assert inference._bundle is None
 
 
 def test_load_bundle_rejects_incompatible_cell_payload(tmp_path: Path) -> None:
