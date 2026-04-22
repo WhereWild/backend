@@ -663,6 +663,10 @@ async def species_inference_heatmap_tile_route(
         "prefer_cell_table",
         description="Feature source strategy: prefer_cell_table or cell_table_only.",
     ),
+    temporal_mode: str = Query(
+        "current",
+        description="Temporal feature strategy: current weather or missing to mask temporal inputs.",
+    ),
     max_native_zoom: int = Query(
         DARWIN_HEATMAP_DEFAULT_MAX_NATIVE_ZOOM,
         ge=1,
@@ -683,8 +687,19 @@ async def species_inference_heatmap_tile_route(
     if not inference.is_loaded():
         raise HTTPException(status_code=503, detail="Inference model not loaded.")
 
+    temporal_mode_value = (
+        temporal_mode if isinstance(temporal_mode, str) else getattr(temporal_mode, "default", temporal_mode)
+    )
+    normalized_temporal_mode = str(temporal_mode_value).strip().lower()
+    if normalized_temporal_mode not in {"current", "missing"}:
+        raise HTTPException(
+            status_code=422,
+            detail="temporal_mode must be one of ['current', 'missing']",
+        )
+
     scorer = DarwinSpeciesHeatmapScorer(
         feature_mode=feature_mode,
+        temporal_mode=normalized_temporal_mode,
         forecast_hours=forecast_hours,
         max_tile_size=heatmap_tile_max_size,
     )

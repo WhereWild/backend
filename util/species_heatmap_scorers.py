@@ -122,6 +122,7 @@ class ClassicSpeciesHeatmapScorer:
 @dataclass(frozen=True)
 class DarwinSpeciesHeatmapScorer:
     feature_mode: str
+    temporal_mode: str
     forecast_hours: int
     max_tile_size: int
 
@@ -144,6 +145,7 @@ class DarwinSpeciesHeatmapScorer:
             y,
             tile_size=tile_size,
             feature_mode=self.feature_mode,
+            temporal_mode=self.temporal_mode,
             forecast_hours=self.forecast_hours,
             cancel_check=cancel_check,
             bypass_cache=bypass_cache,

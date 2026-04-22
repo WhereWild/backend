@@ -113,7 +113,7 @@ def test_classic_scorer_crops_from_fixed_parent_zoom(monkeypatch):
 
 
 def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
-    rendered: list[tuple[int, int, int, int, str, int]] = []
+    rendered: list[tuple[int, int, int, int, str, str, int]] = []
 
     def _fake_render_heatmap_tile_bytes(
         taxon_id,
@@ -123,12 +123,13 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
         *,
         tile_size,
         feature_mode,
+        temporal_mode="current",
         forecast_hours=0,
         cancel_check=None,
         bypass_cache=False,
         profile=None,
     ):
-        rendered.append((z, x, y, tile_size, feature_mode, forecast_hours))
+        rendered.append((z, x, y, tile_size, feature_mode, temporal_mode, forecast_hours))
         return _png_bytes(
             tile_size,
             (
@@ -141,11 +142,16 @@ def test_darwin_scorer_uses_closest_reusable_parent(monkeypatch):
 
     monkeypatch.setattr("util.heatmap_tiles.render_heatmap_tile_bytes", _fake_render_heatmap_tile_bytes)
 
-    scorer = scorers.DarwinSpeciesHeatmapScorer(feature_mode="prefer_cell_table", forecast_hours=24, max_tile_size=8)
+    scorer = scorers.DarwinSpeciesHeatmapScorer(
+        feature_mode="prefer_cell_table",
+        temporal_mode="current",
+        forecast_hours=24,
+        max_tile_size=8,
+    )
     payload = scorer.render_runtime_tile_bytes(321, 6, 40, 50, tile_size=2, max_native_zoom=2)
     image = Image.open(BytesIO(payload))
 
-    assert rendered == [(4, 10, 12, 8, "prefer_cell_table", 24)]
+    assert rendered == [(4, 10, 12, 8, "prefer_cell_table", "current", 24)]
     assert image.size == (2, 2)
 
 
@@ -160,6 +166,7 @@ def test_darwin_scorer_forwards_bypass_cache(monkeypatch):
         *,
         tile_size,
         feature_mode,
+        temporal_mode="current",
         forecast_hours=0,
         cancel_check=None,
         bypass_cache=False,
@@ -178,7 +185,12 @@ def test_darwin_scorer_forwards_bypass_cache(monkeypatch):
 
     monkeypatch.setattr("util.heatmap_tiles.render_heatmap_tile_bytes", _fake_render_heatmap_tile_bytes)
 
-    scorer = scorers.DarwinSpeciesHeatmapScorer(feature_mode="prefer_cell_table", forecast_hours=0, max_tile_size=8)
+    scorer = scorers.DarwinSpeciesHeatmapScorer(
+        feature_mode="prefer_cell_table",
+        temporal_mode="current",
+        forecast_hours=0,
+        max_tile_size=8,
+    )
     scorer.render_runtime_tile_bytes(321, 3, 4, 5, tile_size=2, max_native_zoom=3, bypass_cache=True)
 
     assert observed == [True]
@@ -346,6 +358,56 @@ def test_render_heatmap_tile_bytes_separates_cache_by_forecast_hours(
     heatmap_tiles.render_heatmap_tile_bytes(101, 3, 4, 5, tile_size=4, forecast_hours=24)
 
     assert call_args == [0, 24]
+
+
+def test_render_heatmap_tile_bytes_separates_cache_by_temporal_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    call_args: list[str] = []
+
+    def _fake_score_species_coords(
+        species_key: int,
+        coords: list[tuple[float, float]],
+        *,
+        resolution_hint: float,
+        feature_mode: str,
+        temporal_mode: str,
+        temporal_forecast_hours: int | None,
+        score_batch_size: int,
+        include_source: bool,
+        cancel_check=None,
+        profile=None,
+    ) -> tuple[list[float | None], None]:
+        call_args.append(temporal_mode)
+        return [0.5 for _ in coords], None
+
+    monkeypatch.setattr(
+        heatmap_tiles,
+        "_HEATMAP_TILE_DISK_CACHE",
+        DiskTileCache(cache_dir=tmp_path, max_bytes=256 * 1024 * 1024),
+    )
+    monkeypatch.setattr(heatmap_tiles.inference, "bundle_cache_token", lambda: "bundle-a")
+    monkeypatch.setattr(heatmap_tiles.inference, "score_species_coords", _fake_score_species_coords)
+
+    heatmap_tiles.render_heatmap_tile_bytes(
+        101,
+        3,
+        4,
+        5,
+        tile_size=4,
+        temporal_mode="missing",
+    )
+    heatmap_tiles.render_heatmap_tile_bytes(
+        101,
+        3,
+        4,
+        5,
+        tile_size=4,
+        temporal_mode="current",
+    )
+
+    assert call_args == ["missing", "current"]
 
 
 def test_batch_sample_features_records_profile(monkeypatch: pytest.MonkeyPatch) -> None:
